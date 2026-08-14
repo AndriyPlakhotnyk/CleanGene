@@ -37,4 +37,4 @@ config/cleangene.env
 results/
 *.log
 *.out
-*.err
+*.err\n\ntest_data/
