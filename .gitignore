@@ -1,0 +1,40 @@
+# Ignore compiled Python files
+__pycache__/ 
+*.py[cod] 
+*$py.class 
+
+# Distribution / packaging directories
+.Python 
+build/ 
+develop-eggs/ 
+dist/ 
+downloads/ 
+eggs/ 
+lib/ 
+lib64/ 
+parts/ 
+sdist/ 
+var/ 
+wheels/ 
+pip-wheel-metadata/ 
+share/python-wheels/ 
+
+# Installer logs
+pip-log.txt 
+pip-delete-this-directory.txt 
+
+# Virtual environments
+.venv/ 
+env/ 
+ENV/ 
+env.bak/ 
+venv/ 
+tmp/ 
+
+# Data and output directories
+input/*.tsv
+config/cleangene.env
+results/
+*.log
+*.out
+*.err

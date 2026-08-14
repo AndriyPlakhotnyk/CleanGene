@@ -1,0 +1,33 @@
+"""Scientific defaults inherited from ImaGene unless noted otherwise."""
+SCIENTIFIC_DEFAULTS = {
+    "PANAROO_CLEAN_MODE": "strict",
+    "VALIDATION_SCOPE": "all",
+    "ACCESSORY_PREVALENCE_CUTOFF": "0.95",
+    "READ_VALIDATION_MIN_BREADTH": "0.90",
+    "READ_VALIDATION_MIN_MEAN_DEPTH": "5",
+    "READ_VALIDATION_MIN_IDENTITY": "0.95",
+    "READ_VALIDATION_MIN_MAPQ": "20",
+    "BASEQUAL": "30",
+    "TAXONOMY_MODE": "auto",
+    "MAJOR_CONTAMINATION_THRESHOLD": "5",
+}
+EXECUTION_DEFAULTS = {
+    "CPUS": "4",
+    "SLURM_CPUS": "8",
+    "SLURM_MEM": "32G",
+    "SLURM_TIME": "12:00:00",
+    "SLURM_MAX_PARALLEL": "2000",
+    "PANAROO_CPUS": "16",
+    "PANAROO_MEM": "96G",
+    "PANAROO_TIME": "24:00:00",
+    "VALIDATION_CPUS": "4",
+    "VALIDATION_MEM": "12G",
+    "VALIDATION_TIME": "08:00:00",
+    "SUMMARY_CPUS": "2",
+    "SUMMARY_MEM": "8G",
+    "SUMMARY_TIME": "02:00:00",
+    "SLURM_ACCOUNT": "",
+    "SLURM_PARTITION": "",
+    "KRAKEN2_DB": "",
+}
+DEFAULTS = {**SCIENTIFIC_DEFAULTS, **EXECUTION_DEFAULTS}

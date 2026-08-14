@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cleangene"
+version = "0.1.0"
+description = "SLURM-native bacterial gene presence/absence cleanup with read-supported evidence"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+cleangene = "cleangene.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
