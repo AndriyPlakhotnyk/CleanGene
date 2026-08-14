@@ -1,0 +1,7 @@
+# Test manifest for local run
+isolate_id	organism	R1	R2
+V607_S1_L001_R1_001	SpeciesUnknown	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/V607_S1_L001_R1_001.fastq.gz	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/V607_S1_L001_R2_001.fastq.gz
+VS223_S23_L001_R1_001	SpeciesB	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/VS223_S23_L001_R1_001.fastq.gz	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/VS223_S23_L001_R2_001.fastq.gz
+ERR086051_1	SpeciesC	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/ERR086051_1.fastq.gz	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/ERR086051_2.fastq.gz
+ERR086060_1	SpeciesD	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/ERR086060_1.fastq.gz	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/ERR086060_2.fastq.gz
+ERROR12345_X1	SpeciesX	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/ERR3170975_2.fastq.gz	/home/andriy/Desktop/Workspace/Genomics/CleanGene/test_data/ERR3170975_1.fastq.gz

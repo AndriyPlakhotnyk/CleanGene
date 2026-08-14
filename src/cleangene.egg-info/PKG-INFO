@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: cleangene
+Version: 0.1.0
+Summary: SLURM-native bacterial gene presence/absence cleanup with read-supported evidence
+Requires-Python: >=3.10
+License-File: LICENSE
+Dynamic: license-file

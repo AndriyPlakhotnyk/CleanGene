@@ -12,4 +12,5 @@ dependencies:
   - bcftools
   - minimap2
   - kraken2
-  - pytest
+  - pip: 
+    - .
