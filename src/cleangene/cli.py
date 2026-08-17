@@ -5,9 +5,9 @@ from pathlib import Path
 from .config import read_env
 from .defaults import SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
-from .slurm import array_chunks, sbatch_cmd, submit, submit_chunked_arrays
+from .slurm import sbatch_cmd, submit
 from .util import atomic_json, command_exists, safe_name, sha256, write_tsv
-from .workers import dispatch, needs_kraken
+from .workers import dispatch
 
 def make_run(manifest: Path, analysis_root: Path, cfg: dict[str,str], run_id: str | None) -> Path:
     rid=run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=analysis_root/"runs"/rid
@@ -50,17 +50,12 @@ def local(run: Path) -> None:
     dispatch("summary",run,None)
 
 def slurm(run: Path, cfg: dict[str,str], dry: bool) -> None:
-    rows=load_manifest(run/"provenance"/"manifest.tsv")
-    ni=len((run/"state"/"isolate_tasks.tsv").read_text().splitlines())-1; maxp=cfg["SLURM_MAX_PARALLEL"]; chunk=int(cfg["SLURM_ARRAY_CHUNK_SIZE"]); outstanding=int(cfg["SLURM_MAX_OUTSTANDING_CHUNKS"]); exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
+    exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
     base=dict(account=cfg["SLURM_ACCOUNT"],partition=cfg["SLURM_PARTITION"])
-    def cmd(stage,array,cpus,mem,time,dep=None):
-        idx='${SLURM_ARRAY_TASK_ID}' if array else '0'; wrap=f"{exe} --stage {stage} --run-dir {shlex_quote(str(run))} --index {idx}"; log=run/"logs"/"slurm"/f"{stage}.%A_%a.log"; return sbatch_cmd(name=f"cg-{stage}",wrap=wrap,cpus=cpus,mem=mem,time=time,array=array,dependency=dep,log=log,**base)
-    dep=None
-    if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip():
-        dep=submit(cmd("kraken_db_setup",None,cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"]),dry)
-    preprocess=submit_chunked_arrays(lambda array, d: cmd("preprocess",array,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],d),array_chunks(range(ni),chunk,maxp),dry,outstanding,dep)
-    j2=submit(cmd("resolve_groups",None,cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],":".join(preprocess) if preprocess else dep),dry)
-    submit(cmd("orchestrate_downstream",None,cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],j2),dry)
+    wrap=f"{exe} --stage slurm_controller --run-dir {shlex_quote(str(run))} --index 0"
+    log=run/"logs"/"slurm"/"controller.%j.log"
+    cmd=sbatch_cmd(name="cg-controller",wrap=wrap,cpus=cfg["SLURM_CONTROLLER_CPUS"],mem=cfg["SLURM_CONTROLLER_MEM"],time=cfg["SLURM_CONTROLLER_TIME"],log=log,**base)
+    submit(cmd,dry)
 
 def shlex_quote(x:str)->str:
     import shlex; return shlex.quote(x)

@@ -5,9 +5,9 @@ import contextlib
 from cleangene.manifest import groups, load_manifest
 from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
-from cleangene.slurm import array_chunks, sbatch_cmd, submit, submit_chunked_arrays
+from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, array_chunks, sbatch_cmd, submit, submit_chunked_arrays
 from cleangene.util import atomic_json, write_tsv
-from cleangene.workers import ensure_kraken2_db, manifest_pangenome_dir, parse_kraken_report
+from cleangene.workers import _run_array_stage, ensure_kraken2_db, manifest_pangenome_dir, parse_kraken_report
 from cleangene.cli import make_run, slurm
 from unittest.mock import patch
 import subprocess
@@ -105,16 +105,15 @@ class CleanGeneCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             manifest=Path(d)/"m.tsv"
             manifest.write_text("isolate_id\torganism\tR1\tR2\n" + "\n".join(f"i{x}\tSpecies\tr1.fq\tr2.fq" for x in range(3)) + "\n")
-            cfg={"SLURM_ACCOUNT":"","SLURM_PARTITION":"","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"2","SLURM_MAX_OUTSTANDING_CHUNKS":"1","SLURM_CPUS":"1","SLURM_MEM":"1G","SLURM_TIME":"1:00:00","GROUP_ORCHESTRATOR_CPUS":"1","GROUP_ORCHESTRATOR_MEM":"1G","GROUP_ORCHESTRATOR_TIME":"1:00:00","TAXONOMY_MODE":"kraken2","KRAKEN2_DB":"","KRAKEN2_DB_CPUS":"1","KRAKEN2_DB_MEM":"1G","KRAKEN2_DB_TIME":"1:00:00"}
+            cfg={"SLURM_ACCOUNT":"","SLURM_PARTITION":"","SLURM_CONTROLLER_CPUS":"1","SLURM_CONTROLLER_MEM":"1G","SLURM_CONTROLLER_TIME":"1:00:00","TAXONOMY_MODE":"kraken2"}
             run=make_run(manifest,Path(d),cfg,"r")
             buf=StringIO()
             with contextlib.redirect_stdout(buf):
                 slurm(run,cfg,True)
             out=buf.getvalue()
-            self.assertIn("cg-kraken_db_setup",out)
-            self.assertIn("--array 0-1%100",out)
-            self.assertIn("--array 2%100",out)
-            self.assertIn("--dependency afterok:DRYRUN",out)
+            self.assertIn("cg-controller",out)
+            self.assertNotIn("cg-preprocess",out)
+            self.assertNotIn("cg-kraken_db_setup",out)
 
     def test_preprocess_cannot_build_missing_kraken_db(self):
         with tempfile.TemporaryDirectory() as d:
@@ -125,5 +124,42 @@ class CleanGeneCoreTests(unittest.TestCase):
             write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","grouping_source","R1","R2"],rows)
             with self.assertRaisesRegex(SystemExit,"kraken_db_setup"):
                 ensure_kraken2_db(run,cfg,rows)
+
+    def test_available_slots_respects_headroom(self):
+        self.assertEqual(available_slots(2000,10,0),1990)
+        self.assertEqual(available_slots(2000,10,1800),190)
+        self.assertEqual(available_slots(2000,10,1990),0)
+        self.assertEqual(available_slots(2000,10,2000),0)
+
+    def test_array_task_count(self):
+        self.assertEqual(array_task_count("0-499%100"),500)
+        self.assertEqual(array_task_count("1,3,7%100"),3)
+        self.assertEqual(array_task_count(None),1)
+
+    def test_user_job_count_counts_squeue_rows_for_all_user_jobs(self):
+        done=subprocess.CompletedProcess(["squeue"],0,stdout="1\n2\n3\n",stderr="")
+        with patch("cleangene.slurm.subprocess.run",return_value=done):
+            self.assertEqual(user_job_count("andriy"),3)
+
+    def test_qos_retry_recalculates_and_resubmits(self):
+        err=RuntimeError("sbatch failed\nstderr: QOSMaxSubmitJobPerUserLimit")
+        with patch("cleangene.slurm.user_job_count",side_effect=[1990,1800,1800]), \
+             patch("cleangene.slurm.time.sleep"), \
+             patch("cleangene.slurm.submit",side_effect=[err,"123"]):
+            with contextlib.redirect_stdout(StringIO()):
+                self.assertEqual(submit_with_qos_retry(["sbatch"],{"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0"},1,"x"),"123")
+
+    def test_controller_does_not_oversubmit_when_partially_full(self):
+        seen=[]
+        cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+        with tempfile.TemporaryDirectory() as d, \
+             patch("cleangene.workers.user_job_count",return_value=1800), \
+             patch("cleangene.workers._wait_jobs"), \
+             patch("cleangene.workers.submit_with_qos_retry",side_effect=lambda cmd,cfg,task_count,label:(seen.append((cmd,task_count)) or "1")):
+            with contextlib.redirect_stdout(StringIO()):
+                _run_array_stage(Path(d),cfg,"preprocess",500,"1","1G","1:00:00","x")
+        array=seen[0][0][seen[0][0].index("--array")+1]
+        self.assertEqual(array,"0-189%100")
+        self.assertEqual(seen[0][1],190)
 
 if __name__ == "__main__": unittest.main()

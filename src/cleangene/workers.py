@@ -6,7 +6,7 @@ from .evidence import validate_isolate
 from .fasta import assembly_metrics
 from .manifest import groups, write_resolved
 from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_binary
-from .slurm import array_chunks, sbatch_cmd, submit, submit_chunked_arrays
+from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 
 def context(run_dir: Path):
@@ -178,29 +178,105 @@ def resolve_groups(run_dir: Path, index: int | None = None) -> None:
     touch_done(run_dir/"state"/"resolve_groups.done.json",{"groups":len(ordered),"order":"smallest_first"})
 
 def orchestrate_downstream(run_dir: Path, index: int | None = None) -> None:
-    cfg,_=context(run_dir); group_rows=read_tsv(run_dir/"state"/"group_tasks.tsv"); isolate_rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
-    exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"; maxp=cfg["SLURM_MAX_PARALLEL"]; chunk=int(cfg["SLURM_ARRAY_CHUNK_SIZE"]); outstanding=int(cfg["SLURM_MAX_OUTSTANDING_CHUNKS"])
+    controller_downstream(run_dir)
+
+def _controller_cmd(run_dir: Path, cfg: dict[str,str], stage: str, array: str | None, cpus: str, mem: str, time_limit: str) -> list[str]:
+    exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
     base=dict(account=cfg["SLURM_ACCOUNT"],partition=cfg["SLURM_PARTITION"])
-    def cmd(stage,array,cpus,mem,time,dep=None):
-        idx='${SLURM_ARRAY_TASK_ID}' if array else '0'
-        wrap=f"{exe} --stage {stage} --run-dir {shlex_quote(str(run_dir))} --index {idx}"
-        log=run_dir/"logs"/"slurm"/f"{stage}.%A_%a.log"
-        return sbatch_cmd(name=f"cg-{stage}",wrap=wrap,cpus=cpus,mem=mem,time=time,array=array,dependency=dep,log=log,**base)
-    previous=None; prepare_deps=[]
+    idx='${SLURM_ARRAY_TASK_ID}' if array else '0'
+    wrap=f"{exe} --stage {stage} --run-dir {shlex_quote(str(run_dir))} --index {idx}"
+    log=run_dir/"logs"/"slurm"/f"{stage}.%A_%a.log"
+    return sbatch_cmd(name=f"cg-{stage}",wrap=wrap,cpus=cpus,mem=mem,time=time_limit,array=array,log=log,**base)
+
+def _array_spec(start: int, count: int, max_parallel: str) -> str:
+    end=start+count-1
+    spec=str(start) if start==end else f"{start}-{end}"
+    return f"{spec}%{max_parallel}"
+
+def _indices_spec(indices: list[int], max_parallel: str) -> str:
+    if indices==list(range(indices[0],indices[-1]+1)):
+        base=str(indices[0]) if len(indices)==1 else f"{indices[0]}-{indices[-1]}"
+    else:
+        base=",".join(map(str,indices))
+    return f"{base}%{max_parallel}"
+
+def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str) -> None:
+    poll=int(cfg["SLURM_POLL_SECONDS"])
+    while True:
+        active=job_active(job_ids)
+        current=user_job_count()
+        avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
+        print(f"user jobs: {current}/{cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | {label}: {complete} | waiting ...", flush=True)
+        if not active:
+            assert_jobs_succeeded(job_ids)
+            return
+        time.sleep(poll)
+
+def _run_single_job(run_dir: Path, cfg: dict[str,str], stage: str, cpus: str, mem: str, time_limit: str, label: str) -> str:
+    cmd=_controller_cmd(run_dir,cfg,stage,None,cpus,mem,time_limit)
+    jid=submit_with_qos_retry(cmd,cfg,1,label)
+    _wait_jobs([jid],cfg,label,"single job submitted")
+    return jid
+
+def _run_array_stage(run_dir: Path, cfg: dict[str,str], stage: str, total: int, cpus: str, mem: str, time_limit: str, label: str) -> list[str]:
+    maxp=cfg["SLURM_MAX_PARALLEL"]; chunk=int(cfg["SLURM_ARRAY_CHUNK_SIZE"]); poll=int(cfg["SLURM_POLL_SECONDS"])
+    start=0; jobs=[]
+    while start < total:
+        current=user_job_count()
+        avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
+        done=f"{start}/{total} complete"
+        print(f"user jobs: {current}/{cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | {label}: {done} | waiting/submitting ...", flush=True)
+        if avail <= 0:
+            time.sleep(poll); continue
+        n=min(chunk,avail,total-start)
+        array=_array_spec(start,n,maxp)
+        cmd=_controller_cmd(run_dir,cfg,stage,array,cpus,mem,time_limit)
+        jobs.append(submit_with_qos_retry(cmd,cfg,array_task_count(array),label))
+        _wait_jobs([jobs[-1]],cfg,label,f"{start+n}/{total} complete")
+        start += n
+    return jobs
+
+def _run_index_stage(run_dir: Path, cfg: dict[str,str], stage: str, indices: list[int], cpus: str, mem: str, time_limit: str, label: str) -> list[str]:
+    maxp=cfg["SLURM_MAX_PARALLEL"]; chunk=int(cfg["SLURM_ARRAY_CHUNK_SIZE"]); poll=int(cfg["SLURM_POLL_SECONDS"])
+    pos=0; jobs=[]; total=len(indices)
+    while pos < total:
+        current=user_job_count()
+        avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
+        print(f"user jobs: {current}/{cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | {label}: {pos}/{total} complete | waiting/submitting ...", flush=True)
+        if avail <= 0:
+            time.sleep(poll); continue
+        n=min(chunk,avail,total-pos)
+        array=_indices_spec(indices[pos:pos+n],maxp)
+        cmd=_controller_cmd(run_dir,cfg,stage,array,cpus,mem,time_limit)
+        jobs.append(submit_with_qos_retry(cmd,cfg,array_task_count(array),label))
+        _wait_jobs([jobs[-1]],cfg,label,f"{pos+n}/{total} complete")
+        pos += n
+    return jobs
+
+def controller_downstream(run_dir: Path) -> None:
+    cfg,_=context(run_dir); group_rows=read_tsv(run_dir/"state"/"group_tasks.tsv"); isolate_rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
+    prepare_deps=[]
     for klass in ("small","medium","large"):
         indices=[i for i,r in enumerate(group_rows) if r.get("group_size_class")==klass]
         if not indices: continue
         prefix=f"PANAROO_{klass.upper()}"
-        pan=submit_chunked_arrays(lambda array, d: cmd("panaroo",array,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),d),array_chunks(indices,chunk,maxp),False,outstanding,previous)
-        prep=submit_chunked_arrays(lambda array, d: cmd("prepare_validation",array,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),d),array_chunks(indices,chunk,maxp),False,outstanding,":".join(pan))
-        previous=":".join(prep)
-        prepare_deps.extend(prep)
-    dep=":".join(prepare_deps) if prepare_deps else None
+        # Group tasks are ordered smallest-first; run tier slices in that order.
+        for stage in ("panaroo","prepare_validation"):
+            prepare_deps.extend(_run_index_stage(run_dir,cfg,stage,indices,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),f"CleanGene {stage}"))
     ni=len(isolate_rows); ng=len(group_rows)
-    val=submit_chunked_arrays(lambda array, d: cmd("validate",array,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],d),array_chunks(range(ni),chunk,maxp),False,outstanding,dep) if ni else []
-    red=submit_chunked_arrays(lambda array, d: cmd("reduce",array,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],d),array_chunks(range(ng),chunk,maxp),False,outstanding,":".join(val) if val else None) if ng else []
-    submit(cmd("summary",None,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],":".join(red) if red else None),False)
+    if ni: _run_array_stage(run_dir,cfg,"validate",ni,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],"CleanGene validate")
+    if ng: _run_array_stage(run_dir,cfg,"reduce",ng,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene reduce")
+    _run_single_job(run_dir,cfg,"summary",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene summary")
     touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":ng,"isolates":ni})
+
+def slurm_controller(run_dir: Path, index: int | None = None) -> None:
+    cfg, rows=context(run_dir)
+    if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip():
+        _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
+    ni=len(read_tsv(run_dir/"state"/"isolate_tasks.tsv"))
+    _run_array_stage(run_dir,cfg,"preprocess",ni,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess")
+    _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
+    controller_downstream(run_dir)
 
 def manifest_pangenome_dir(rows: list[dict[str,str]], group: str) -> Path | None:
     paths=sorted({r.get("pangenome_dir","").strip() for r in rows if r["group_id"]==group and r.get("pangenome_dir","").strip()})
@@ -308,7 +384,8 @@ def summarize(run_dir: Path) -> None:
     cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); touch_done(run_dir/"state"/"summary.done.json",{"groups":len(group_rows)})
 
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
-    if stage=="kraken_db_setup": kraken_db_setup(run_dir,index)
+    if stage=="slurm_controller": slurm_controller(run_dir,index)
+    elif stage=="kraken_db_setup": kraken_db_setup(run_dir,index)
     elif stage=="preprocess": preprocess(run_dir,int(index))
     elif stage=="resolve_groups": resolve_groups(run_dir,index)
     elif stage=="orchestrate_downstream": orchestrate_downstream(run_dir,index)
