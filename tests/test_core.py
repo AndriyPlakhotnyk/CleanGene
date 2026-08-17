@@ -51,6 +51,14 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertEqual(rows[0]["group_id"],"__kraken_pending__")
             self.assertEqual(rows[0]["grouping_source"],"kraken_pending")
 
+    def test_manifest_tolerates_bom_spaces_and_csv(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"manifest.csv"
+            p.write_text("\ufeff isolate_id , organism , R1 , R2 \niso1,Species A,r1.fq,r2.fq\n")
+            rows=load_manifest(p)
+            self.assertEqual(rows[0]["isolate_id"],"iso1")
+            self.assertEqual(rows[0]["group_id"],"Species A")
+
     def test_normalize_panaroo_accepts_safe_isolate_names(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/"gene_presence_absence.csv"

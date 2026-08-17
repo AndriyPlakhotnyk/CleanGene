@@ -9,23 +9,31 @@ BAM_COLUMNS = ("raw_bam", "BAM", "bam")
 def _clean(value: str | None) -> str:
     return (value or "").strip()
 
+def _clean_header(value: str | None) -> str:
+    return (value or "").lstrip("\ufeff").strip()
+
+def _delimiter(header: str) -> str:
+    return "," if header.count(",") > header.count("\t") else "\t"
+
 def load_manifest(path: Path) -> list[dict[str, str]]:
     if not path.is_file():
         raise SystemExit(f"Manifest not found: {path}")
-    with path.open(newline="", errors="replace") as handle:
+    with path.open(newline="", encoding="utf-8-sig", errors="replace") as handle:
         lines = [line for line in handle if line.strip() and not line.lstrip().startswith("#")]
     if not lines:
         raise SystemExit(f"Manifest is empty: {path}")
-    reader = csv.DictReader(lines, delimiter="\t")
+    reader = csv.DictReader(lines, delimiter=_delimiter(lines[0]))
+    reader.fieldnames = [_clean_header(name) for name in (reader.fieldnames or [])]
     fields = set(reader.fieldnames or [])
     required = {"isolate_id"}
     missing = sorted(required - fields)
     if missing:
-        raise SystemExit("Manifest missing required columns: " + ", ".join(missing))
+        observed = ", ".join(reader.fieldnames or []) or "<none>"
+        raise SystemExit("Manifest missing required columns: " + ", ".join(missing) + f" (observed columns: {observed})")
     rows = []
     seen = set()
     for line, raw in enumerate(reader, 2):
-        row = {k: _clean(v) for k, v in raw.items() if k is not None}
+        row = {_clean_header(k): _clean(v) for k, v in raw.items() if k is not None}
         isolate = row.get("isolate_id", "")
         if not isolate:
             raise SystemExit(f"Manifest row {line} has no isolate_id")
