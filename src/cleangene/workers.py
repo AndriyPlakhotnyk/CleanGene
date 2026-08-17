@@ -1,5 +1,5 @@
 from __future__ import annotations
-import csv, json, os, shutil, subprocess, sys
+import csv, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 from .config import truthy
 from .evidence import validate_isolate

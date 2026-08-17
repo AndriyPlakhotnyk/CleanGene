@@ -7,7 +7,7 @@ from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, array_chunks, sbatch_cmd, submit, submit_chunked_arrays
 from cleangene.util import atomic_json, write_tsv
-from cleangene.workers import _run_array_stage, ensure_kraken2_db, manifest_pangenome_dir, parse_kraken_report
+from cleangene.workers import _run_array_stage, _wait_jobs, ensure_kraken2_db, manifest_pangenome_dir, parse_kraken_report
 from cleangene.cli import make_run, slurm
 from unittest.mock import patch
 import subprocess
@@ -161,5 +161,15 @@ class CleanGeneCoreTests(unittest.TestCase):
         array=seen[0][0][seen[0][0].index("--array")+1]
         self.assertEqual(array,"0-189%100")
         self.assertEqual(seen[0][1],190)
+
+    def test_wait_jobs_sleep_branch_has_time_import(self):
+        cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0"}
+        with patch("cleangene.workers.job_active",side_effect=[{"1"},set()]), \
+             patch("cleangene.workers.user_job_count",return_value=0), \
+             patch("cleangene.workers.assert_jobs_succeeded"), \
+             patch("cleangene.workers.time.sleep") as sleep, \
+             contextlib.redirect_stdout(StringIO()):
+            _wait_jobs(["1"],cfg,"x","0/1 complete")
+        sleep.assert_called_once_with(0)
 
 if __name__ == "__main__": unittest.main()
