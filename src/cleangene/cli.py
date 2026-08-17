@@ -9,10 +9,22 @@ from .slurm import sbatch_cmd, submit
 from .util import atomic_json, command_exists, safe_name, sha256, write_tsv
 from .workers import dispatch
 
+def validate_fastq_inputs(rows: list[dict[str,str]]) -> None:
+    errors=[]
+    for row in rows:
+        if row.get("raw_bam"): continue
+        r1=row.get("R1","").strip(); r2=row.get("R2","").strip()
+        if not r1 or not r2:
+            errors.append(f"{row['isolate_id']}: missing R1/R2")
+        elif not Path(r1).is_file() or not Path(r2).is_file():
+            errors.append(f"{row['isolate_id']}: FASTQ path not found R1={r1} R2={r2}")
+    if errors:
+        raise SystemExit("Manifest FASTQ validation failed:\n" + "\n".join(errors[:20]))
+
 def make_run(manifest: Path, analysis_root: Path, cfg: dict[str,str], run_id: str | None) -> Path:
     rid=run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=analysis_root/"runs"/rid
     (run/"provenance").mkdir(parents=True,exist_ok=True); (run/"state").mkdir(exist_ok=True); (run/"logs"/"slurm").mkdir(parents=True,exist_ok=True)
-    rows=load_manifest(manifest); write_resolved(run/"provenance"/"manifest.tsv",rows); atomic_json(run/"provenance"/"resolved_config.json",cfg); atomic_json(run/"provenance"/"inputs.json",{"manifest":str(manifest.resolve()),"manifest_sha256":sha256(manifest),"created":datetime.now().isoformat()})
+    rows=load_manifest(manifest); validate_fastq_inputs(rows); write_resolved(run/"provenance"/"manifest.tsv",rows); atomic_json(run/"provenance"/"resolved_config.json",cfg); atomic_json(run/"provenance"/"inputs.json",{"manifest":str(manifest.resolve()),"manifest_sha256":sha256(manifest),"created":datetime.now().isoformat()})
     write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in rows)); write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],([g,sum(1 for r in rows if r["group_id"]==g),"unresolved"] for g in groups(rows)))
     return run
 

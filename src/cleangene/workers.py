@@ -17,6 +17,11 @@ def task_row(run_dir: Path, kind: str, index: int) -> dict[str,str]:
     if index<0 or index>=len(rows): raise SystemExit(f"Task index {index} outside {kind} task list")
     return rows[index]
 
+def manifest_row_for_task(task: dict[str,str], rows: list[dict[str,str]]) -> dict[str,str]:
+    matches=[r for r in rows if r["isolate_id"]==task["isolate_id"]]
+    if len(matches)!=1: raise SystemExit(f"Could not resolve manifest row for isolate {task['isolate_id']}")
+    return {**matches[0], **task}
+
 def shlex_quote(x: str) -> str:
     import shlex
     return shlex.quote(x)
@@ -79,6 +84,8 @@ def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str
         run(["samtools","fastq","-@",threads,"-1",r1,"-2",r2,"-0",str(other),"-s",str(other),"-n",str(collated)],
             stdout=logs/"samtools-fastq.stdout",stderr=logs/"samtools-fastq.stderr")
         method="raw_bam_samtools_fastq"
+    if not r1 or not r2:
+        raise SystemExit(f"Missing R1/R2 read paths for isolate {row.get('isolate_id','<unknown>')}")
     if mode not in {"off","auto","always"}: raise SystemExit("READ_TRIMMING_MODE must be off, auto, or always")
     if mode in {"auto","always"}:
         if command_exists("fastp"):
@@ -94,7 +101,7 @@ def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str
     return r1,r2,method,trimmed
 
 def preprocess(run_dir: Path, index: int) -> None:
-    cfg, rows=context(run_dir); row=task_row(run_dir,"isolate",index); iso=row["isolate_id"]; group=row["group_id"]; safe=safe_name(iso)
+    cfg, rows=context(run_dir); row=manifest_row_for_task(task_row(run_dir,"isolate",index),rows); iso=row["isolate_id"]; group=row["group_id"]; safe=safe_name(iso)
     root=run_dir/"results"/"groups"/safe_name(group); out=root/"01_isolates"/safe; done=run_dir/"state"/"preprocess"/f"{safe}.done.json"
     if done.is_file():
         status=load_json(done)

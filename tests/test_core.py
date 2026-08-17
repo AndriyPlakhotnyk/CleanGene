@@ -7,7 +7,7 @@ from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, array_chunks, sbatch_cmd, submit, submit_chunked_arrays
 from cleangene.util import atomic_json, write_tsv
-from cleangene.workers import _run_array_stage, _wait_jobs, ensure_kraken2_db, manifest_pangenome_dir, parse_kraken_report
+from cleangene.workers import _run_array_stage, _wait_jobs, ensure_kraken2_db, manifest_pangenome_dir, manifest_row_for_task, parse_kraken_report, task_row
 from cleangene.cli import make_run, slurm
 from unittest.mock import patch
 import subprocess
@@ -66,6 +66,20 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertEqual(rows[0]["isolate_id"],"iso1")
             self.assertEqual(rows[0]["group_id"],"Species A")
 
+    def test_worker_task_preserves_fastq_paths_from_four_column_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); r1=root/"r1.fq"; r2=root/"r2.fq"
+            r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
+            manifest=root/"manifest.tsv"
+            manifest.write_text(f"isolate_id\torganism\tR1\tR2\niso1\tSpecies A\t{r1}\t{r2}\n")
+            run=make_run(manifest,root,{"SLURM_ACCOUNT":"","SLURM_PARTITION":""},"r")
+            rows=load_manifest(run/"provenance"/"manifest.tsv")
+            row=manifest_row_for_task(task_row(run,"isolate",0),rows)
+            self.assertEqual(row["isolate_id"],"iso1")
+            self.assertEqual(row["organism"],"Species A")
+            self.assertEqual(row["R1"],str(r1))
+            self.assertEqual(row["R2"],str(r2))
+
     def test_normalize_panaroo_accepts_safe_isolate_names(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/"gene_presence_absence.csv"
@@ -104,7 +118,9 @@ class CleanGeneCoreTests(unittest.TestCase):
     def test_slurm_dry_run_uses_kraken_db_dependency_and_chunks(self):
         with tempfile.TemporaryDirectory() as d:
             manifest=Path(d)/"m.tsv"
-            manifest.write_text("isolate_id\torganism\tR1\tR2\n" + "\n".join(f"i{x}\tSpecies\tr1.fq\tr2.fq" for x in range(3)) + "\n")
+            r1=Path(d)/"r1.fq"; r2=Path(d)/"r2.fq"
+            r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
+            manifest.write_text("isolate_id\torganism\tR1\tR2\n" + "\n".join(f"i{x}\tSpecies\t{r1}\t{r2}" for x in range(3)) + "\n")
             cfg={"SLURM_ACCOUNT":"","SLURM_PARTITION":"","SLURM_CONTROLLER_CPUS":"1","SLURM_CONTROLLER_MEM":"1G","SLURM_CONTROLLER_TIME":"1:00:00","TAXONOMY_MODE":"kraken2"}
             run=make_run(manifest,Path(d),cfg,"r")
             buf=StringIO()
