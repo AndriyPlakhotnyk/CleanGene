@@ -63,7 +63,7 @@
    Job status with `squeue -j <JOB_ID>`. Logs are in `<analysis_root>/runs/<run-id>/logs/slurm/*.log`.
 
 7. **Large scale (≥30 k isolates)**  
-   Use `config/cleangene.arc.env` on ARC. It leaves `SLURM_PARTITION` empty, submits organisms smallest first, and uses Panaroo resource tiers for small (<500), medium (500-2000), and large (>2000) organism groups.
+   Use `config/cleangene.arc.env` on ARC. It leaves `SLURM_PARTITION` empty, chunks large SLURM arrays with `SLURM_ARRAY_CHUNK_SIZE=500`, throttles chunks with `SLURM_MAX_OUTSTANDING_CHUNKS=1`, submits organisms smallest first, and uses Panaroo resource tiers for small (<500), medium (500-2000), and large (>2000) organism groups. ARC config sets `TAXONOMY_MODE=kraken2`, so Kraken2 QC runs in preprocess workers.
 
 8. **Resume an unfinished run**
 

@@ -6,7 +6,7 @@ from .evidence import validate_isolate
 from .fasta import assembly_metrics
 from .manifest import groups, write_resolved
 from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_binary
-from .slurm import sbatch_cmd, submit
+from .slurm import array_chunks, sbatch_cmd, submit, submit_chunked_arrays
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 
 def context(run_dir: Path):
@@ -38,36 +38,33 @@ def needs_kraken(rows: list[dict[str,str]], cfg: dict[str,str]) -> bool:
     mode=cfg.get("TAXONOMY_MODE","auto")
     return mode not in {"off","auto"} or any(r.get("grouping_source")=="kraken_pending" for r in rows)
 
+def default_kraken2_db(run_dir: Path, cfg: dict[str,str]) -> Path:
+    return Path(cfg.get("KRAKEN2_BUILD_DIR","") or run_dir.parent.parent/"databases"/f"kraken2_{cfg.get('KRAKEN2_DATABASE_SIZE','standard-8')}").expanduser().resolve()
+
 def ensure_kraken2_db(run_dir: Path, cfg: dict[str,str], rows: list[dict[str,str]]) -> str:
     db=cfg.get("KRAKEN2_DB","").strip()
-    if db:
-        return db
+    if db and (Path(db)/"hash.k2d").is_file(): return db
     if not needs_kraken(rows,cfg):
         return ""
     if not truthy(cfg.get("KRAKEN2_AUTO_DOWNLOAD","true")):
         raise SystemExit("KRAKEN2_DB is required when taxonomy or Kraken-inferred grouping is enabled")
-    db_path=Path(cfg.get("KRAKEN2_BUILD_DIR","") or run_dir.parent.parent/"databases"/f"kraken2_{cfg.get('KRAKEN2_DATABASE_SIZE','standard-8')}").expanduser().resolve()
+    db_path=default_kraken2_db(run_dir,cfg)
+    if (db_path/"hash.k2d").is_file(): return str(db_path)
+    raise SystemExit(f"Kraken2 database is not ready: {db_path}. The kraken_db_setup SLURM stage must complete before preprocess.")
+
+def kraken_db_setup(run_dir: Path, index: int | None = None) -> None:
+    cfg, rows=context(run_dir)
+    if not needs_kraken(rows,cfg): touch_done(run_dir/"state"/"kraken_db_setup.done.json",{"status":"not_required"}); return
+    db=cfg.get("KRAKEN2_DB","").strip()
+    db_path=Path(db).expanduser().resolve() if db else default_kraken2_db(run_dir,cfg)
     if not (db_path/"hash.k2d").is_file():
-        lock=db_path.with_suffix(".build.lock")
         db_path.parent.mkdir(parents=True,exist_ok=True)
-        import time
-        while True:
-            try:
-                lock.mkdir()
-                break
-            except FileExistsError:
-                if (db_path/"hash.k2d").is_file(): return str(db_path)
-                time.sleep(30)
         script=Path(__file__).resolve().parents[2]/"scripts"/"build_kraken2_database.sh"
-        try:
-            run([str(script),str(db_path),cfg.get("SLURM_CPUS",cfg.get("CPUS","4")),cfg.get("KRAKEN2_CLEAN_BUILD_FILES","true"),cfg.get("KRAKEN2_DATABASE_SIZE","standard-8")],stdout=run_dir/"logs"/"kraken2-db.stdout",stderr=run_dir/"logs"/"kraken2-db.stderr")
-        finally:
-            try: lock.rmdir()
-            except OSError: pass
+        run([str(script),str(db_path),cfg.get("KRAKEN2_DB_CPUS",cfg.get("CPUS","4")),cfg.get("KRAKEN2_CLEAN_BUILD_FILES","true"),cfg.get("KRAKEN2_DATABASE_SIZE","standard-8")],stdout=run_dir/"logs"/"kraken2-db.stdout",stderr=run_dir/"logs"/"kraken2-db.stderr")
     cfg["KRAKEN2_DB"]=str(db_path)
     from .util import atomic_json
     atomic_json(run_dir/"provenance"/"resolved_config.json",cfg)
-    return str(db_path)
+    touch_done(run_dir/"state"/"kraken_db_setup.done.json",{"KRAKEN2_DB":str(db_path)})
 
 def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int]:
     r1=row.get("R1","").strip(); r2=row.get("R2","").strip(); mode=cfg.get("READ_TRIMMING_MODE","auto").strip().lower()
@@ -182,7 +179,7 @@ def resolve_groups(run_dir: Path, index: int | None = None) -> None:
 
 def orchestrate_downstream(run_dir: Path, index: int | None = None) -> None:
     cfg,_=context(run_dir); group_rows=read_tsv(run_dir/"state"/"group_tasks.tsv"); isolate_rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
-    exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"; maxp=cfg["SLURM_MAX_PARALLEL"]
+    exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"; maxp=cfg["SLURM_MAX_PARALLEL"]; chunk=int(cfg["SLURM_ARRAY_CHUNK_SIZE"]); outstanding=int(cfg["SLURM_MAX_OUTSTANDING_CHUNKS"])
     base=dict(account=cfg["SLURM_ACCOUNT"],partition=cfg["SLURM_PARTITION"])
     def cmd(stage,array,cpus,mem,time,dep=None):
         idx='${SLURM_ARRAY_TASK_ID}' if array else '0'
@@ -190,21 +187,19 @@ def orchestrate_downstream(run_dir: Path, index: int | None = None) -> None:
         log=run_dir/"logs"/"slurm"/f"{stage}.%A_%a.log"
         return sbatch_cmd(name=f"cg-{stage}",wrap=wrap,cpus=cpus,mem=mem,time=time,array=array,dependency=dep,log=log,**base)
     previous=None; prepare_deps=[]
-    start=0
     for klass in ("small","medium","large"):
         indices=[i for i,r in enumerate(group_rows) if r.get("group_size_class")==klass]
         if not indices: continue
-        array=f"{indices[0]}-{indices[-1]}%{maxp}" if indices==list(range(indices[0],indices[-1]+1)) else ",".join(map(str,indices))
         prefix=f"PANAROO_{klass.upper()}"
-        p=submit(cmd("panaroo",array,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),previous),False)
-        previous=submit(cmd("prepare_validation",array,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),p),False)
-        prepare_deps.append(previous)
-        start += len(indices)
+        pan=submit_chunked_arrays(lambda array, d: cmd("panaroo",array,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),d),array_chunks(indices,chunk,maxp),False,outstanding,previous)
+        prep=submit_chunked_arrays(lambda array, d: cmd("prepare_validation",array,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),d),array_chunks(indices,chunk,maxp),False,outstanding,":".join(pan))
+        previous=":".join(prep)
+        prepare_deps.extend(prep)
     dep=":".join(prepare_deps) if prepare_deps else None
     ni=len(isolate_rows); ng=len(group_rows)
-    jv=submit(cmd("validate",f"0-{ni-1}%{maxp}",cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],dep),False) if ni else None
-    jr=submit(cmd("reduce",f"0-{ng-1}%{maxp}",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],jv),False) if ng else None
-    submit(cmd("summary",None,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],jr),False)
+    val=submit_chunked_arrays(lambda array, d: cmd("validate",array,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],d),array_chunks(range(ni),chunk,maxp),False,outstanding,dep) if ni else []
+    red=submit_chunked_arrays(lambda array, d: cmd("reduce",array,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],d),array_chunks(range(ng),chunk,maxp),False,outstanding,":".join(val) if val else None) if ng else []
+    submit(cmd("summary",None,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],":".join(red) if red else None),False)
     touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":ng,"isolates":ni})
 
 def manifest_pangenome_dir(rows: list[dict[str,str]], group: str) -> Path | None:
@@ -313,7 +308,8 @@ def summarize(run_dir: Path) -> None:
     cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); touch_done(run_dir/"state"/"summary.done.json",{"groups":len(group_rows)})
 
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
-    if stage=="preprocess": preprocess(run_dir,int(index))
+    if stage=="kraken_db_setup": kraken_db_setup(run_dir,index)
+    elif stage=="preprocess": preprocess(run_dir,int(index))
     elif stage=="resolve_groups": resolve_groups(run_dir,index)
     elif stage=="orchestrate_downstream": orchestrate_downstream(run_dir,index)
     elif stage=="panaroo": panaroo(run_dir,int(index))

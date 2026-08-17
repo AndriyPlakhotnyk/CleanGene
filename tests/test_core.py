@@ -1,10 +1,14 @@
 import tempfile, unittest
 from pathlib import Path
+from io import StringIO
+import contextlib
 from cleangene.manifest import groups, load_manifest
 from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
-from cleangene.slurm import sbatch_cmd, submit
-from cleangene.workers import manifest_pangenome_dir, parse_kraken_report
+from cleangene.slurm import array_chunks, sbatch_cmd, submit, submit_chunked_arrays
+from cleangene.util import atomic_json, write_tsv
+from cleangene.workers import ensure_kraken2_db, manifest_pangenome_dir, parse_kraken_report
+from cleangene.cli import make_run, slurm
 from unittest.mock import patch
 import subprocess
 
@@ -78,14 +82,48 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertEqual(manifest_pangenome_dir(rows,"g"),pan.resolve())
 
     def test_sbatch_array_uses_configured_parallel_value(self):
-        cmd=sbatch_cmd(name="x",wrap="echo ok",cpus="1",mem="1G",time="00:05:00",array="0-28293%100")
+        cmd=sbatch_cmd(name="x",wrap="echo ok",cpus="1",mem="1G",time="00:05:00",array=array_chunks(range(28294),500,"100")[0])
         self.assertIn("--array",cmd)
-        self.assertEqual(cmd[cmd.index("--array")+1],"0-28293%100")
+        self.assertEqual(cmd[cmd.index("--array")+1],"0-499%100")
+
+    def test_chunked_arrays_chain_dependencies(self):
+        seen=[]
+        def build(array, dep):
+            seen.append((array,dep)); return ["sbatch","--array",array]
+        with contextlib.redirect_stdout(StringIO()):
+            ids=submit_chunked_arrays(build,array_chunks(range(1200),500,"100"),True,1,"dbjob")
+        self.assertEqual(ids,["DRYRUN","DRYRUN","DRYRUN"])
+        self.assertEqual(seen,[("0-499%100","dbjob"),("500-999%100","DRYRUN"),("1000-1199%100","DRYRUN")])
 
     def test_submit_reports_sbatch_stderr(self):
         failed=subprocess.CompletedProcess(["sbatch"],1,stdout="",stderr="Batch job submission failed: throttled")
         with patch("cleangene.slurm.subprocess.run",return_value=failed):
             with self.assertRaisesRegex(RuntimeError,"throttled"):
                 submit(["sbatch","--array","0-10%100"],False)
+
+    def test_slurm_dry_run_uses_kraken_db_dependency_and_chunks(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest=Path(d)/"m.tsv"
+            manifest.write_text("isolate_id\torganism\tR1\tR2\n" + "\n".join(f"i{x}\tSpecies\tr1.fq\tr2.fq" for x in range(3)) + "\n")
+            cfg={"SLURM_ACCOUNT":"","SLURM_PARTITION":"","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"2","SLURM_MAX_OUTSTANDING_CHUNKS":"1","SLURM_CPUS":"1","SLURM_MEM":"1G","SLURM_TIME":"1:00:00","GROUP_ORCHESTRATOR_CPUS":"1","GROUP_ORCHESTRATOR_MEM":"1G","GROUP_ORCHESTRATOR_TIME":"1:00:00","TAXONOMY_MODE":"kraken2","KRAKEN2_DB":"","KRAKEN2_DB_CPUS":"1","KRAKEN2_DB_MEM":"1G","KRAKEN2_DB_TIME":"1:00:00"}
+            run=make_run(manifest,Path(d),cfg,"r")
+            buf=StringIO()
+            with contextlib.redirect_stdout(buf):
+                slurm(run,cfg,True)
+            out=buf.getvalue()
+            self.assertIn("cg-kraken_db_setup",out)
+            self.assertIn("--array 0-1%100",out)
+            self.assertIn("--array 2%100",out)
+            self.assertIn("--dependency afterok:DRYRUN",out)
+
+    def test_preprocess_cannot_build_missing_kraken_db(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"runs"/"r"; (run/"provenance").mkdir(parents=True)
+            cfg={"TAXONOMY_MODE":"kraken2","KRAKEN2_DB":"","KRAKEN2_AUTO_DOWNLOAD":"true","KRAKEN2_DATABASE_SIZE":"standard-8"}
+            rows=[{"isolate_id":"i1","group_id":"g","grouping_source":"manifest_group_id","R1":"r1","R2":"r2"}]
+            atomic_json(run/"provenance"/"resolved_config.json",cfg)
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","grouping_source","R1","R2"],rows)
+            with self.assertRaisesRegex(SystemExit,"kraken_db_setup"):
+                ensure_kraken2_db(run,cfg,rows)
 
 if __name__ == "__main__": unittest.main()
