@@ -1,40 +1,42 @@
 # Ignore compiled Python files
-__pycache__/ 
-*.py[cod] 
-*$py.class 
+__pycache__/
+*.py[cod]
+*$py.class
 
 # Distribution / packaging directories
-.Python 
-build/ 
-develop-eggs/ 
-dist/ 
-downloads/ 
-eggs/ 
-lib/ 
-lib64/ 
-parts/ 
-sdist/ 
-var/ 
-wheels/ 
-pip-wheel-metadata/ 
-share/python-wheels/ 
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
 
 # Installer logs
-pip-log.txt 
-pip-delete-this-directory.txt 
+pip-log.txt
+pip-delete-this-directory.txt
 
 # Virtual environments
-.venv/ 
-env/ 
-ENV/ 
-env.bak/ 
-venv/ 
-tmp/ 
+.venv/
+env/
+ENV/
+env.bak/
+venv/
+tmp/
 
-# Data and output directories
+# Data, output, and local AI handoff notes
 input/*.tsv
 config/cleangene.env
 results/
+test_data/
+.cleangene_ai_handoff.md
 *.log
 *.out
-*.err\n\ntest_data/
+*.err

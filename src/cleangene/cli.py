@@ -24,14 +24,17 @@ def load_existing(root: Path, run_id: str) -> Path:
 def check(args) -> int:
     rows=load_manifest(args.manifest); cfg=read_env(args.config); required=["shovill","prokka","panaroo","bwa","samtools","bcftools","minimap2"]
     if cfg["TAXONOMY_MODE"]!="off": required.append("kraken2")
+    if cfg.get("READ_TRIMMING_MODE","auto")=="always": required.append("fastp")
     missing=[x for x in required if not command_exists(x)]
     print(f"manifest: {len(rows)} isolates / {len(groups(rows))} groups")
+    print(f"inputs: {sum(1 for r in rows if r.get('raw_bam'))} raw BAM / {sum(1 for r in rows if r.get('R1') and r.get('R2'))} FASTQ-pair rows")
     print("tools: " + ("OK" if not missing else "missing " + ", ".join(missing)))
+    if cfg.get("READ_TRIMMING_MODE","auto")=="auto" and not command_exists("fastp"): print("warning: fastp not found; adapter trimming check will be skipped")
     if cfg["TAXONOMY_MODE"]!="off" and not cfg.get("KRAKEN2_DB"): print("warning: KRAKEN2_DB must be configured for a real run")
     return 0 if not missing else 2
 
 def estimate(args) -> int:
-    rows=load_manifest(args.manifest); total=sum(Path(r[k]).stat().st_size for r in rows for k in ("R1","R2")); ng=len(groups(rows)); n=len(rows)
+    rows=load_manifest(args.manifest); total=sum(Path(r[k]).stat().st_size for r in rows for k in (("raw_bam",) if r.get("raw_bam") else ("R1","R2"))); ng=len(groups(rows)); n=len(rows)
     print(json.dumps({"isolates":n,"groups":ng,"compressed_read_bytes":total,"slurm_preprocess_tasks":n,"slurm_panaroo_tasks":ng,"slurm_validation_tasks":n,"slurm_reduce_tasks":ng},indent=2)); return 0
 
 def local(run: Path) -> None:

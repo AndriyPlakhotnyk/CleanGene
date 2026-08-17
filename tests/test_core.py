@@ -1,8 +1,9 @@
 import tempfile, unittest
 from pathlib import Path
+from cleangene.manifest import groups, load_manifest
 from cleangene.fasta import assembly_metrics
-from cleangene.pangenome import present, select_rows
-from cleangene.workers import parse_kraken_report
+from cleangene.pangenome import normalize_panaroo, present, select_rows
+from cleangene.workers import manifest_pangenome_dir, parse_kraken_report
 
 class CleanGeneCoreTests(unittest.TestCase):
     def test_present(self):
@@ -24,5 +25,37 @@ class CleanGeneCoreTests(unittest.TestCase):
             p=Path(d)/"k.tsv"; p.write_text("70.0\t700\t700\tS\t1\t  Expected species\n6.0\t60\t60\tS\t2\t  Other species\n")
             top, contamination, _=parse_kraken_report(p,"Expected species")
             self.assertEqual(top,"Expected species"); self.assertAlmostEqual(contamination,6.0)
+
+    def test_manifest_infers_group_and_pangenome(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"manifest.tsv"
+            p.write_text("# comment\nisolate_id\torganism\tR1\tR2\tpangenome\niso1\tSpecies A\tr1.fq\tr2.fq\t/pan\n")
+            rows=load_manifest(p)
+            self.assertEqual(rows[0]["group_id"],"Species A")
+            self.assertEqual(rows[0]["pangenome_dir"],"/pan")
+            self.assertEqual(groups(rows),["Species A"])
+
+    def test_manifest_accepts_raw_bam_without_fastq(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"manifest.tsv"
+            p.write_text("isolate_id\tgroup_id\traw_bam\niso1\tg1\treads.bam\n")
+            rows=load_manifest(p)
+            self.assertEqual(rows[0]["raw_bam"],"reads.bam")
+            self.assertEqual(rows[0]["group_id"],"g1")
+
+    def test_normalize_panaroo_accepts_safe_isolate_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"gene_presence_absence.csv"
+            p.write_text("Gene,iso_1,iso_2\nabc,locus1,\ndef,,locus2\n")
+            rows=normalize_panaroo(p,["iso 1","iso 2"])
+            self.assertEqual(rows,[{"Gene":"abc","iso 1":1,"iso 2":0},{"Gene":"def","iso 1":0,"iso 2":1}])
+
+    def test_manifest_pangenome_dir_requires_one_valid_panaroo_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            pan=Path(d)/"panaroo"
+            pan.mkdir()
+            (pan/"gene_presence_absence.csv").write_text("Gene,iso1,iso2\nabc,a,b\n")
+            rows=[{"group_id":"g","pangenome_dir":str(pan)},{"group_id":"g","pangenome_dir":str(pan)}]
+            self.assertEqual(manifest_pangenome_dir(rows,"g"),pan.resolve())
 
 if __name__ == "__main__": unittest.main()

@@ -21,7 +21,14 @@
 
    ```text
    isolate_id  group_id  R1         R2
-   ERR001      sp00001    /data/r1.fastq.gz  /data/r2.fastq.gz
+   ERR001      sp00001   /data/r1.fastq.gz  /data/r2.fastq.gz
+   ```
+
+   Raw sequencing BAM containers are also accepted instead of FASTQ pairs:
+
+   ```text
+   isolate_id  group_id  raw_bam
+   ERR001      sp00001   /data/raw_reads.bam
    ```
 
 4. **Run a test dry‑run**

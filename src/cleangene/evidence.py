@@ -75,6 +75,6 @@ def validate_isolate(reference: Path, key_tsv: Path, r1: str, r2: str, outdir: P
         key=row["reference_id"]; gene=row["Gene"]; c=cov.get(key,{}); a=aln.get(key,{})
         breadth=float(c.get("breadth",0)); depth=float(c.get("mean_depth",0)); identity=float(a.get("identity",0)); call=int(breadth>=min_breadth and depth>=min_depth and identity>=min_identity)
         state="confirmed_present" if call else "partial_or_divergent" if breadth>0 else "not_detected"
-        rows.append({"reference_id":key,"Gene":gene,"validated_call":call,"validation_state":state,"breadth":breadth,"mean_depth":depth,"identity":identity,"identical_positions":int(a.get("identical_positions",0)),"aligned_positions":int(a.get("aligned_positions",0)),"mapped_reads":int(c.get("mapped_reads",0)),"mean_mapping_quality":float(c.get("mean_mapping_quality",0))})
-    fields=["reference_id","Gene","validated_call","validation_state","breadth","mean_depth","identity","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"]
+        rows.append({"reference_id":key,"Gene":gene,"validated_call":call,"validation_state":state,"breadth":breadth,"percent_coverage":breadth*100.0,"mean_depth":depth,"identity":identity,"percent_identity":identity*100.0,"identical_positions":int(a.get("identical_positions",0)),"aligned_positions":int(a.get("aligned_positions",0)),"mapped_reads":int(c.get("mapped_reads",0)),"mean_mapping_quality":float(c.get("mean_mapping_quality",0))})
+    fields=["reference_id","Gene","validated_call","validation_state","breadth","percent_coverage","mean_depth","identity","percent_identity","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"]
     write_tsv(outdir/"metrics.tsv",fields,rows)
