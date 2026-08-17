@@ -22,6 +22,8 @@ This source release has not executed Shovill, Prokka, Panaroo, BWA, SAMtools, BC
 - If `group_id` is omitted, CleanGene uses `organism` as the group label, falling back to `default`.
 - Input reads may be supplied as paired FASTQs (`R1`/`R2`) or as an unmapped/raw sequencing BAM (`raw_bam`, `BAM`, or `bam`). Raw BAM reads are extracted with `samtools fastq` before assembly, taxonomy, and BWA validation.
 - `READ_TRIMMING_MODE` controls adapter handling: `auto` runs `fastp --detect_adapter_for_pe` when available, `always` requires `fastp`, and `off` leaves reads unchanged.
+- Skani is not part of the CleanGene pipeline. If `group_id` is absent but `organism` is supplied, `organism` becomes the pangenome group. If both are absent, CleanGene runs Kraken2 and groups isolates by inferred top species.
+- With `TAXONOMY_MODE=auto`, Kraken2 runs only when needed for missing organism/group IDs. Use `TAXONOMY_MODE=kraken2` to force taxonomic QC for already grouped manifests.
 - A manifest may provide `pangenome_dir`, `panaroo_dir`, or `pangenome` for a group that already has Panaroo output. CleanGene reuses `gene_presence_absence.csv` and the Panaroo sequence files, then runs BWA/SAMtools/BCFtools/minimap2 read validation.
 - Kraken2 is an isolate-level taxonomy/contamination gate and requires a site database unless taxonomy is disabled.
 - Population-structure inference is not part of CleanGene; its responsibility is the evidence-backed gene matrix and QC.

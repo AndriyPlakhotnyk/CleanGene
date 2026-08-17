@@ -1,11 +1,12 @@
 from __future__ import annotations
-import csv, json, os, shutil, subprocess
+import csv, json, os, shutil, subprocess, sys
 from pathlib import Path
 from .config import truthy
 from .evidence import validate_isolate
 from .fasta import assembly_metrics
-from .manifest import load_manifest, groups
+from .manifest import groups, write_resolved
 from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_binary
+from .slurm import sbatch_cmd, submit
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 
 def context(run_dir: Path):
@@ -15,6 +16,10 @@ def task_row(run_dir: Path, kind: str, index: int) -> dict[str,str]:
     rows=read_tsv(run_dir/"state"/f"{kind}_tasks.tsv")
     if index<0 or index>=len(rows): raise SystemExit(f"Task index {index} outside {kind} task list")
     return rows[index]
+
+def shlex_quote(x: str) -> str:
+    import shlex
+    return shlex.quote(x)
 
 def parse_kraken_report(path: Path, expected: str) -> tuple[str,float,float]:
     top=("",-1.0); contamination=0.0; unclassified=0.0; expected_norm=" ".join(expected.lower().split())
@@ -28,6 +33,41 @@ def parse_kraken_report(path: Path, expected: str) -> tuple[str,float,float]:
             if expected_norm and norm!=expected_norm: contamination += pct
         if rank=="U": unclassified=max(unclassified,pct)
     return top[0], contamination, max(0.0,100.0-unclassified)
+
+def needs_kraken(rows: list[dict[str,str]], cfg: dict[str,str]) -> bool:
+    mode=cfg.get("TAXONOMY_MODE","auto")
+    return mode not in {"off","auto"} or any(r.get("grouping_source")=="kraken_pending" for r in rows)
+
+def ensure_kraken2_db(run_dir: Path, cfg: dict[str,str], rows: list[dict[str,str]]) -> str:
+    db=cfg.get("KRAKEN2_DB","").strip()
+    if db:
+        return db
+    if not needs_kraken(rows,cfg):
+        return ""
+    if not truthy(cfg.get("KRAKEN2_AUTO_DOWNLOAD","true")):
+        raise SystemExit("KRAKEN2_DB is required when taxonomy or Kraken-inferred grouping is enabled")
+    db_path=Path(cfg.get("KRAKEN2_BUILD_DIR","") or run_dir.parent.parent/"databases"/f"kraken2_{cfg.get('KRAKEN2_DATABASE_SIZE','standard-8')}").expanduser().resolve()
+    if not (db_path/"hash.k2d").is_file():
+        lock=db_path.with_suffix(".build.lock")
+        db_path.parent.mkdir(parents=True,exist_ok=True)
+        import time
+        while True:
+            try:
+                lock.mkdir()
+                break
+            except FileExistsError:
+                if (db_path/"hash.k2d").is_file(): return str(db_path)
+                time.sleep(30)
+        script=Path(__file__).resolve().parents[2]/"scripts"/"build_kraken2_database.sh"
+        try:
+            run([str(script),str(db_path),cfg.get("SLURM_CPUS",cfg.get("CPUS","4")),cfg.get("KRAKEN2_CLEAN_BUILD_FILES","true"),cfg.get("KRAKEN2_DATABASE_SIZE","standard-8")],stdout=run_dir/"logs"/"kraken2-db.stdout",stderr=run_dir/"logs"/"kraken2-db.stderr")
+        finally:
+            try: lock.rmdir()
+            except OSError: pass
+    cfg["KRAKEN2_DB"]=str(db_path)
+    from .util import atomic_json
+    atomic_json(run_dir/"provenance"/"resolved_config.json",cfg)
+    return str(db_path)
 
 def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int]:
     r1=row.get("R1","").strip(); r2=row.get("R2","").strip(); mode=cfg.get("READ_TRIMMING_MODE","auto").strip().lower()
@@ -57,16 +97,17 @@ def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str
     return r1,r2,method,trimmed
 
 def preprocess(run_dir: Path, index: int) -> None:
-    cfg, _=context(run_dir); row=task_row(run_dir,"isolate",index); iso=row["isolate_id"]; group=row["group_id"]; safe=safe_name(iso)
+    cfg, rows=context(run_dir); row=task_row(run_dir,"isolate",index); iso=row["isolate_id"]; group=row["group_id"]; safe=safe_name(iso)
     root=run_dir/"results"/"groups"/safe_name(group); out=root/"01_isolates"/safe; done=run_dir/"state"/"preprocess"/f"{safe}.done.json"
     if done.is_file():
         status=load_json(done)
-        if status.get("excluded") or (out/"annotation"/f"{safe}.gff").is_file(): return
+        if status.get("excluded") or status.get("external_pangenome") or (out/"annotation"/f"{safe}.gff").is_file(): return
     out.mkdir(parents=True,exist_ok=True); logs=out/"logs"; logs.mkdir(exist_ok=True)
     r1,r2,read_method,adapter_trimmed=prepare_read_inputs(row,out,logs,cfg)
     expected=row.get("organism","").strip(); taxonomy=cfg.get("TAXONOMY_MODE","auto"); excluded=False; top=""; contam=0.0
-    if taxonomy!="off":
-        db=cfg.get("KRAKEN2_DB","")
+    taxonomy_enabled=taxonomy not in {"off","auto"} or row.get("grouping_source")=="kraken_pending"
+    if taxonomy_enabled:
+        db=ensure_kraken2_db(run_dir,cfg,rows)
         if not db: raise SystemExit("KRAKEN2_DB is required when TAXONOMY_MODE is not off")
         report=out/"kraken2.report.tsv"; output=out/"kraken2.output.tsv"
         run(["kraken2","--db",db,"--paired","--report",str(report),"--output",str(output),r1,r2],stdout=logs/"kraken2.stdout",stderr=logs/"kraken2.stderr")
@@ -78,6 +119,12 @@ def preprocess(run_dir: Path, index: int) -> None:
         fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"]
         data={"isolate_id":iso,"group_id":group,"excluded":1,"reason":"major_contamination","top_species":top,"contamination_pct":contam,"R1":r1,"R2":r2,"raw_bam":row.get("raw_bam",""),"read_preprocessing":read_method,"adapter_trimmed":adapter_trimmed,"assembly":assembly,"gff":"",**metrics}
         write_tsv(out/"qc.tsv",fields,[data]); touch_done(done,{"excluded":True,"reason":"major_contamination"}); return
+    external_pangenome=bool(row.get("pangenome_dir","").strip())
+    if external_pangenome and not assembly:
+        metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
+        fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"]
+        data={"isolate_id":iso,"group_id":group,"excluded":0,"reason":"","top_species":top,"contamination_pct":contam,"R1":r1,"R2":r2,"raw_bam":row.get("raw_bam",""),"read_preprocessing":read_method,"adapter_trimmed":adapter_trimmed,"assembly":"","gff":"",**metrics}
+        write_tsv(out/"qc.tsv",fields,[data]); touch_done(done,{"excluded":False,"external_pangenome":row["pangenome_dir"]}); return
     if not assembly:
         shov=out/"assembly"; shov.mkdir(exist_ok=True); assembly=str(shov/"contigs.fa")
         if not Path(assembly).is_file(): run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
@@ -93,12 +140,72 @@ def retained_rows(run_dir: Path, group: str) -> list[dict[str,str]]:
     _, rows=context(run_dir); result=[]
     for row in rows:
         if row["group_id"]!=group: continue
-        safe=safe_name(row["isolate_id"]); qc=run_dir/"results"/"groups"/safe_name(group)/"01_isolates"/safe/"qc.tsv"
+        safe=safe_name(row["isolate_id"]); qc=find_isolate_qc(run_dir,row)
         if not qc.is_file(): raise SystemExit(f"Missing isolate QC: {qc}")
         q=read_tsv(qc)[0]
         if q["excluded"] in {"1","true","True"}: continue
         row=dict(row); row["assembly"]=q["assembly"]; row["gff"]=q["gff"]; row["R1"]=q.get("R1",row.get("R1","")); row["R2"]=q.get("R2",row.get("R2","")); result.append(row)
     return result
+
+def find_isolate_qc(run_dir: Path, row: dict[str,str]) -> Path:
+    safe=safe_name(row["isolate_id"])
+    direct=run_dir/"results"/"groups"/safe_name(row["group_id"])/"01_isolates"/safe/"qc.tsv"
+    if direct.is_file(): return direct
+    hits=list((run_dir/"results"/"groups").glob(f"*/01_isolates/{safe}/qc.tsv"))
+    return hits[0] if hits else direct
+
+def group_size_class(n: int, cfg: dict[str,str]) -> str:
+    if n <= int(cfg.get("PANAROO_SMALL_MAX_ISOLATES","499")): return "small"
+    if n <= int(cfg.get("PANAROO_MEDIUM_MAX_ISOLATES","2000")): return "medium"
+    return "large"
+
+def resolve_groups(run_dir: Path, index: int | None = None) -> None:
+    cfg, rows=context(run_dir)
+    resolved=[]
+    for row in rows:
+        row=dict(row)
+        if row.get("grouping_source")=="kraken_pending":
+            qc=find_isolate_qc(run_dir,row)
+            top=read_tsv(qc)[0].get("top_species","").strip() if qc.is_file() else ""
+            if not top:
+                raise SystemExit(f"Kraken2 could not infer organism for isolate {row['isolate_id']}")
+            row["organism"]=top
+            row["group_id"]=top
+            row["grouping_source"]="kraken2_top_species"
+        resolved.append(row)
+    counts={g:sum(1 for r in resolved if r["group_id"]==g) for g in groups(resolved)}
+    ordered=sorted(counts, key=lambda g:(counts[g],g))
+    write_resolved(run_dir/"provenance"/"manifest.tsv",resolved)
+    write_tsv(run_dir/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in resolved))
+    write_tsv(run_dir/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],([g,counts[g],group_size_class(counts[g],cfg)] for g in ordered))
+    touch_done(run_dir/"state"/"resolve_groups.done.json",{"groups":len(ordered),"order":"smallest_first"})
+
+def orchestrate_downstream(run_dir: Path, index: int | None = None) -> None:
+    cfg,_=context(run_dir); group_rows=read_tsv(run_dir/"state"/"group_tasks.tsv"); isolate_rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
+    exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"; maxp=cfg["SLURM_MAX_PARALLEL"]
+    base=dict(account=cfg["SLURM_ACCOUNT"],partition=cfg["SLURM_PARTITION"])
+    def cmd(stage,array,cpus,mem,time,dep=None):
+        idx='${SLURM_ARRAY_TASK_ID}' if array else '0'
+        wrap=f"{exe} --stage {stage} --run-dir {shlex_quote(str(run_dir))} --index {idx}"
+        log=run_dir/"logs"/"slurm"/f"{stage}.%A_%a.log"
+        return sbatch_cmd(name=f"cg-{stage}",wrap=wrap,cpus=cpus,mem=mem,time=time,array=array,dependency=dep,log=log,**base)
+    previous=None; prepare_deps=[]
+    start=0
+    for klass in ("small","medium","large"):
+        indices=[i for i,r in enumerate(group_rows) if r.get("group_size_class")==klass]
+        if not indices: continue
+        array=f"{indices[0]}-{indices[-1]}%{maxp}" if indices==list(range(indices[0],indices[-1]+1)) else ",".join(map(str,indices))
+        prefix=f"PANAROO_{klass.upper()}"
+        p=submit(cmd("panaroo",array,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),previous),False)
+        previous=submit(cmd("prepare_validation",array,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),p),False)
+        prepare_deps.append(previous)
+        start += len(indices)
+    dep=":".join(prepare_deps) if prepare_deps else None
+    ni=len(isolate_rows); ng=len(group_rows)
+    jv=submit(cmd("validate",f"0-{ni-1}%{maxp}",cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],dep),False) if ni else None
+    jr=submit(cmd("reduce",f"0-{ng-1}%{maxp}",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],jv),False) if ng else None
+    submit(cmd("summary",None,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],jr),False)
+    touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":ng,"isolates":ni})
 
 def manifest_pangenome_dir(rows: list[dict[str,str]], group: str) -> Path | None:
     paths=sorted({r.get("pangenome_dir","").strip() for r in rows if r["group_id"]==group and r.get("pangenome_dir","").strip()})
@@ -202,11 +309,13 @@ def summarize(run_dir: Path) -> None:
         n_genes=max(0,len(read_tsv(val))) if val.is_file() else 0; group_rows.append([group,len([r for r in rows if r["group_id"]==group]),len(retained),n_genes])
         for row in rows:
             if row["group_id"]!=group: continue
-            q=read_tsv(root/"01_isolates"/safe_name(row["isolate_id"])/"qc.tsv")[0]; iso_rows.append(q)
+            q=read_tsv(find_isolate_qc(run_dir,row))[0]; q={**q,"group_id":group}; iso_rows.append(q)
     cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); touch_done(run_dir/"state"/"summary.done.json",{"groups":len(group_rows)})
 
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
     if stage=="preprocess": preprocess(run_dir,int(index))
+    elif stage=="resolve_groups": resolve_groups(run_dir,index)
+    elif stage=="orchestrate_downstream": orchestrate_downstream(run_dir,index)
     elif stage=="panaroo": panaroo(run_dir,int(index))
     elif stage=="prepare_validation": prepare_validation(run_dir,int(index))
     elif stage=="validate": validate(run_dir,int(index))

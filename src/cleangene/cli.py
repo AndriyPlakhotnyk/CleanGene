@@ -13,7 +13,7 @@ def make_run(manifest: Path, analysis_root: Path, cfg: dict[str,str], run_id: st
     rid=run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=analysis_root/"runs"/rid
     (run/"provenance").mkdir(parents=True,exist_ok=True); (run/"state").mkdir(exist_ok=True); (run/"logs"/"slurm").mkdir(parents=True,exist_ok=True)
     rows=load_manifest(manifest); write_resolved(run/"provenance"/"manifest.tsv",rows); atomic_json(run/"provenance"/"resolved_config.json",cfg); atomic_json(run/"provenance"/"inputs.json",{"manifest":str(manifest.resolve()),"manifest_sha256":sha256(manifest),"created":datetime.now().isoformat()})
-    write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in rows)); write_tsv(run/"state"/"group_tasks.tsv",["group_id"],([g] for g in groups(rows)))
+    write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in rows)); write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],([g,sum(1 for r in rows if r["group_id"]==g),"unresolved"] for g in groups(rows)))
     return run
 
 def load_existing(root: Path, run_id: str) -> Path:
@@ -23,14 +23,15 @@ def load_existing(root: Path, run_id: str) -> Path:
 
 def check(args) -> int:
     rows=load_manifest(args.manifest); cfg=read_env(args.config); required=["shovill","prokka","panaroo","bwa","samtools","bcftools","minimap2"]
-    if cfg["TAXONOMY_MODE"]!="off": required.append("kraken2")
+    needs_kraken=cfg["TAXONOMY_MODE"] not in {"off","auto"} or any(r.get("grouping_source")=="kraken_pending" for r in rows)
+    if needs_kraken: required.append("kraken2")
     if cfg.get("READ_TRIMMING_MODE","auto")=="always": required.append("fastp")
     missing=[x for x in required if not command_exists(x)]
     print(f"manifest: {len(rows)} isolates / {len(groups(rows))} groups")
     print(f"inputs: {sum(1 for r in rows if r.get('raw_bam'))} raw BAM / {sum(1 for r in rows if r.get('R1') and r.get('R2'))} FASTQ-pair rows")
     print("tools: " + ("OK" if not missing else "missing " + ", ".join(missing)))
     if cfg.get("READ_TRIMMING_MODE","auto")=="auto" and not command_exists("fastp"): print("warning: fastp not found; adapter trimming check will be skipped")
-    if cfg["TAXONOMY_MODE"]!="off" and not cfg.get("KRAKEN2_DB"): print("warning: KRAKEN2_DB must be configured for a real run")
+    if needs_kraken and not cfg.get("KRAKEN2_DB"): print("warning: KRAKEN2_DB is not configured; run will use KRAKEN2_AUTO_DOWNLOAD if enabled")
     return 0 if not missing else 2
 
 def estimate(args) -> int:
@@ -38,8 +39,10 @@ def estimate(args) -> int:
     print(json.dumps({"isolates":n,"groups":ng,"compressed_read_bytes":total,"slurm_preprocess_tasks":n,"slurm_panaroo_tasks":ng,"slurm_validation_tasks":n,"slurm_reduce_tasks":ng},indent=2)); return 0
 
 def local(run: Path) -> None:
-    ni=len((run/"state"/"isolate_tasks.tsv").read_text().splitlines())-1; ng=len((run/"state"/"group_tasks.tsv").read_text().splitlines())-1
+    ni=len((run/"state"/"isolate_tasks.tsv").read_text().splitlines())-1
     for i in range(ni): dispatch("preprocess",run,i)
+    dispatch("resolve_groups",run,None)
+    ng=len((run/"state"/"group_tasks.tsv").read_text().splitlines())-1
     for i in range(ng): dispatch("panaroo",run,i)
     for i in range(ng): dispatch("prepare_validation",run,i)
     for i in range(ni): dispatch("validate",run,i)
@@ -47,16 +50,13 @@ def local(run: Path) -> None:
     dispatch("summary",run,None)
 
 def slurm(run: Path, cfg: dict[str,str], dry: bool) -> None:
-    ni=len((run/"state"/"isolate_tasks.tsv").read_text().splitlines())-1; ng=len((run/"state"/"group_tasks.tsv").read_text().splitlines())-1; maxp=cfg["SLURM_MAX_PARALLEL"]; exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
+    ni=len((run/"state"/"isolate_tasks.tsv").read_text().splitlines())-1; maxp=cfg["SLURM_MAX_PARALLEL"]; exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
     base=dict(account=cfg["SLURM_ACCOUNT"],partition=cfg["SLURM_PARTITION"])
     def cmd(stage,array,cpus,mem,time,dep=None):
         idx='${SLURM_ARRAY_TASK_ID}' if array else '0'; wrap=f"{exe} --stage {stage} --run-dir {shlex_quote(str(run))} --index {idx}"; log=run/"logs"/"slurm"/f"{stage}.%A_%a.log"; return sbatch_cmd(name=f"cg-{stage}",wrap=wrap,cpus=cpus,mem=mem,time=time,array=array,dependency=dep,log=log,**base)
     j1=submit(cmd("preprocess",f"0-{ni-1}%{maxp}",cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"]),dry)
-    j2=submit(cmd("panaroo",f"0-{ng-1}%{maxp}",cfg["PANAROO_CPUS"],cfg["PANAROO_MEM"],cfg["PANAROO_TIME"],j1),dry)
-    j3=submit(cmd("prepare_validation",f"0-{ng-1}%{maxp}",cfg["PANAROO_CPUS"],cfg["PANAROO_MEM"],cfg["PANAROO_TIME"],j2),dry)
-    j4=submit(cmd("validate",f"0-{ni-1}%{maxp}",cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],j3),dry)
-    j5=submit(cmd("reduce",f"0-{ng-1}%{maxp}",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],j4),dry)
-    wrap=f"{exe} --stage summary --run-dir {shlex_quote(str(run))} --index 0"; submit(sbatch_cmd(name="cg-summary",wrap=wrap,cpus=cfg["SUMMARY_CPUS"],mem=cfg["SUMMARY_MEM"],time=cfg["SUMMARY_TIME"],dependency=j5,log=run/"logs"/"slurm"/"summary.%j.log",**base),dry)
+    j2=submit(cmd("resolve_groups",None,cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],j1),dry)
+    submit(cmd("orchestrate_downstream",None,cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],j2),dry)
 
 def shlex_quote(x:str)->str:
     import shlex; return shlex.quote(x)

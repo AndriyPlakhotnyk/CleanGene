@@ -31,6 +31,13 @@
    ERR001      sp00001   /data/raw_reads.bam
    ```
 
+   Grouping rules:
+
+   - `group_id` supplied: use that pangenome group.
+   - no `group_id`, `organism` supplied: group by organism.
+   - neither supplied: run Kraken2 and group by inferred top species.
+   - `pangenome_dir` supplied: skip pangenome generation and run BWA validation against that Panaroo output.
+
 4. **Run a test dry‑run**
 
    ```bash
@@ -56,7 +63,7 @@
    Job status with `squeue -j <JOB_ID>`. Logs are in `<analysis_root>/runs/<run-id>/logs/slurm/*.log`.
 
 7. **Large scale (≥30 k isolates)**  
-   *SLURM_MAX_PARALLEL* defaults to 64 – increase it if you have more resources or reduce to avoid oversubmission. The array syntax `0-<N>-999` ensures each task gets a unique SLURM_ARRAY_TASK_ID.
+   Use `config/cleangene.arc.env` on ARC. It leaves `SLURM_PARTITION` empty, submits organisms smallest first, and uses Panaroo resource tiers for small (<500), medium (500-2000), and large (>2000) organism groups.
 
 8. **Resume an unfinished run**
 

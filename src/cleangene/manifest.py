@@ -39,8 +39,14 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
             raise SystemExit(f"Manifest row {line} must provide R1/R2 or raw_bam")
         if bool(row.get("R1")) != bool(row.get("R2")):
             raise SystemExit(f"Manifest row {line} must provide both R1 and R2")
-        if not row.get("group_id"):
-            row["group_id"] = row.get("organism") or "default"
+        if row.get("group_id"):
+            row["grouping_source"] = "manifest_group_id"
+        elif row.get("organism"):
+            row["group_id"] = row["organism"]
+            row["grouping_source"] = "manifest_organism"
+        else:
+            row["group_id"] = "__kraken_pending__"
+            row["grouping_source"] = "kraken_pending"
         pangenome = next((row.get(c, "") for c in PANGENOME_COLUMNS if row.get(c, "")), "")
         row["pangenome_dir"] = pangenome
         rows.append(row)
@@ -57,7 +63,7 @@ def groups(rows: list[dict[str, str]]) -> list[str]:
     return seen
 
 def write_resolved(path: Path, rows: list[dict[str, str]]) -> None:
-    preferred = ["isolate_id", "group_id", "organism", "R1", "R2", "raw_bam", "assembly", "pangenome_dir"]
+    preferred = ["isolate_id", "group_id", "grouping_source", "organism", "R1", "R2", "raw_bam", "assembly", "pangenome_dir"]
     extras = sorted({key for row in rows for key in row} - set(preferred))
     fields = [field for field in preferred if any(field in row for row in rows)] + extras
     write_tsv(path, fields, rows)
