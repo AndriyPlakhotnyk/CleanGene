@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, os, subprocess, sys
+import argparse, csv, json, os, shutil, subprocess, sys
 from datetime import datetime
 from pathlib import Path
 from .config import read_env
@@ -38,6 +38,47 @@ def validate_run_dir(run: Path) -> None:
     missing=[str(p) for p in required if not p.is_file()]
     if missing: raise SystemExit("Cannot resume run; missing metadata:\n" + "\n".join(missing))
 
+def _float_or_none(value: str | None) -> float | None:
+    try:
+        return float(value) if value not in {"", "NA", None} else None
+    except ValueError:
+        return None
+
+def _remove_done(path: Path) -> None:
+    if path.is_file(): path.unlink()
+
+def invalidate_legacy_identity_metrics(run: Path, cfg: dict[str,str]) -> int:
+    min_breadth=float(cfg["READ_VALIDATION_MIN_BREADTH"]); min_depth=float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"])
+    invalidated=0
+    for metrics in (run/"results"/"groups").glob("*/03_read_validation/evidence/*/metrics.tsv"):
+        rows=[]
+        try:
+            with metrics.open(newline="") as handle:
+                rows=list(csv.DictReader(handle,delimiter="\t"))
+        except OSError:
+            continue
+        stale=False
+        for row in rows:
+            mapped=_float_or_none(row.get("mapped_reads")) or 0
+            breadth=_float_or_none(row.get("breadth")) or 0
+            depth=_float_or_none(row.get("mean_depth")) or 0
+            identity=_float_or_none(row.get("identity"))
+            aligned=_float_or_none(row.get("aligned_positions"))
+            method=row.get("identity_method","")
+            if mapped>0 and breadth>=min_breadth and depth>=min_depth and identity==0 and (aligned in {0,None}) and not method:
+                stale=True
+                break
+        if not stale: continue
+        backup=metrics.with_name("metrics.pre_identity_fix.tsv")
+        if not backup.is_file(): shutil.copy2(metrics,backup)
+        group_safe=metrics.parents[3].name; iso_safe=metrics.parent.name
+        _remove_done(run/"state"/"validate"/f"{iso_safe}.done.json")
+        _remove_done(run/"state"/"reduce"/f"{group_safe}.done.json")
+        _remove_done(run/"state"/"plot"/f"{group_safe}.done.json")
+        _remove_done(run/"state"/"summary.done.json")
+        invalidated += 1
+    return invalidated
+
 def latest_run(root: Path) -> Path:
     runs=sorted((root/"runs").glob("*"),key=lambda p:p.stat().st_mtime,reverse=True)
     if not runs: raise SystemExit(f"No runs found under {root/'runs'}")
@@ -69,6 +110,7 @@ def local(run: Path) -> None:
     for i in range(ng): dispatch("prepare_validation",run,i)
     for i in range(ni): dispatch("validate",run,i)
     for i in range(ng): dispatch("reduce",run,i)
+    for i in range(ng): dispatch("plot",run,i)
     dispatch("summary",run,None)
 
 def slurm(run: Path, cfg: dict[str,str], dry: bool) -> None:
@@ -98,6 +140,8 @@ def resume_command(args) -> int:
         run=latest_run(root) if args.latest else load_existing(root,args.run)
     validate_run_dir(run)
     cfg=json.load((run/"provenance"/"resolved_config.json").open())
+    invalidated=invalidate_legacy_identity_metrics(run,cfg)
+    if invalidated: print(f"invalidated_legacy_identity_metrics={invalidated}")
     print(f"run_dir={run}")
     slurm(run,cfg,args.dry_run)
     return 0

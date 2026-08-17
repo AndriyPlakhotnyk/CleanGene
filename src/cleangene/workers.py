@@ -2,10 +2,11 @@ from __future__ import annotations
 import csv, json, os, shutil, subprocess, sys, time
 from pathlib import Path
 from .config import truthy
-from .evidence import validate_isolate
+from .evidence import validate_isolate, validation_decision_logic_rows
 from .fasta import assembly_metrics
 from .manifest import groups, write_resolved
 from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_binary
+from .plotting import plot_presence_absence
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 
@@ -215,7 +216,7 @@ def incomplete_indices(run_dir: Path, stage: str) -> list[int]:
         rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
         return [i for i,r in enumerate(rows) if not _done(run_dir/"state"/"preprocess"/f"{safe_name(r['isolate_id'])}.done.json")]
     rows=read_tsv(run_dir/"state"/"group_tasks.tsv")
-    marker={"panaroo":"panaroo","prepare_validation":"prepare_validation","reduce":"reduce"}[stage]
+    marker={"panaroo":"panaroo","prepare_validation":"prepare_validation","reduce":"reduce","plot":"plot"}[stage]
     return [i for i,r in enumerate(rows) if not _done(run_dir/"state"/marker/f"{safe_name(r['group_id'])}.done.json")]
 
 def incomplete_validate_indices(run_dir: Path) -> list[int]:
@@ -295,6 +296,8 @@ def controller_downstream(run_dir: Path) -> None:
     if val_indices: _run_index_stage(run_dir,cfg,"validate",val_indices,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],"CleanGene validate")
     red_indices=incomplete_indices(run_dir,"reduce")
     if red_indices: _run_index_stage(run_dir,cfg,"reduce",red_indices,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene reduce")
+    plot_indices=incomplete_indices(run_dir,"plot")
+    if plot_indices: _run_index_stage(run_dir,cfg,"plot",plot_indices,cfg["PLOT_CPUS"],cfg["PLOT_MEM"],cfg["PLOT_TIME"],"CleanGene plot")
     if not _done(run_dir/"state"/"summary.done.json"): _run_single_job(run_dir,cfg,"summary",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene summary")
     touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":ng,"isolates":ni})
 
@@ -370,7 +373,7 @@ def validate(run_dir: Path, index: int) -> None:
     if iso not in retained: touch_done(done,{"status":"skipped_excluded"}); return
     key=out/"tested_gene_key.tsv"; ref=out/"tested_gene_references.fasta"
     if not key.is_file() or key.stat().st_size==0 or len(read_tsv(key))==0:
-        ev.mkdir(parents=True,exist_ok=True); write_tsv(ev/"metrics.tsv",["reference_id","Gene","validated_call","validation_state","breadth","percent_coverage","mean_depth","identity","percent_identity","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"],[]); touch_done(done,{"status":"no_selected_genes"}); return
+        ev.mkdir(parents=True,exist_ok=True); write_tsv(ev/"metrics.tsv",["reference_id","Gene","validated_call","validation_state","decision_reason","final_call_source","breadth","percent_coverage","mean_depth","identity","percent_identity","identity_method","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"],[]); touch_done(done,{"status":"no_selected_genes"}); return
     rr=retained[iso]; validate_isolate(ref,key,rr["R1"],rr["R2"],ev,int(cfg["VALIDATION_CPUS"]),float(cfg["READ_VALIDATION_MIN_BREADTH"]),float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"]),float(cfg["READ_VALIDATION_MIN_IDENTITY"]),int(cfg["READ_VALIDATION_MIN_MAPQ"]),int(cfg["BASEQUAL"])); touch_done(done)
 
 def reduce_group(run_dir: Path, index: int) -> None:
@@ -384,25 +387,44 @@ def reduce_group(run_dir: Path, index: int) -> None:
         for r in read_tsv(p) if p.is_file() else []:
             r={**r,"isolate_id":iso,"initial_call":by_gene[r["Gene"]][iso]}
             r.setdefault("percent_coverage", str(float(r.get("breadth") or 0) * 100.0))
-            r.setdefault("percent_identity", str(float(r.get("identity") or 0) * 100.0))
+            if r.get("identity") not in {"", "NA", None}: r.setdefault("percent_identity", str(float(r.get("identity") or 0) * 100.0))
+            else: r.setdefault("percent_identity","NA")
+            r.setdefault("identity_method","legacy")
+            r.setdefault("final_call_source","read_validation")
+            r.setdefault("decision_reason","legacy metrics")
             metrics.append(r)
     validated={g:dict(v) for g,v in by_gene.items()}
-    for r in metrics: validated[r["Gene"]][r["isolate_id"]]=int(r["validated_call"])
+    for r in metrics:
+        if r.get("final_call_source")=="initial_call_unresolved":
+            validated[r["Gene"]][r["isolate_id"]]=int(r["initial_call"])
+        elif str(r.get("validated_call",""))!="":
+            validated[r["Gene"]][r["isolate_id"]]=int(r["validated_call"])
     fields=["Gene",*isolates]; write_tsv(out/"validated_gene_presence_absence.binary.tsv",fields,([g,*[validated[g][i] for i in isolates]] for g in by_gene))
-    metric_fields=["Gene","isolate_id","initial_call","validated_call","validation_state","breadth","percent_coverage","mean_depth","identity","percent_identity","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"]
+    metric_fields=["Gene","isolate_id","initial_call","validated_call","validation_state","decision_reason","final_call_source","breadth","percent_coverage","mean_depth","identity","percent_identity","identity_method","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"]
     write_tsv(out/"read_validation_metrics.tsv",metric_fields,metrics)
     evidence_rows=[]
     metric_index={(r["Gene"],r["isolate_id"]):r for r in metrics}
     for gene in by_gene:
         for iso in isolates:
             m=metric_index.get((gene,iso)); initial_call=by_gene[gene][iso]; final=validated[gene][iso]
-            evidence_rows.append([group,gene,iso,initial_call,final,m["validation_state"] if m else "not_tested_carried_forward",m.get("breadth","") if m else "",m.get("percent_coverage","") if m else "",m.get("mean_depth","") if m else "",m.get("identity","") if m else "",m.get("percent_identity","") if m else "",m.get("mapped_reads","") if m else ""])
-    write_tsv(out/"gene_call_evidence.long.tsv",["group_id","Gene","isolate_id","initial_call","validated_call","validation_state","breadth","percent_coverage","mean_depth","identity","percent_identity","mapped_reads"],evidence_rows)
+            evidence_rows.append([group,gene,iso,initial_call,final,m["validation_state"] if m else "not_tested_carried_forward",m.get("final_call_source","not_tested") if m else "not_tested",m.get("breadth","") if m else "",m.get("percent_coverage","") if m else "",m.get("mean_depth","") if m else "",m.get("identity","") if m else "",m.get("percent_identity","") if m else "",m.get("identity_method","") if m else "",m.get("mapped_reads","") if m else ""])
+    write_tsv(out/"gene_call_evidence.long.tsv",["group_id","Gene","isolate_id","initial_call","validated_call","validation_state","final_call_source","breadth","percent_coverage","mean_depth","identity","percent_identity","identity_method","mapped_reads"],evidence_rows)
     changes=[]
     for g in by_gene:
         a=[by_gene[g][i] for i in isolates]; b=[validated[g][i] for i in isolates]; changes.append([g,sum(a),sum(b),sum(x==0 and y==1 for x,y in zip(a,b)),sum(x==1 and y==0 for x,y in zip(a,b)),sum(x==y for x,y in zip(a,b))])
     write_tsv(out/"tested_genes.tsv",["Gene","n_initial_present","n_validated_present","n_added","n_removed","n_unchanged"],changes)
     touch_done(done,{"n_isolates":len(isolates),"n_genes":len(by_gene)})
+
+def plot_group(run_dir: Path, index: int) -> None:
+    cfg,_=context(run_dir); group=task_row(run_dir,"group",index)["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); done=run_dir/"state"/"plot"/f"{safe_name(group)}.done.json"
+    if done.is_file(): return
+    matrix=root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"; out=root/"04_summary"
+    if not matrix.is_file():
+        touch_done(done,{"status":"skipped","reason":"missing_validated_matrix"})
+        return
+    out.mkdir(parents=True,exist_ok=True)
+    plot_presence_absence(matrix,out,group,int(cfg["PLOT_MAX_CLUSTER_ISOLATES"]))
+    touch_done(done,{"matrix":str(matrix),"outdir":str(out)})
 
 def summarize(run_dir: Path) -> None:
     cfg,rows=context(run_dir); iso_rows=[]; group_rows=[]
@@ -412,7 +434,7 @@ def summarize(run_dir: Path) -> None:
         for row in rows:
             if row["group_id"]!=group: continue
             q=read_tsv(find_isolate_qc(run_dir,row))[0]; q={**q,"group_id":group}; iso_rows.append(q)
-    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); touch_done(run_dir/"state"/"summary.done.json",{"groups":len(group_rows)})
+    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); touch_done(run_dir/"state"/"summary.done.json",{"groups":len(group_rows)})
 
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
     if stage=="slurm_controller": slurm_controller(run_dir,index)
@@ -424,5 +446,6 @@ def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
     elif stage=="prepare_validation": prepare_validation(run_dir,int(index))
     elif stage=="validate": validate(run_dir,int(index))
     elif stage=="reduce": reduce_group(run_dir,int(index))
+    elif stage=="plot": plot_group(run_dir,int(index))
     elif stage=="summary": summarize(run_dir)
     else: raise SystemExit(f"Unknown worker stage: {stage}")

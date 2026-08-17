@@ -61,20 +61,62 @@ def align_identity(reference: Path, consensus_fa: Path) -> dict[str, dict[str, f
     for line in p.stdout.splitlines():
         f=line.split("\t")
         if len(f)<12: continue
-        q=f[0]; matches=int(f[9]); block=int(f[10]); mapq=int(f[11]); cand={"identity":matches/block if block else 0.0,"identical_positions":matches,"aligned_positions":block,"consensus_mapq":mapq}
-        if q not in best or cand["identical_positions"]>best[q]["identical_positions"]: best[q]=cand
+        q=f[0]; target=f[5]
+        if q != target: continue
+        matches=int(f[9]); block=int(f[10]); mapq=int(f[11]); cand={"identity":matches/block if block else None,"identical_positions":matches,"aligned_positions":block,"consensus_mapq":mapq,"identity_method":"minimap2_asm5"}
+        if target not in best or cand["identical_positions"]>best[target]["identical_positions"]: best[target]=cand
     return best
+
+def fixed_coordinate_identity(ref: str, cons: str) -> dict[str, object] | None:
+    ref=ref.upper(); cons=cons.upper()
+    n=min(len(ref),len(cons)); compared=0; same=0
+    for a,b in zip(ref[:n],cons[:n]):
+        if a=="N" or b=="N": continue
+        compared += 1
+        same += int(a==b)
+    extra=abs(len(ref)-len(cons))
+    compared += extra
+    if compared == 0: return None
+    return {"identity":same/compared,"identical_positions":same,"aligned_positions":compared,"identity_method":"fixed_coordinate_global"}
+
+def classify_gene_evidence(*, mapped_reads: float, breadth: float, mean_depth: float, identity: float | None, min_breadth: float, min_depth: float, min_identity: float) -> dict[str, object]:
+    if mapped_reads == 0 or breadth == 0:
+        return {"validation_state":"not_detected","validated_call":0,"final_call_source":"read_validation","decision_reason":"mapped_reads=0 or breadth=0"}
+    if mean_depth < min_depth:
+        return {"validation_state":"low_depth","validated_call":"","final_call_source":"initial_call_unresolved","decision_reason":"breadth>0 and mean_depth below threshold"}
+    if breadth < min_breadth:
+        return {"validation_state":"partial_coverage","validated_call":0,"final_call_source":"read_validation","decision_reason":"depth passes but breadth below threshold"}
+    if identity is None:
+        return {"validation_state":"identity_unresolved","validated_call":"","final_call_source":"initial_call_unresolved","decision_reason":"breadth/depth pass but identity could not be measured"}
+    if identity < min_identity:
+        return {"validation_state":"divergent","validated_call":0,"final_call_source":"read_validation","decision_reason":"breadth/depth pass but identity below threshold"}
+    return {"validation_state":"confirmed_present","validated_call":1,"final_call_source":"read_validation","decision_reason":"breadth/depth/identity pass"}
+
+def validation_decision_logic_rows(min_breadth: str = "MIN_BREADTH", min_depth: str = "MIN_DEPTH", min_identity: str = "MIN_IDENTITY") -> list[list[str]]:
+    return [
+        ["not_detected","mapped_reads=0 OR breadth=0","0","No read evidence for the gene"],
+        ["low_depth",f"breadth>0 AND mean_depth < {min_depth}","preserve initial call","Insufficient depth for a confident read-validation decision"],
+        ["partial_coverage",f"mean_depth >= {min_depth} AND breadth < {min_breadth}","0","Reads cover only part of the gene; not an intact-gene call"],
+        ["identity_unresolved","breadth/depth pass but identity could not be measured","preserve initial call","Coverage supports the locus but sequence identity is unresolved"],
+        ["divergent",f"breadth/depth pass AND identity < {min_identity}","0","Covered sequence is below identity threshold"],
+        ["confirmed_present",f"breadth >= {min_breadth} AND depth >= {min_depth} AND identity >= {min_identity}","1","Read evidence confirms the gene"],
+        ["not_tested_carried_forward","gene not selected for validation","preserve initial call","Initial pangenome call was carried forward"],
+    ]
 
 def validate_isolate(reference: Path, key_tsv: Path, r1: str, r2: str, outdir: Path, threads: int, min_breadth: float, min_depth: float, min_identity: float, min_mapq: int, basequal: int) -> None:
     outdir.mkdir(parents=True, exist_ok=True); bam=outdir/"gene_reads.bam"
     map_reads(reference,r1,r2,bam,threads,min_mapq,outdir/"bwa_mem.log")
     cov=coverage(bam,min_mapq); fa=consensus(reference,bam,outdir/"gene_reads",min_depth,min_mapq,basequal); aln=align_identity(reference,fa)
+    refs=read_fasta(reference); cons=read_fasta(fa)
     with key_tsv.open(newline="") as h: keys=list(csv.DictReader(h,delimiter="\t"))
     rows=[]
     for row in keys:
-        key=row["reference_id"]; gene=row["Gene"]; c=cov.get(key,{}); a=aln.get(key,{})
-        breadth=float(c.get("breadth",0)); depth=float(c.get("mean_depth",0)); identity=float(a.get("identity",0)); call=int(breadth>=min_breadth and depth>=min_depth and identity>=min_identity)
-        state="confirmed_present" if call else "partial_or_divergent" if breadth>0 else "not_detected"
-        rows.append({"reference_id":key,"Gene":gene,"validated_call":call,"validation_state":state,"breadth":breadth,"percent_coverage":breadth*100.0,"mean_depth":depth,"identity":identity,"percent_identity":identity*100.0,"identical_positions":int(a.get("identical_positions",0)),"aligned_positions":int(a.get("aligned_positions",0)),"mapped_reads":int(c.get("mapped_reads",0)),"mean_mapping_quality":float(c.get("mean_mapping_quality",0))})
-    fields=["reference_id","Gene","validated_call","validation_state","breadth","percent_coverage","mean_depth","identity","percent_identity","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"]
+        key=row["reference_id"]; gene=row["Gene"]; c=cov.get(key,{}); a=aln.get(key)
+        breadth=float(c.get("breadth",0)); depth=float(c.get("mean_depth",0)); mapped=float(c.get("mapped_reads",0))
+        if not a and mapped>0 and breadth>0:
+            a=fixed_coordinate_identity(refs.get(key,""),cons.get(key,""))
+        identity=None if not a else a.get("identity")
+        decision=classify_gene_evidence(mapped_reads=mapped,breadth=breadth,mean_depth=depth,identity=identity,min_breadth=min_breadth,min_depth=min_depth,min_identity=min_identity)
+        rows.append({"reference_id":key,"Gene":gene,**decision,"breadth":breadth,"percent_coverage":breadth*100.0,"mean_depth":depth,"identity":"NA" if identity is None else identity,"percent_identity":"NA" if identity is None else identity*100.0,"identity_method":a.get("identity_method","unresolved") if a else "unresolved","identical_positions":"" if not a else int(a.get("identical_positions",0)),"aligned_positions":"" if not a else int(a.get("aligned_positions",0)),"mapped_reads":int(mapped),"mean_mapping_quality":float(c.get("mean_mapping_quality",0))})
+    fields=["reference_id","Gene","validated_call","validation_state","decision_reason","final_call_source","breadth","percent_coverage","mean_depth","identity","percent_identity","identity_method","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"]
     write_tsv(outdir/"metrics.tsv",fields,rows)

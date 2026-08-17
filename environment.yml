@@ -13,5 +13,7 @@ dependencies:
   - minimap2
   - fastp
   - kraken2
+  - matplotlib
+  - scipy
   - pip: 
     - .

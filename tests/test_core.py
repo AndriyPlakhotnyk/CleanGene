@@ -3,12 +3,13 @@ from pathlib import Path
 from io import StringIO
 import contextlib
 from cleangene.manifest import groups, load_manifest
+from cleangene.evidence import classify_gene_evidence, fixed_coordinate_identity
 from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, array_chunks, sbatch_cmd, submit, submit_chunked_arrays
-from cleangene.util import atomic_json, write_tsv
-from cleangene.workers import _run_array_stage, _wait_jobs, controller_downstream, ensure_kraken2_db, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, slurm_controller, task_row
-from cleangene.cli import make_run, slurm
+from cleangene.util import atomic_json, read_tsv, write_tsv
+from cleangene.workers import _run_array_stage, _wait_jobs, controller_downstream, ensure_kraken2_db, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, reduce_group, slurm_controller, task_row
+from cleangene.cli import invalidate_legacy_identity_metrics, make_run, slurm
 from unittest.mock import patch
 import subprocess
 
@@ -26,6 +27,25 @@ class CleanGeneCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/"x.fa"; p.write_text(">a\nAAAA\n>b\nGGNN\n")
             m=assembly_metrics(p); self.assertEqual(m["assembly_length"],8); self.assertEqual(m["contigs"],2); self.assertEqual(m["ambiguous_bases"],2)
+
+    def test_validation_classification_preserves_unresolved_identity(self):
+        d=classify_gene_evidence(mapped_reads=274,breadth=0.998255,mean_depth=59.8726,identity=None,min_breadth=0.90,min_depth=5,min_identity=0.95)
+        self.assertEqual(d["validation_state"],"identity_unresolved")
+        self.assertEqual(d["validated_call"],"")
+        self.assertEqual(d["final_call_source"],"initial_call_unresolved")
+
+    def test_validation_classification_states(self):
+        args=dict(min_breadth=0.90,min_depth=5,min_identity=0.95)
+        self.assertEqual(classify_gene_evidence(mapped_reads=0,breadth=0,mean_depth=0,identity=None,**args)["validation_state"],"not_detected")
+        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=0.5,mean_depth=10,identity=1.0,**args)["validation_state"],"partial_coverage")
+        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=1.0,mean_depth=2,identity=1.0,**args)["validation_state"],"low_depth")
+        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=1.0,mean_depth=10,identity=0.8,**args)["validation_state"],"divergent")
+        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=1.0,mean_depth=10,identity=0.99,**args)["validation_state"],"confirmed_present")
+
+    def test_fixed_coordinate_identity_avoids_false_zero_for_matching_names(self):
+        self.assertEqual(fixed_coordinate_identity("ACGT","ACGT")["identity"],1.0)
+        self.assertEqual(fixed_coordinate_identity("ACGT","ACGA")["identity"],0.75)
+        self.assertIsNone(fixed_coordinate_identity("NNNN","NNNN"))
 
     def test_kraken_contamination(self):
         with tempfile.TemporaryDirectory() as d:
@@ -225,7 +245,7 @@ class CleanGeneCoreTests(unittest.TestCase):
     def test_resume_reruns_failed_panaroo_only(self):
         with tempfile.TemporaryDirectory() as d:
             run=Path(d)/"run"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
-            cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_ACCOUNT":"","SLURM_PARTITION":"","PANAROO_CPUS":"1","PANAROO_MEM":"1G","PANAROO_TIME":"1:00:00","PANAROO_SMALL_CPUS":"1","PANAROO_SMALL_MEM":"1G","PANAROO_SMALL_TIME":"1:00:00","SUMMARY_CPUS":"1","SUMMARY_MEM":"1G","SUMMARY_TIME":"1:00:00","VALIDATION_CPUS":"1","VALIDATION_MEM":"1G","VALIDATION_TIME":"1:00:00"}
+            cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_ACCOUNT":"","SLURM_PARTITION":"","PANAROO_CPUS":"1","PANAROO_MEM":"1G","PANAROO_TIME":"1:00:00","PANAROO_SMALL_CPUS":"1","PANAROO_SMALL_MEM":"1G","PANAROO_SMALL_TIME":"1:00:00","SUMMARY_CPUS":"1","SUMMARY_MEM":"1G","SUMMARY_TIME":"1:00:00","VALIDATION_CPUS":"1","VALIDATION_MEM":"1G","VALIDATION_TIME":"1:00:00","PLOT_CPUS":"1","PLOT_MEM":"1G","PLOT_TIME":"1:00:00"}
             atomic_json(run/"provenance"/"resolved_config.json",cfg)
             write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id"],[["iso1","done"],["iso2","failed"]])
             write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["done","iso1"],["failed","iso2"]])
@@ -236,5 +256,46 @@ class CleanGeneCoreTests(unittest.TestCase):
                 controller_downstream(run)
             self.assertIn(("panaroo",[1]),seen)
             self.assertNotIn(("panaroo",[0]),seen)
+
+    def test_reduce_preserves_initial_call_for_identity_unresolved(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; group="g"; iso="iso1"; other="iso2"; root=run/"results"/"groups"/group
+            (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
+            atomic_json(run/"provenance"/"resolved_config.json",{})
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2"],[[iso,group,"r1","r2"],[other,group,"r1","r2"]])
+            write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[[group,2,"small"]])
+            for sample in (iso,other):
+                write_tsv(root/"01_isolates"/sample/"qc.tsv",["isolate_id","group_id","excluded","assembly","gff","R1","R2"],[[sample,group,0,"","", "r1","r2"]])
+            write_tsv(root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv",["Gene",iso,other],[["rpoE",1,1]])
+            write_tsv(root/"03_read_validation"/"evidence"/iso/"metrics.tsv",["reference_id","Gene","validated_call","validation_state","decision_reason","final_call_source","breadth","mean_depth","identity","mapped_reads"],[["rpoE","rpoE","","identity_unresolved","identity could not be measured","initial_call_unresolved",0.99,50,"NA",274]])
+            reduce_group(run,0)
+            rows=read_tsv(root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv")
+            self.assertEqual(rows[0][iso],"1")
+
+    def test_plot_group_writes_done_marker(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; group="g"; root=run/"results"/"groups"/group
+            (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
+            atomic_json(run/"provenance"/"resolved_config.json",{"PLOT_MAX_CLUSTER_ISOLATES":"2000"})
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id"],[["i",group]])
+            write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[[group,1,"small"]])
+            write_tsv(root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv",["Gene","i"],[["g1",1]])
+            with patch("cleangene.workers.plot_presence_absence") as plot:
+                plot_group(run,0)
+            plot.assert_called_once()
+            self.assertTrue((run/"state"/"plot"/"g.done.json").is_file())
+
+    def test_resume_invalidates_legacy_zero_identity_metrics(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; g="g"; iso="iso"; metrics=run/"results"/"groups"/g/"03_read_validation"/"evidence"/iso/"metrics.tsv"
+            (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
+            write_tsv(metrics,["reference_id","Gene","validated_call","validation_state","breadth","mean_depth","identity","aligned_positions","mapped_reads"],[["rpoE","rpoE",0,"partial_or_divergent",0.99,50,0,0,274]])
+            for p in (run/"state"/"validate"/"iso.done.json",run/"state"/"reduce"/"g.done.json",run/"state"/"plot"/"g.done.json",run/"state"/"summary.done.json"):
+                atomic_json(p,{})
+            n=invalidate_legacy_identity_metrics(run,{"READ_VALIDATION_MIN_BREADTH":"0.90","READ_VALIDATION_MIN_MEAN_DEPTH":"5"})
+            self.assertEqual(n,1)
+            self.assertTrue(metrics.with_name("metrics.pre_identity_fix.tsv").is_file())
+            self.assertFalse((run/"state"/"validate"/"iso.done.json").exists())
+            self.assertFalse((run/"state"/"reduce"/"g.done.json").exists())
 
 if __name__ == "__main__": unittest.main()

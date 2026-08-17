@@ -17,6 +17,22 @@ Run:
 
 This source release has not executed Shovill, Prokka, Panaroo, BWA, SAMtools, BCFtools, minimap2, and Kraken2 end-to-end against your production cluster/data from this build environment. Before a 30,000-isolate production run, execute a representative real cohort and compare CleanGene calls against the corresponding ImaGene outputs.
 
+## Read-validation call states
+
+CleanGene writes `results/cohort/validation_decision_logic.tsv` and per-gene evidence files with the same state model:
+
+| State | Criteria | Final call behavior |
+| --- | --- | --- |
+| `not_detected` | `mapped_reads=0` or `breadth=0` | Set to `0` |
+| `low_depth` | some coverage but mean depth below `READ_VALIDATION_MIN_MEAN_DEPTH` | Preserve initial pangenome call |
+| `partial_coverage` | depth passes but breadth below `READ_VALIDATION_MIN_BREADTH` | Set to `0` |
+| `identity_unresolved` | breadth/depth pass but sequence identity cannot be measured | Preserve initial pangenome call |
+| `divergent` | breadth/depth pass but identity below `READ_VALIDATION_MIN_IDENTITY` | Set to `0` |
+| `confirmed_present` | breadth, depth, and identity pass | Set to `1` |
+| `not_tested_carried_forward` | gene was not selected for read validation | Preserve initial pangenome call |
+
+Resume invalidates legacy metrics where covered genes were serialized as `identity=0` with no aligned positions, then reruns only the affected validation/reduce/plot/summary stages.
+
 ## Deliberate v0.1 boundaries
 
 - If `group_id` is omitted, CleanGene uses `organism` as the group label, falling back to `default`.
