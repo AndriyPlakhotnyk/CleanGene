@@ -3,7 +3,10 @@ from pathlib import Path
 from cleangene.manifest import groups, load_manifest
 from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
+from cleangene.slurm import sbatch_cmd, submit
 from cleangene.workers import manifest_pangenome_dir, parse_kraken_report
+from unittest.mock import patch
+import subprocess
 
 class CleanGeneCoreTests(unittest.TestCase):
     def test_present(self):
@@ -73,5 +76,16 @@ class CleanGeneCoreTests(unittest.TestCase):
             (pan/"gene_presence_absence.csv").write_text("Gene,iso1,iso2\nabc,a,b\n")
             rows=[{"group_id":"g","pangenome_dir":str(pan)},{"group_id":"g","pangenome_dir":str(pan)}]
             self.assertEqual(manifest_pangenome_dir(rows,"g"),pan.resolve())
+
+    def test_sbatch_array_uses_configured_parallel_value(self):
+        cmd=sbatch_cmd(name="x",wrap="echo ok",cpus="1",mem="1G",time="00:05:00",array="0-28293%100")
+        self.assertIn("--array",cmd)
+        self.assertEqual(cmd[cmd.index("--array")+1],"0-28293%100")
+
+    def test_submit_reports_sbatch_stderr(self):
+        failed=subprocess.CompletedProcess(["sbatch"],1,stdout="",stderr="Batch job submission failed: throttled")
+        with patch("cleangene.slurm.subprocess.run",return_value=failed):
+            with self.assertRaisesRegex(RuntimeError,"throttled"):
+                submit(["sbatch","--array","0-10%100"],False)
 
 if __name__ == "__main__": unittest.main()

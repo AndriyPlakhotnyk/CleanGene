@@ -15,4 +15,13 @@ def sbatch_cmd(*, name: str, wrap: str, cpus: str, mem: str, time: str, array: s
 def submit(cmd: list[str], dry_run: bool) -> str:
     if dry_run:
         print(" ".join(shlex.quote(x) for x in cmd)); return "DRYRUN"
-    result=subprocess.run(cmd,check=True,capture_output=True,text=True); return result.stdout.strip().split(";")[0]
+    result=subprocess.run(cmd,capture_output=True,text=True)
+    if result.returncode:
+        rendered=" ".join(shlex.quote(x) for x in cmd)
+        stderr=result.stderr.strip() or "<no stderr>"
+        stdout=result.stdout.strip()
+        message=f"sbatch failed with exit status {result.returncode}\ncommand: {rendered}\nstderr: {stderr}"
+        if stdout:
+            message += f"\nstdout: {stdout}"
+        raise RuntimeError(message)
+    return result.stdout.strip().split(";")[0]
