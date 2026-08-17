@@ -7,7 +7,7 @@ from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, array_chunks, sbatch_cmd, submit, submit_chunked_arrays
 from cleangene.util import atomic_json, write_tsv
-from cleangene.workers import _run_array_stage, _wait_jobs, ensure_kraken2_db, manifest_pangenome_dir, manifest_row_for_task, parse_kraken_report, task_row
+from cleangene.workers import _run_array_stage, _wait_jobs, controller_downstream, ensure_kraken2_db, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, slurm_controller, task_row
 from cleangene.cli import make_run, slurm
 from unittest.mock import patch
 import subprocess
@@ -187,5 +187,54 @@ class CleanGeneCoreTests(unittest.TestCase):
              contextlib.redirect_stdout(StringIO()):
             _wait_jobs(["1"],cfg,"x","0/1 complete")
         sleep.assert_called_once_with(0)
+
+    def test_panaroo_creates_nested_regrouped_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; group="Streptococcus gallolyticus"; old="__kraken_pending__"
+            pan=Path(d)/"external"; pan.mkdir()
+            (pan/"gene_presence_absence.csv").write_text("Gene,iso1,iso2\ng1,l1,l2\n")
+            (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
+            atomic_json(run/"provenance"/"resolved_config.json",{"PANAROO_CPUS":"1","PANAROO_CLEAN_MODE":"strict"})
+            rows=[
+                {"isolate_id":"iso1","group_id":group,"R1":"r1","R2":"r2","pangenome_dir":str(pan)},
+                {"isolate_id":"iso2","group_id":group,"R1":"r1","R2":"r2","pangenome_dir":str(pan)},
+            ]
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2","pangenome_dir"],rows)
+            write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[[group,2,"small"]])
+            for iso in ("iso1","iso2"):
+                qc=run/"results"/"groups"/old/"01_isolates"/iso/"qc.tsv"
+                write_tsv(qc,["isolate_id","group_id","excluded","assembly","gff","R1","R2"],[{"isolate_id":iso,"group_id":old,"excluded":0,"assembly":"","gff":"","R1":"r1","R2":"r2"}])
+            panaroo(run,0)
+            self.assertTrue((run/"results"/"groups"/"Streptococcus_gallolyticus"/"logs").is_dir())
+
+    def test_resume_skips_completed_preprocess_and_resolve(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
+            cfg={"TAXONOMY_MODE":"off","SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_ACCOUNT":"","SLURM_PARTITION":"","SLURM_CPUS":"1","SLURM_MEM":"1G","SLURM_TIME":"1:00:00","GROUP_ORCHESTRATOR_CPUS":"1","GROUP_ORCHESTRATOR_MEM":"1G","GROUP_ORCHESTRATOR_TIME":"1:00:00","SUMMARY_CPUS":"1","SUMMARY_MEM":"1G","SUMMARY_TIME":"1:00:00","VALIDATION_CPUS":"1","VALIDATION_MEM":"1G","VALIDATION_TIME":"1:00:00","PANAROO_CPUS":"1","PANAROO_MEM":"1G","PANAROO_TIME":"1:00:00"}
+            atomic_json(run/"provenance"/"resolved_config.json",cfg)
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id"],[["iso1","g"]])
+            write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["g","iso1"]])
+            write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[["g",1,"small"]])
+            atomic_json(run/"state"/"preprocess"/"iso1.done.json",{})
+            atomic_json(run/"state"/"resolve_groups.done.json",{})
+            with patch("cleangene.workers._run_index_stage") as arrays, patch("cleangene.workers._run_single_job") as singles, patch("cleangene.workers.controller_downstream"):
+                slurm_controller(run)
+            self.assertFalse(any("preprocess" in str(c) for c in arrays.call_args_list))
+            self.assertFalse(any("resolve_groups" in str(c) for c in singles.call_args_list))
+
+    def test_resume_reruns_failed_panaroo_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
+            cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_ACCOUNT":"","SLURM_PARTITION":"","PANAROO_CPUS":"1","PANAROO_MEM":"1G","PANAROO_TIME":"1:00:00","PANAROO_SMALL_CPUS":"1","PANAROO_SMALL_MEM":"1G","PANAROO_SMALL_TIME":"1:00:00","SUMMARY_CPUS":"1","SUMMARY_MEM":"1G","SUMMARY_TIME":"1:00:00","VALIDATION_CPUS":"1","VALIDATION_MEM":"1G","VALIDATION_TIME":"1:00:00"}
+            atomic_json(run/"provenance"/"resolved_config.json",cfg)
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id"],[["iso1","done"],["iso2","failed"]])
+            write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["done","iso1"],["failed","iso2"]])
+            write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[["done",2,"small"],["failed",2,"small"]])
+            atomic_json(run/"state"/"panaroo"/"done.done.json",{})
+            seen=[]
+            with patch("cleangene.workers._run_index_stage",side_effect=lambda run,cfg,stage,indices,*args:(seen.append((stage,indices)) or [])), patch("cleangene.workers._run_single_job"):
+                controller_downstream(run)
+            self.assertIn(("panaroo",[1]),seen)
+            self.assertNotIn(("panaroo",[0]),seen)
 
 if __name__ == "__main__": unittest.main()

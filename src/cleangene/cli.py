@@ -33,6 +33,16 @@ def load_existing(root: Path, run_id: str) -> Path:
     if not (run/"provenance"/"resolved_config.json").is_file(): raise SystemExit(f"Run not found: {run}")
     return run
 
+def validate_run_dir(run: Path) -> None:
+    required=[run/"provenance"/"resolved_config.json",run/"provenance"/"manifest.tsv",run/"state"/"isolate_tasks.tsv"]
+    missing=[str(p) for p in required if not p.is_file()]
+    if missing: raise SystemExit("Cannot resume run; missing metadata:\n" + "\n".join(missing))
+
+def latest_run(root: Path) -> Path:
+    runs=sorted((root/"runs").glob("*"),key=lambda p:p.stat().st_mtime,reverse=True)
+    if not runs: raise SystemExit(f"No runs found under {root/'runs'}")
+    return runs[0]
+
 def check(args) -> int:
     rows=load_manifest(args.manifest); cfg=read_env(args.config); required=["shovill","prokka","panaroo","bwa","samtools","bcftools","minimap2"]
     needs_kraken=cfg["TAXONOMY_MODE"] not in {"off","auto"} or any(r.get("grouping_source")=="kraken_pending" for r in rows)
@@ -81,12 +91,26 @@ def run_command(args) -> int:
     else: slurm(run,cfg,args.dry_run)
     return 0
 
+def resume_command(args) -> int:
+    if args.run_dir: run=args.run_dir.expanduser().resolve()
+    else:
+        root=(args.analysis_root or Path.cwd()).expanduser().resolve()
+        run=latest_run(root) if args.latest else load_existing(root,args.run)
+    validate_run_dir(run)
+    cfg=json.load((run/"provenance"/"resolved_config.json").open())
+    print(f"run_dir={run}")
+    slurm(run,cfg,args.dry_run)
+    return 0
+
 def main(argv=None) -> int:
     p=argparse.ArgumentParser(prog="cleangene"); sub=p.add_subparsers(dest="cmd",required=True)
     c=sub.add_parser("check"); c.add_argument("--manifest",type=Path,required=True); c.add_argument("--config",type=Path); c.set_defaults(func=check)
     e=sub.add_parser("estimate"); e.add_argument("--manifest",type=Path,required=True); e.set_defaults(func=estimate)
     r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.set_defaults(func=run_command)
+    rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.set_defaults(func=resume_command)
     w=sub.add_parser("_worker"); w.add_argument("--stage",required=True); w.add_argument("--run-dir",type=Path,required=True); w.add_argument("--index",type=int,default=0); w.set_defaults(func=lambda a:(dispatch(a.stage,a.run_dir,a.index),0)[1])
     args=p.parse_args(argv)
     if args.cmd=="run" and not args.resume and not args.manifest: p.error("run requires --manifest unless --resume is used")
+    if args.cmd=="resume" and sum(bool(x) for x in (args.run,args.run_dir,args.latest))!=1: p.error("resume requires exactly one of --run, --run-dir, or --latest")
+    if args.cmd=="resume" and args.latest and not args.analysis_root: p.error("resume --latest requires --analysis-root")
     return args.func(args)

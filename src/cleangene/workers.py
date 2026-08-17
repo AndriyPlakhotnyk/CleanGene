@@ -207,7 +207,22 @@ def _indices_spec(indices: list[int], max_parallel: str) -> str:
         base=",".join(map(str,indices))
     return f"{base}%{max_parallel}"
 
-def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str) -> None:
+def _done(path: Path) -> bool:
+    return path.is_file()
+
+def incomplete_indices(run_dir: Path, stage: str) -> list[int]:
+    if stage=="preprocess":
+        rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
+        return [i for i,r in enumerate(rows) if not _done(run_dir/"state"/"preprocess"/f"{safe_name(r['isolate_id'])}.done.json")]
+    rows=read_tsv(run_dir/"state"/"group_tasks.tsv")
+    marker={"panaroo":"panaroo","prepare_validation":"prepare_validation","reduce":"reduce"}[stage]
+    return [i for i,r in enumerate(rows) if not _done(run_dir/"state"/marker/f"{safe_name(r['group_id'])}.done.json")]
+
+def incomplete_validate_indices(run_dir: Path) -> list[int]:
+    rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
+    return [i for i,r in enumerate(rows) if not _done(run_dir/"state"/"validate"/f"{safe_name(r['isolate_id'])}.done.json")]
+
+def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str, details: str = "") -> None:
     poll=int(cfg["SLURM_POLL_SECONDS"])
     while True:
         active=job_active(job_ids)
@@ -215,14 +230,14 @@ def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str
         avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
         print(f"user jobs: {current}/{cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | {label}: {complete} | waiting ...", flush=True)
         if not active:
-            assert_jobs_succeeded(job_ids)
+            assert_jobs_succeeded(job_ids,details)
             return
         time.sleep(poll)
 
 def _run_single_job(run_dir: Path, cfg: dict[str,str], stage: str, cpus: str, mem: str, time_limit: str, label: str) -> str:
     cmd=_controller_cmd(run_dir,cfg,stage,None,cpus,mem,time_limit)
     jid=submit_with_qos_retry(cmd,cfg,1,label)
-    _wait_jobs([jid],cfg,label,"single job submitted")
+    _wait_jobs([jid],cfg,label,"single job submitted",f"job_id={jid} stage={stage} index=0 log={run_dir/'logs'/'slurm'/(stage + '.%A_%a.log')}")
     return jid
 
 def _run_array_stage(run_dir: Path, cfg: dict[str,str], stage: str, total: int, cpus: str, mem: str, time_limit: str, label: str) -> list[str]:
@@ -239,7 +254,7 @@ def _run_array_stage(run_dir: Path, cfg: dict[str,str], stage: str, total: int, 
         array=_array_spec(start,n,maxp)
         cmd=_controller_cmd(run_dir,cfg,stage,array,cpus,mem,time_limit)
         jobs.append(submit_with_qos_retry(cmd,cfg,array_task_count(array),label))
-        _wait_jobs([jobs[-1]],cfg,label,f"{start+n}/{total} complete")
+        _wait_jobs([jobs[-1]],cfg,label,f"{start+n}/{total} complete",f"job_id={jobs[-1]} stage={stage} index={array} log={run_dir/'logs'/'slurm'/(stage + '.%A_%a.log')}")
         start += n
     return jobs
 
@@ -256,7 +271,7 @@ def _run_index_stage(run_dir: Path, cfg: dict[str,str], stage: str, indices: lis
         array=_indices_spec(indices[pos:pos+n],maxp)
         cmd=_controller_cmd(run_dir,cfg,stage,array,cpus,mem,time_limit)
         jobs.append(submit_with_qos_retry(cmd,cfg,array_task_count(array),label))
-        _wait_jobs([jobs[-1]],cfg,label,f"{pos+n}/{total} complete")
+        _wait_jobs([jobs[-1]],cfg,label,f"{pos+n}/{total} complete",f"job_id={jobs[-1]} stage={stage} index={array} log={run_dir/'logs'/'slurm'/(stage + '.%A_%a.log')}")
         pos += n
     return jobs
 
@@ -264,25 +279,33 @@ def controller_downstream(run_dir: Path) -> None:
     cfg,_=context(run_dir); group_rows=read_tsv(run_dir/"state"/"group_tasks.tsv"); isolate_rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
     prepare_deps=[]
     for klass in ("small","medium","large"):
-        indices=[i for i,r in enumerate(group_rows) if r.get("group_size_class")==klass]
+        missing=set(incomplete_indices(run_dir,"panaroo"))
+        indices=[i for i,r in enumerate(group_rows) if r.get("group_size_class")==klass and i in missing]
         if not indices: continue
         prefix=f"PANAROO_{klass.upper()}"
-        # Group tasks are ordered smallest-first; run tier slices in that order.
-        for stage in ("panaroo","prepare_validation"):
-            prepare_deps.extend(_run_index_stage(run_dir,cfg,stage,indices,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),f"CleanGene {stage}"))
+        prepare_deps.extend(_run_index_stage(run_dir,cfg,"panaroo",indices,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),"CleanGene panaroo"))
+    for klass in ("small","medium","large"):
+        missing=set(incomplete_indices(run_dir,"prepare_validation"))
+        indices=[i for i,r in enumerate(group_rows) if r.get("group_size_class")==klass and i in missing]
+        if not indices: continue
+        prefix=f"PANAROO_{klass.upper()}"
+        prepare_deps.extend(_run_index_stage(run_dir,cfg,"prepare_validation",indices,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),"CleanGene prepare_validation"))
     ni=len(isolate_rows); ng=len(group_rows)
-    if ni: _run_array_stage(run_dir,cfg,"validate",ni,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],"CleanGene validate")
-    if ng: _run_array_stage(run_dir,cfg,"reduce",ng,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene reduce")
-    _run_single_job(run_dir,cfg,"summary",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene summary")
+    val_indices=incomplete_validate_indices(run_dir)
+    if val_indices: _run_index_stage(run_dir,cfg,"validate",val_indices,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],"CleanGene validate")
+    red_indices=incomplete_indices(run_dir,"reduce")
+    if red_indices: _run_index_stage(run_dir,cfg,"reduce",red_indices,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene reduce")
+    if not _done(run_dir/"state"/"summary.done.json"): _run_single_job(run_dir,cfg,"summary",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene summary")
     touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":ng,"isolates":ni})
 
 def slurm_controller(run_dir: Path, index: int | None = None) -> None:
     cfg, rows=context(run_dir)
-    if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip():
+    if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip() and not _done(run_dir/"state"/"kraken_db_setup.done.json"):
         _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
-    ni=len(read_tsv(run_dir/"state"/"isolate_tasks.tsv"))
-    _run_array_stage(run_dir,cfg,"preprocess",ni,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess")
-    _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
+    prep_indices=incomplete_indices(run_dir,"preprocess")
+    if prep_indices: _run_index_stage(run_dir,cfg,"preprocess",prep_indices,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess")
+    if not _done(run_dir/"state"/"resolve_groups.done.json"):
+        _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
     controller_downstream(run_dir)
 
 def manifest_pangenome_dir(rows: list[dict[str,str]], group: str) -> Path | None:
@@ -305,18 +328,18 @@ def prepared_pangenome_dir(run_dir: Path, group: str, root: Path) -> Path:
 
 def panaroo(run_dir: Path, index: int) -> None:
     cfg,rows=context(run_dir); task=task_row(run_dir,"group",index); group=task["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); out=root/"02_pangenome"/"panaroo"; done=run_dir/"state"/"panaroo"/f"{safe_name(group)}.done.json"
+    root.mkdir(parents=True,exist_ok=True); (root/"logs").mkdir(parents=True,exist_ok=True); out.mkdir(parents=True,exist_ok=True)
     if done.is_file():
         status=load_json(done)
         if status.get("status")=="skipped" or status.get("external_pangenome_dir") or (out/"gene_presence_absence.csv").is_file(): return
     retained=retained_rows(run_dir,group)
     if len(retained)<2: touch_done(done,{"status":"skipped","reason":"fewer_than_two_retained"}); return
     external=manifest_pangenome_dir(rows,group)
-    logs=root/"logs"; logs.mkdir(exist_ok=True)
+    logs=root/"logs"; logs.mkdir(parents=True,exist_ok=True)
     if external:
         isolates=[r["isolate_id"] for r in retained]; rows=normalize_panaroo(external/"gene_presence_absence.csv",isolates); calls=root/"02_pangenome"/"initial_calls"; calls.mkdir(parents=True,exist_ok=True); write_binary(calls/"gene_presence_absence.binary.tsv",rows,isolates)
         touch_done(done,{"n_isolates":len(isolates),"n_genes":len(rows),"external_pangenome_dir":str(external)})
         return
-    out.mkdir(parents=True,exist_ok=True)
     gffs=[r["gff"] for r in retained]
     run(["panaroo","-i",*gffs,"-o",str(out),"--clean-mode",cfg["PANAROO_CLEAN_MODE"],"-t",cfg.get("PANAROO_CPUS",cfg.get("CPUS","4"))],stdout=logs/"panaroo.stdout",stderr=logs/"panaroo.stderr")
     isolates=[r["isolate_id"] for r in retained]; rows=normalize_panaroo(out/"gene_presence_absence.csv",isolates); calls=root/"02_pangenome"/"initial_calls"; calls.mkdir(parents=True,exist_ok=True); write_binary(calls/"gene_presence_absence.binary.tsv",rows,isolates)
@@ -324,6 +347,7 @@ def panaroo(run_dir: Path, index: int) -> None:
 
 def prepare_validation(run_dir: Path, index: int) -> None:
     cfg,_=context(run_dir); group=task_row(run_dir,"group",index)["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); done=run_dir/"state"/"prepare_validation"/f"{safe_name(group)}.done.json"
+    root.mkdir(parents=True,exist_ok=True); (root/"logs").mkdir(parents=True,exist_ok=True)
     if done.is_file(): return
     retained=retained_rows(run_dir,group)
     if len(retained)<2: touch_done(done,{"status":"skipped"}); return

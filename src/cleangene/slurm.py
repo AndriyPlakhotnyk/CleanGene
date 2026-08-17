@@ -95,10 +95,10 @@ def job_active(job_ids: list[str]) -> set[str]:
     result=subprocess.run(["squeue","-h","-j",",".join(ids),"-o","%A"],capture_output=True,text=True)
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
-def assert_jobs_succeeded(job_ids: list[str]) -> None:
+def assert_jobs_succeeded(job_ids: list[str], details: str = "") -> None:
     ids=[j for j in job_ids if j and j!="DRYRUN"]
     if not ids: return
-    result=subprocess.run(["sacct","-n","-X","-j",",".join(ids),"--format=State","-P"],capture_output=True,text=True)
+    result=subprocess.run(["sacct","-n","-X","-j",",".join(ids),"--format=JobIDRaw,State","-P"],capture_output=True,text=True)
     if result.returncode: return
-    bad=[s.strip().split("|")[0] for s in result.stdout.splitlines() if s.strip() and not s.startswith(("COMPLETED","COMPLETING"))]
-    if bad: raise RuntimeError("SLURM job failure detected: " + ", ".join(bad[:5]))
+    bad=[s.strip() for s in result.stdout.splitlines() if s.strip() and not s.split("|")[-1].startswith(("COMPLETED","COMPLETING"))]
+    if bad: raise RuntimeError("SLURM job failure detected: " + ", ".join(bad[:5]) + (f" | {details}" if details else ""))
