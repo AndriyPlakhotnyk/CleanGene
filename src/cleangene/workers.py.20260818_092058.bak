@@ -75,30 +75,18 @@ def kraken_db_setup(run_dir: Path, index: int | None = None) -> None:
 def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int]:
     r1=row.get("R1","").strip(); r2=row.get("R2","").strip(); mode=cfg.get("READ_TRIMMING_MODE","auto").strip().lower()
     method="manifest_fastq"; trimmed=0
-    raw_bam=row.get("raw_bam","").strip()
-
-    if raw_bam:
-        if not Path(raw_bam).is_file():
-            raise SystemExit(f"Input BAM not found for isolate {row.get('isolate_id','<unknown>')}: {raw_bam}")
+    if row.get("raw_bam","").strip():
         reads=out/"reads"; reads.mkdir(exist_ok=True)
         r1=str(reads/"raw_R1.fastq.gz"); r2=str(reads/"raw_R2.fastq.gz")
         collated=reads/"raw_name_collated.bam"
         other=reads/"raw_unpaired.fastq.gz"
         threads=str(max(1,int(cfg.get("CPUS","4"))-1))
-        run(["samtools","collate","-@",threads,"-o",str(collated),raw_bam],stdout=logs/"samtools-collate.stdout",stderr=logs/"samtools-collate.stderr")
+        run(["samtools","collate","-@",threads,"-o",str(collated),row["raw_bam"]],stdout=logs/"samtools-collate.stdout",stderr=logs/"samtools-collate.stderr")
         run(["samtools","fastq","-@",threads,"-1",r1,"-2",r2,"-0",str(other),"-s",str(other),"-n",str(collated)],
             stdout=logs/"samtools-fastq.stdout",stderr=logs/"samtools-fastq.stderr")
         method="raw_bam_samtools_fastq"
-
     if not r1 or not r2:
         raise SystemExit(f"Missing R1/R2 read paths for isolate {row.get('isolate_id','<unknown>')}")
-
-    missing=[p for p in (r1,r2) if not Path(p).is_file()]
-    if missing:
-        raise SystemExit(
-            f"FASTQ input not found for isolate {row.get('isolate_id','<unknown>')}: "
-            + ", ".join(missing)
-        )
     if mode not in {"off","auto","always"}: raise SystemExit("READ_TRIMMING_MODE must be off, auto, or always")
     if mode in {"auto","always"}:
         if command_exists("fastp"):
