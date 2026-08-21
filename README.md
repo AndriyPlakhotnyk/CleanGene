@@ -83,4 +83,16 @@
        --profile local
    ```
 
+10. **Downstream analyses**
+
+   Completed runs can submit SLURM-native sample queries, differential-gene tests, operon typing, read-backed variant analysis, and iTOL annotation datasets:
+
+   ```bash
+   cleangene utils get-samples \
+       --run-dir ~/cleangene-output/runs/<run-id> \
+       --organism "Species name" --genes geneA geneB
+   ```
+
+   See [docs/UTILS.md](docs/UTILS.md) for command forms, manifest columns, outputs, and resource controls.
+
 > The script is written to work for many hundreds of isolates – the array ranges handle arbitrary sizes, and job dependencies ensure that stages start only after previous ones finish. Adjust defaults in `src/cleangene/defaults.py` if your resources differ.

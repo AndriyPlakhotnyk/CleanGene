@@ -15,5 +15,6 @@ dependencies:
   - kraken2
   - matplotlib
   - scipy
+  - mafft
   - pip: 
     - .

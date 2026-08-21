@@ -1,0 +1,86 @@
+from __future__ import annotations
+import contextlib, json, tempfile, unittest
+from io import StringIO
+from pathlib import Path
+from unittest.mock import patch
+
+from cleangene.cli import main
+from cleangene.downstream import differential_genes, get_operon, get_samples, get_variants, make_itol, resolve_organism
+from cleangene.util import atomic_json, read_tsv, write_tsv
+
+class CleanGeneUtilsTests(unittest.TestCase):
+    def make_run(self, root: Path) -> Path:
+        run=root/"runs"/"test_run"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir(); matrix=run/"results"/"groups"/"Species_one"/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"
+        atomic_json(run/"provenance"/"resolved_config.json",{"SLURM_ACCOUNT":"","SLURM_PARTITION":"","UTILS_CPUS":"2","UTILS_MEM":"4G","UTILS_TIME":"01:00:00","UTILS_VARIANT_CPUS":"4","UTILS_VARIANT_MEM":"8G","UTILS_VARIANT_TIME":"02:00:00"})
+        write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id"],[["i1","Species one"],["i2","Species one"],["i3","Species one"],["i4","Species one"]])
+        write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[["Species one",4,"small"]])
+        write_tsv(matrix,["Gene","i1","i2","i3","i4"],[["gA",1,1,0,0],["gB",1,0,1,0],["gC",0,0,1,1]])
+        return run
+
+    def test_get_samples_writes_calls_and_lists(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=self.make_run(Path(d)); out=Path(d)/"out"; out.mkdir()
+            get_samples({"run_dir":str(run),"output_dir":str(out),"organism":"Species one","genes":["gA","gB"],"samples":[],"status":"both","match":"all"})
+            calls=read_tsv(out/"gene_presence_absence.tsv"); present=read_tsv(out/"samples_present.tsv"); absent=read_tsv(out/"samples_absent.tsv")
+            self.assertEqual([r["isolate_id"] for r in present],["i1"]); self.assertEqual(len(absent),3); self.assertEqual(calls[0]["gB"],"1")
+
+    def test_differential_genes_compares_two_cohorts(self):
+        with tempfile.TemporaryDirectory() as d, patch("cleangene.downstream.plot_binary_heatmap"):
+            run=self.make_run(Path(d)); out=Path(d)/"out"; out.mkdir()
+            differential_genes({"run_dir":str(run),"output_dir":str(out),"organism":"Species one","group_a":["i1","i2"],"group_b":["i3","i4"],"max_q_value":1,"min_prevalence_difference":0,"top":10})
+            rows={r["Gene"]:r for r in read_tsv(out/"differential_genes.tsv")}
+            self.assertEqual(rows["gA"]["group_a_present"],"2"); self.assertEqual(rows["gA"]["group_b_present"],"0")
+
+    def test_operon_assigns_same_id_to_same_pattern(self):
+        with tempfile.TemporaryDirectory() as d, patch("cleangene.downstream.plot_binary_heatmap"):
+            run=self.make_run(Path(d)); out=Path(d)/"out"; out.mkdir()
+            get_operon({"run_dir":str(run),"output_dir":str(out),"operons":[{"name":"abc","genes":["gA"],"organism":"Species one","samples":[]}]})
+            rows=read_tsv(out/"operon_calls.tsv"); by_iso={r["isolate_id"]:r for r in rows}
+            self.assertEqual(by_iso["i3"]["operon_id"],by_iso["i4"]["operon_id"]); self.assertEqual(by_iso["i1"]["operon_id"],by_iso["i2"]["operon_id"]); self.assertNotEqual(by_iso["i1"]["operon_id"],by_iso["i3"]["operon_id"])
+
+    def test_itol_writes_binary_and_operon_strip(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=self.make_run(Path(d)); out=Path(d)/"out"; out.mkdir(); operon=Path(d)/"operon.tsv"
+            write_tsv(operon,["isolate_id","operon_id"],[["i1","abc_V001"],["i2","abc_V002"]])
+            make_itol({"run_dir":str(run),"output_dir":str(out),"organism":"Species one","genes":["gA"],"samples":[],"operon":str(operon),"variants":"","color_scheme":"muted","custom_colors":{}})
+            self.assertTrue((out/"itol_gene_presence_absence.txt").read_text().startswith("DATASET_BINARY")); self.assertTrue((out/"itol_operon_types.txt").read_text().startswith("DATASET_COLORSTRIP"))
+
+    def test_missing_organism_lists_run_organisms(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=self.make_run(Path(d))
+            with self.assertRaisesRegex(SystemExit,"Available organisms: Species one"): resolve_organism(run,None,[])
+
+    def test_variant_worker_reports_read_metrics_and_location_status(self):
+        with tempfile.TemporaryDirectory() as d, \
+             patch("cleangene.workers.retained_rows",return_value=[{"isolate_id":"i1","R1":"r1","R2":"r2","assembly":"","gff":""}]), \
+             patch("cleangene.downstream._gene_references",return_value=([("CG00000001","ACGT")],[{"reference_id":"CG00000001","Gene":"gA","feature_type":"target","parent_gene":"","flank_offset":"","annotation":"gA"}])), \
+             patch("cleangene.downstream.run"), patch("cleangene.evidence.map_reads"), \
+             patch("cleangene.evidence.coverage",return_value={"CG00000001":{"mapped_reads":10,"covered_bases":4,"breadth":1.0}}), \
+             patch("cleangene.evidence.align_identity",return_value={"CG00000001":{"identity":1.0,"identical_positions":4}}), \
+             patch("cleangene.downstream._variant_counts",return_value={"CG00000001":{"snps":1,"mnps":0,"insertions":0,"deletions":0,"inserted_bases":0,"deleted_bases":0}}), \
+             patch("cleangene.downstream._plot_variant_alignment"):
+            run_dir=self.make_run(Path(d)); out=Path(d)/"out"; out.mkdir()
+            def fake_consensus(reference,bam,prefix,*args):
+                path=prefix.with_suffix(".consensus.fasta"); path.write_text(">CG00000001\nACGT\n"); return path
+            with patch("cleangene.evidence.consensus",side_effect=fake_consensus):
+                get_variants({"run_dir":str(run_dir),"output_dir":str(out),"organism":"Species one","genes":["gA"],"samples":["i1"],"cpus":1,"min_similarity":95,"flanking_genes":0})
+            row=read_tsv(out/"gene_variants.tsv")[0]
+            self.assertEqual(row["variant_id"],"gA_V001"); self.assertEqual(row["percent_identity"],"100.0"); self.assertEqual(row["snps"],"1"); self.assertEqual(row["location_status"],"no_assembly")
+
+    def test_utils_cli_prints_submission_messages_and_uses_sbatch(self):
+        with tempfile.TemporaryDirectory() as d, patch("cleangene.utils_cli.submit",return_value="123") as submit_job:
+            run=self.make_run(Path(d)); stdout=StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code=main(["utils","get-samples","--run-dir",str(run),"--analysis-name","query","--organism","Species one","--genes","gA"])
+            self.assertEqual(code,0); text=stdout.getvalue(); self.assertIn("Welcome to CleanGene Utils",text); self.assertIn(f"Located run: {run}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Analysis submitted. Please find logs in",text)
+            command=submit_job.call_args.args[0]; self.assertEqual(command[0],"sbatch"); self.assertIn("_utils_worker",command[-1])
+            request=json.loads((run/"results"/"utils"/"query"/"request.json").read_text()); self.assertEqual(request["slurm_job_id"],"123")
+
+    def test_core_run_prints_submission_messages(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); manifest=root/"manifest.tsv"; manifest.write_text("isolate_id\torganism\tR1\tR2\ni1\tSpecies one\t/r1.fastq.gz\t/r2.fastq.gz\n")
+            stdout=StringIO()
+            with contextlib.redirect_stdout(stdout): main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","messages","--dry-run"])
+            text=stdout.getvalue(); self.assertIn("Welcome to CleanGene",text); self.assertIn(f"Run directory: {root/'runs'/'messages'}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Run submitted. Please find logs in",text)
+
+if __name__=="__main__": unittest.main()

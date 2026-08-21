@@ -7,6 +7,8 @@ from .defaults import SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
 from .slurm import sbatch_cmd, submit
 from .util import atomic_json, command_exists, safe_name, sha256, write_tsv
+from .utils_cli import add_utils_parser
+from .ux import spinner
 from .workers import dispatch
 
 def validate_fastq_inputs(rows: list[dict[str,str]]) -> None:
@@ -115,37 +117,46 @@ def local(run: Path) -> None:
     for i in range(ng): dispatch("plot",run,i)
     dispatch("summary",run,None)
 
-def slurm(run: Path, cfg: dict[str,str], dry: bool) -> None:
+def slurm(run: Path, cfg: dict[str,str], dry: bool) -> str:
     exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
     base=dict(account=cfg["SLURM_ACCOUNT"],partition=cfg["SLURM_PARTITION"])
     wrap=f"{exe} --stage slurm_controller --run-dir {shlex_quote(str(run))} --index 0"
     log=run/"logs"/"slurm"/"controller.%j.log"
     cmd=sbatch_cmd(name="cg-controller",wrap=wrap,cpus=cfg["SLURM_CONTROLLER_CPUS"],mem=cfg["SLURM_CONTROLLER_MEM"],time=cfg["SLURM_CONTROLLER_TIME"],log=log,**base)
-    submit(cmd,dry)
+    return submit(cmd,dry)
 
 def shlex_quote(x:str)->str:
     import shlex; return shlex.quote(x)
 
 def run_command(args) -> int:
+    print("Welcome to CleanGene")
     cfg=read_env(args.config); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
-    if args.resume: run=load_existing(root,args.resume); cfg=json.load((run/"provenance"/"resolved_config.json").open())
-    else: run=make_run(args.manifest,root,cfg,args.run_id)
-    print(f"run_dir={run}")
-    if args.profile=="local": local(run)
-    else: slurm(run,cfg,args.dry_run)
+    if args.resume:
+        run=load_existing(root,args.resume); cfg=json.load((run/"provenance"/"resolved_config.json").open())
+    else:
+        run_id=args.run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=root/"runs"/run_id
+    print(f"Run directory: {run}")
+    with spinner("Getting ready to submit"):
+        if not args.resume: run=make_run(args.manifest,root,cfg,run_id)
+        if args.profile=="local": local(run)
+        else: slurm(run,cfg,args.dry_run)
+    if args.profile=="slurm": print(f"Run submitted. Please find logs in {run/'logs'/'slurm'}")
     return 0
 
 def resume_command(args) -> int:
+    print("Welcome to CleanGene")
     if args.run_dir: run=args.run_dir.expanduser().resolve()
     else:
         root=(args.analysis_root or Path.cwd()).expanduser().resolve()
         run=latest_run(root) if args.latest else load_existing(root,args.run)
     validate_run_dir(run)
     cfg=json.load((run/"provenance"/"resolved_config.json").open())
-    invalidated=invalidate_legacy_identity_metrics(run,cfg)
-    if invalidated: print(f"invalidated_legacy_identity_metrics={invalidated}")
-    print(f"run_dir={run}")
-    slurm(run,cfg,args.dry_run)
+    print(f"Run directory: {run}")
+    with spinner("Getting ready to submit"):
+        invalidated=invalidate_legacy_identity_metrics(run,cfg)
+        if invalidated: print(f"invalidated_legacy_identity_metrics={invalidated}")
+        slurm(run,cfg,args.dry_run)
+    print(f"Run submitted. Please find logs in {run/'logs'/'slurm'}")
     return 0
 
 def main(argv=None) -> int:
@@ -155,6 +166,8 @@ def main(argv=None) -> int:
     r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.set_defaults(func=run_command)
     rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.set_defaults(func=resume_command)
     w=sub.add_parser("_worker"); w.add_argument("--stage",required=True); w.add_argument("--run-dir",type=Path,required=True); w.add_argument("--index",type=int,default=0); w.set_defaults(func=lambda a:(dispatch(a.stage,a.run_dir,a.index),0)[1])
+    uw=sub.add_parser("_utils_worker"); uw.add_argument("--request",type=Path,required=True); uw.set_defaults(func=lambda a:(__import__("cleangene.downstream",fromlist=["run_request"]).run_request(a.request),0)[1])
+    add_utils_parser(sub)
     args=p.parse_args(argv)
     if args.cmd=="run" and not args.resume and not args.manifest: p.error("run requires --manifest unless --resume is used")
     if args.cmd=="resume" and sum(bool(x) for x in (args.run,args.run_dir,args.latest))!=1: p.error("resume requires exactly one of --run, --run-dir, or --latest")
