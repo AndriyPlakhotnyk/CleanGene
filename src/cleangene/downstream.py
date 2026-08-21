@@ -331,5 +331,8 @@ def run_request(request_path: Path) -> None:
     elif kind=="get_differential_genes": differential_genes(request)
     elif kind=="get_operon": get_operon(request)
     elif kind=="get_variants": get_variants(request)
+    elif kind=="diagnose_call":
+        from .diagnostics import diagnose_call
+        diagnose_call(request)
     elif kind=="itol": make_itol(request)
     else: raise SystemExit(f"Unknown CleanGene utility: {kind}")

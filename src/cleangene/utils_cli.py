@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse, json, sys
 from datetime import datetime
 from pathlib import Path
+from .defaults import DEFAULTS
 from .downstream import read_ids, read_manifest_rows, resolve_organism, validate_matrix_selection
 from .slurm import sbatch_cmd, submit
 from .util import atomic_json, read_tsv, safe_name
@@ -20,6 +21,7 @@ def add_utils_parser(sub) -> None:
     diff=utilities.add_parser("get-differential-genes",aliases=["get_differential_genes"]); _run_args(diff); _organism_args(diff); diff.add_argument("--cohort-a",nargs="*",default=[]); diff.add_argument("--cohort-a-file",type=Path); diff.add_argument("--cohort-b",nargs="*",default=[]); diff.add_argument("--cohort-b-file",type=Path); diff.add_argument("--manifest",type=Path); diff.add_argument("--group-column",default="group_id"); diff.add_argument("--group-a-label"); diff.add_argument("--group-b-label"); diff.add_argument("--max-q-value",type=float,default=0.05); diff.add_argument("--min-prevalence-difference",type=float,default=0.10); diff.add_argument("--top",type=int,default=50)
     operon=utilities.add_parser("get-operon",aliases=["get_operon"]); _run_args(operon); _organism_args(operon); operon.add_argument("--genes",nargs="+"); operon.add_argument("--operon-name"); operon.add_argument("--manifest",type=Path)
     variants=utilities.add_parser("get-variants",aliases=["get_variants"]); _run_args(variants); _organism_args(variants); variants.add_argument("--genes",nargs="+"); variants.add_argument("--operon",type=Path); variants.add_argument("--min-similarity",type=float,default=95.0); variants.add_argument("--flanking-genes",type=int,default=0); variants.add_argument("--analyze-flanks",action="store_true")
+    diagnostic=utilities.add_parser("diagnose-call",aliases=["diagnose_call"]); _run_args(diagnostic); _organism_args(diagnostic); diagnostic.add_argument("--genes",nargs="+",required=True); diagnostic.add_argument("--max-samples",type=int,default=20); diagnostic.add_argument("--skip-assembly-replay",action="store_true")
     itol=utilities.add_parser("itol",aliases=["get_itol"]); _run_args(itol); _organism_args(itol); itol.add_argument("--genes",nargs="*",default=[]); itol.add_argument("--operon",type=Path); itol.add_argument("--variants",type=Path); itol.add_argument("--color-scheme",choices=("classic","muted","custom"),default="classic"); itol.add_argument("--custom-colors",type=Path)
     root.set_defaults(func=utils_command)
 
@@ -111,6 +113,10 @@ def _request(args, run: Path) -> dict[str,object]:
         if not 0<=args.min_similarity<=100: raise SystemExit("--min-similarity must be between 0 and 100")
         if not 0<=args.flanking_genes<=10: raise SystemExit("--flanking-genes must be between 0 and 10")
         return {"utility":kind,"organism":organism,"genes":genes,"samples":samples,"min_similarity":args.min_similarity,"flanking_genes":args.flanking_genes,"analyze_flanks":args.analyze_flanks}
+    if kind=="diagnose_call":
+        organism=resolve_organism(run,args.organism,samples); validate_matrix_selection(run,organism,args.genes,samples)
+        if args.max_samples<1: raise SystemExit("--max-samples must be at least 1")
+        return {"utility":kind,"organism":organism,"genes":args.genes,"samples":samples,"max_samples":args.max_samples,"replay_assembly":not args.skip_assembly_replay}
     if not args.genes and not args.operon and not args.variants: raise SystemExit("itol requires --genes, --operon, and/or --variants")
     inferred_organisms=set(); inferred_samples=[]
     for path,filename in ((args.operon,"operon_calls.tsv"),(args.variants,"gene_variants.tsv")):
@@ -129,9 +135,10 @@ def utils_command(args) -> int:
     print("Welcome to CleanGene Utils")
     run=locate_run(args); print(f"Located run: {run}")
     with spinner("Getting ready to submit"):
-        request=_request(args,run); cfg=json.loads((run/"provenance"/"resolved_config.json").read_text()); stamp=datetime.now().strftime("%y%m%d_%H%M%S"); analysis_id=safe_name(args.analysis_name or f"{stamp}_{request['utility']}"); out=run/"results"/"utils"/analysis_id; logs=run/"logs"/"slurm"/"utils"; out.mkdir(parents=True,exist_ok=False); logs.mkdir(parents=True,exist_ok=True)
-        request.update({"run_dir":str(run),"output_dir":str(out),"analysis_id":analysis_id,"submitted":datetime.now().isoformat(),"cpus":int(cfg.get("UTILS_VARIANT_CPUS" if request["utility"]=="get_variants" else "UTILS_CPUS","8")),"min_mapq":int(cfg.get("READ_VALIDATION_MIN_MAPQ","20")),"min_depth":float(cfg.get("READ_VALIDATION_MIN_MEAN_DEPTH","5")),"basequal":int(cfg.get("BASEQUAL","30"))}); request_path=out/"request.json"; atomic_json(request_path,request)
-        variant=request["utility"]=="get_variants"; cpus=cfg.get("UTILS_VARIANT_CPUS" if variant else "UTILS_CPUS","8"); mem=cfg.get("UTILS_VARIANT_MEM" if variant else "UTILS_MEM","32G"); limit=cfg.get("UTILS_VARIANT_TIME" if variant else "UTILS_TIME","12:00:00")
+        request=_request(args,run); cfg={**DEFAULTS,**json.loads((run/"provenance"/"resolved_config.json").read_text())}; stamp=datetime.now().strftime("%y%m%d_%H%M%S"); analysis_id=safe_name(args.analysis_name or f"{stamp}_{request['utility']}"); out=run/"results"/"utils"/analysis_id; logs=run/"logs"/"slurm"/"utils"; out.mkdir(parents=True,exist_ok=False); logs.mkdir(parents=True,exist_ok=True)
+        resource="DIAGNOSTIC" if request["utility"]=="diagnose_call" else "VARIANT" if request["utility"]=="get_variants" else ""
+        cpus=cfg.get(f"UTILS_{resource}_CPUS" if resource else "UTILS_CPUS","8"); mem=cfg.get(f"UTILS_{resource}_MEM" if resource else "UTILS_MEM","32G"); limit=cfg.get(f"UTILS_{resource}_TIME" if resource else "UTILS_TIME","12:00:00")
+        request.update({"run_dir":str(run),"output_dir":str(out),"analysis_id":analysis_id,"submitted":datetime.now().isoformat(),"cpus":int(cpus),"min_mapq":int(cfg.get("READ_VALIDATION_MIN_MAPQ","20")),"min_depth":float(cfg.get("READ_VALIDATION_MIN_MEAN_DEPTH","5")),"basequal":int(cfg.get("BASEQUAL","30"))}); request_path=out/"request.json"; atomic_json(request_path,request)
         import shlex
         wrap=f"{shlex.quote(sys.executable)} -m cleangene _utils_worker --request {shlex.quote(str(request_path))}"
         command=sbatch_cmd(name=f"cg-util-{safe_name(str(request['utility']))[:20]}",wrap=wrap,cpus=cpus,mem=mem,time=limit,account=cfg.get("SLURM_ACCOUNT",""),partition=cfg.get("SLURM_PARTITION",""),log=logs/f"{analysis_id}.%j.log")

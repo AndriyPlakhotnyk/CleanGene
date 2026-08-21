@@ -1,8 +1,8 @@
 from __future__ import annotations
 import shlex, subprocess
-import os, re, time
+import os, time
+from collections import Counter
 from pathlib import Path
-from typing import Callable
 
 def sbatch_cmd(*, name: str, wrap: str, cpus: str, mem: str, time: str, array: str | None = None, dependency: str | None = None, account: str = "", partition: str = "", log: Path | None = None) -> list[str]:
     cmd=["sbatch","--parsable","--job-name",name,"--cpus-per-task",cpus,"--mem",mem,"--time",time]
@@ -28,28 +28,6 @@ def submit(cmd: list[str], dry_run: bool) -> str:
         raise RuntimeError(message)
     return result.stdout.strip().split(";")[0]
 
-def array_chunks(indices: list[int] | range, chunk_size: int, max_parallel: str) -> list[str]:
-    vals=list(indices)
-    if chunk_size < 1: raise ValueError("SLURM_ARRAY_CHUNK_SIZE must be >= 1")
-    chunks=[]
-    for i in range(0,len(vals),chunk_size):
-        part=vals[i:i+chunk_size]
-        contiguous=part==list(range(part[0],part[-1]+1))
-        spec=f"{part[0]}-{part[-1]}" if contiguous and len(part)>1 else ",".join(map(str,part))
-        chunks.append(f"{spec}%{max_parallel}")
-    return chunks
-
-def submit_chunked_arrays(build_cmd: Callable[[str, str | None], list[str]], arrays: list[str], dry_run: bool, max_outstanding: int = 1, initial_dependency: str | None = None) -> list[str]:
-    if max_outstanding < 1: raise ValueError("SLURM_MAX_OUTSTANDING_CHUNKS must be >= 1")
-    submitted=[]; wave_dep=initial_dependency
-    for i in range(0,len(arrays),max_outstanding):
-        wave=[]
-        for array in arrays[i:i+max_outstanding]:
-            wave.append(submit(build_cmd(array,wave_dep),dry_run))
-        submitted.extend(wave)
-        wave_dep=":".join(wave)
-    return submitted
-
 def array_task_count(array: str | None) -> int:
     if not array: return 1
     spec=array.split("%",1)[0]; total=0
@@ -61,9 +39,19 @@ def array_task_count(array: str | None) -> int:
     return total
 
 def user_job_count(user: str | None = None) -> int:
+    return user_queue_snapshot(user)["total"]
+
+def user_queue_snapshot(user: str | None = None) -> dict[str,object]:
     user=user or os.environ.get("USER","")
-    result=subprocess.run(["squeue","-r","-h","-u",user,"-t","R,PD"],capture_output=True,text=True,check=True)
-    return sum(1 for line in result.stdout.splitlines() if line.strip())
+    result=subprocess.run(["squeue","-r","-h","-u",user,"-t","R,PD","-o","%F|%T"],capture_output=True,text=True,check=True)
+    jobs: dict[str,Counter[str]]= {}
+    total=0
+    for line in result.stdout.splitlines():
+        if not line.strip(): continue
+        job_id,_,state=line.strip().partition("|")
+        jobs.setdefault(job_id,Counter())[state or "UNKNOWN"] += 1
+        total += 1
+    return {"total":total,"jobs":jobs}
 
 def available_slots(limit: int, headroom: int, current: int) -> int:
     return max(0, limit - headroom - current)

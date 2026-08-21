@@ -6,12 +6,17 @@ src/cleangene/__main__.py
 src/cleangene/cli.py
 src/cleangene/config.py
 src/cleangene/defaults.py
+src/cleangene/diagnostics.py
+src/cleangene/downstream.py
 src/cleangene/evidence.py
 src/cleangene/fasta.py
 src/cleangene/manifest.py
 src/cleangene/pangenome.py
+src/cleangene/plotting.py
 src/cleangene/slurm.py
 src/cleangene/util.py
+src/cleangene/utils_cli.py
+src/cleangene/ux.py
 src/cleangene/workers.py
 src/cleangene.egg-info/PKG-INFO
 src/cleangene.egg-info/SOURCES.txt
@@ -19,3 +24,4 @@ src/cleangene.egg-info/dependency_links.txt
 src/cleangene.egg-info/entry_points.txt
 src/cleangene.egg-info/top_level.txt
 tests/test_core.py
+tests/test_utils.py

@@ -5,10 +5,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cleangene.cli import main
+from cleangene.diagnostics import infer_failure_stage
 from cleangene.downstream import differential_genes, get_operon, get_samples, get_variants, make_itol, resolve_organism
 from cleangene.util import atomic_json, read_tsv, write_tsv
 
 class CleanGeneUtilsTests(unittest.TestCase):
+    def test_diagnostic_failure_stage_tracks_sampling_and_assembler(self):
+        self.assertEqual(infer_failure_stage(0,1,20,20,0,0,0,0,False,False)[0],"shovill_seqkit_sampling")
+        self.assertEqual(infer_failure_stage(0,1,20,20,20,0,0,0,False,False)[0],"spades_graph_construction")
+        self.assertEqual(infer_failure_stage(0,1,20,20,20,20,0,0,False,False)[0],"spades_contig_resolution")
+        self.assertEqual(infer_failure_stage(0,1,20,20,20,20,20,0,False,False)[0],"shovill_post_assembly")
+        self.assertEqual(infer_failure_stage(0,1,20,20,20,20,20,20,True,False)[0],"prokka")
     def make_run(self, root: Path) -> Path:
         run=root/"runs"/"test_run"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir(); matrix=run/"results"/"groups"/"Species_one"/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"
         atomic_json(run/"provenance"/"resolved_config.json",{"SLURM_ACCOUNT":"","SLURM_PARTITION":"","UTILS_CPUS":"2","UTILS_MEM":"4G","UTILS_TIME":"01:00:00","UTILS_VARIANT_CPUS":"4","UTILS_VARIANT_MEM":"8G","UTILS_VARIANT_TIME":"02:00:00"})
@@ -75,6 +82,13 @@ class CleanGeneUtilsTests(unittest.TestCase):
             self.assertEqual(code,0); text=stdout.getvalue(); self.assertIn("Welcome to CleanGene Utils",text); self.assertIn(f"Located run: {run}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Analysis submitted. Please find logs in",text)
             command=submit_job.call_args.args[0]; self.assertEqual(command[0],"sbatch"); self.assertIn("_utils_worker",command[-1])
             request=json.loads((run/"results"/"utils"/"query"/"request.json").read_text()); self.assertEqual(request["slurm_job_id"],"123")
+
+    def test_diagnostic_cli_submits_with_dedicated_resources(self):
+        with tempfile.TemporaryDirectory() as d, patch("cleangene.utils_cli.submit",return_value="456") as submit_job:
+            run=self.make_run(Path(d))
+            with contextlib.redirect_stdout(StringIO()): main(["utils","diagnose-call","--run-dir",str(run),"--analysis-name","diag","--organism","Species one","--genes","gA","--samples","i1"])
+            command=submit_job.call_args.args[0]; self.assertEqual(command[command.index("--cpus-per-task")+1],"16"); self.assertEqual(command[command.index("--mem")+1],"128G")
+            request=json.loads((run/"results"/"utils"/"diag"/"request.json").read_text()); self.assertEqual(request["utility"],"diagnose_call"); self.assertEqual(request["samples"],["i1"])
 
     def test_core_run_prints_submission_messages(self):
         with tempfile.TemporaryDirectory() as d:

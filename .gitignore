@@ -32,7 +32,11 @@ venv/
 tmp/
 
 # Data, output, and local AI handoff notes
-input/*.tsv
+input/
+runs/
+*.manifest.tsv
+*.manifest.csv
+*.xlsx
 config/cleangene.env
 results/
 test_data/

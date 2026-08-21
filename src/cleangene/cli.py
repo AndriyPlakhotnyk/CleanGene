@@ -6,7 +6,7 @@ from .config import read_env
 from .defaults import SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
 from .slurm import sbatch_cmd, submit
-from .util import atomic_json, command_exists, safe_name, sha256, write_tsv
+from .util import atomic_json, command_exists, load_json, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
 from .ux import spinner
 from .workers import dispatch
@@ -41,6 +41,16 @@ def validate_run_dir(run: Path) -> None:
     required=[run/"provenance"/"resolved_config.json",run/"provenance"/"manifest.tsv",run/"state"/"isolate_tasks.tsv"]
     missing=[str(p) for p in required if not p.is_file()]
     if missing: raise SystemExit("Cannot resume run; missing metadata:\n" + "\n".join(missing))
+
+def refresh_resume_config(run: Path, config: Path | None) -> dict[str,str]:
+    current=load_json(run/"provenance"/"resolved_config.json")
+    if not config: return current
+    updated=read_env(config)
+    if current.get("KRAKEN2_DB") and not updated.get("KRAKEN2_DB"): updated["KRAKEN2_DB"]=current["KRAKEN2_DB"]
+    backup=run/"provenance"/"resolved_config.pre_resume.json"
+    if not backup.is_file(): shutil.copy2(run/"provenance"/"resolved_config.json",backup)
+    atomic_json(run/"provenance"/"resolved_config.json",updated)
+    return updated
 
 def _float_or_none(value: str | None) -> float | None:
     try:
@@ -132,7 +142,7 @@ def run_command(args) -> int:
     print("Welcome to CleanGene")
     cfg=read_env(args.config); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
-        run=load_existing(root,args.resume); cfg=json.load((run/"provenance"/"resolved_config.json").open())
+        run=load_existing(root,args.resume); cfg=refresh_resume_config(run,args.config)
     else:
         run_id=args.run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=root/"runs"/run_id
     print(f"Run directory: {run}")
@@ -150,7 +160,7 @@ def resume_command(args) -> int:
         root=(args.analysis_root or Path.cwd()).expanduser().resolve()
         run=latest_run(root) if args.latest else load_existing(root,args.run)
     validate_run_dir(run)
-    cfg=json.load((run/"provenance"/"resolved_config.json").open())
+    cfg=refresh_resume_config(run,args.config)
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
         invalidated=invalidate_legacy_identity_metrics(run,cfg)
@@ -164,7 +174,7 @@ def main(argv=None) -> int:
     c=sub.add_parser("check"); c.add_argument("--manifest",type=Path,required=True); c.add_argument("--config",type=Path); c.set_defaults(func=check)
     e=sub.add_parser("estimate"); e.add_argument("--manifest",type=Path,required=True); e.set_defaults(func=estimate)
     r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.set_defaults(func=run_command)
-    rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.set_defaults(func=resume_command)
+    rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--config",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.set_defaults(func=resume_command)
     w=sub.add_parser("_worker"); w.add_argument("--stage",required=True); w.add_argument("--run-dir",type=Path,required=True); w.add_argument("--index",type=int,default=0); w.set_defaults(func=lambda a:(dispatch(a.stage,a.run_dir,a.index),0)[1])
     uw=sub.add_parser("_utils_worker"); uw.add_argument("--request",type=Path,required=True); uw.set_defaults(func=lambda a:(__import__("cleangene.downstream",fromlist=["run_request"]).run_request(a.request),0)[1])
     add_utils_parser(sub)

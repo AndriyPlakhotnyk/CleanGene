@@ -1,4 +1,4 @@
-import tempfile, unittest
+import os, tempfile, unittest
 from pathlib import Path
 from io import StringIO
 import contextlib
@@ -6,10 +6,10 @@ from cleangene.manifest import groups, load_manifest
 from cleangene.evidence import classify_gene_evidence, fixed_coordinate_identity
 from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
-from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, array_chunks, sbatch_cmd, submit, submit_chunked_arrays
+from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, sbatch_cmd, submit
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _run_array_stage, _wait_jobs, controller_downstream, ensure_kraken2_db, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, reduce_group, slurm_controller, task_row
-from cleangene.cli import invalidate_legacy_identity_metrics, make_run, slurm
+from cleangene.workers import _RollingScheduler, _controller_pipeline, _preprocess_scratch, _wait_jobs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.cli import invalidate_legacy_identity_metrics, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
 
@@ -116,18 +116,9 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertEqual(manifest_pangenome_dir(rows,"g"),pan.resolve())
 
     def test_sbatch_array_uses_configured_parallel_value(self):
-        cmd=sbatch_cmd(name="x",wrap="echo ok",cpus="1",mem="1G",time="00:05:00",array=array_chunks(range(28294),500,"100")[0])
+        cmd=sbatch_cmd(name="x",wrap="echo ok",cpus="1",mem="1G",time="00:05:00",array="0-499%100")
         self.assertIn("--array",cmd)
         self.assertEqual(cmd[cmd.index("--array")+1],"0-499%100")
-
-    def test_chunked_arrays_chain_dependencies(self):
-        seen=[]
-        def build(array, dep):
-            seen.append((array,dep)); return ["sbatch","--array",array]
-        with contextlib.redirect_stdout(StringIO()):
-            ids=submit_chunked_arrays(build,array_chunks(range(1200),500,"100"),True,1,"dbjob")
-        self.assertEqual(ids,["DRYRUN","DRYRUN","DRYRUN"])
-        self.assertEqual(seen,[("0-499%100","dbjob"),("500-999%100","DRYRUN"),("1000-1199%100","DRYRUN")])
 
     def test_submit_reports_sbatch_stderr(self):
         failed=subprocess.CompletedProcess(["sbatch"],1,stdout="",stderr="Batch job submission failed: throttled")
@@ -161,6 +152,36 @@ class CleanGeneCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit,"kraken_db_setup"):
                 ensure_kraken2_db(run,cfg,rows)
 
+    def test_preprocess_threads_kraken_and_suppresses_per_read_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir=Path(d)/"run"; db=Path(d)/"db"; db.mkdir(); (db/"hash.k2d").write_text("db")
+            r1=Path(d)/"r1.fq"; r2=Path(d)/"r2.fq"; r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
+            cfg={"TAXONOMY_MODE":"kraken2","KRAKEN2_DB":str(db),"KRAKEN2_DB_ACCESS":"direct","KRAKEN2_KEEP_CLASSIFICATIONS":"false","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"true","READ_TRIMMING_MODE":"off","CPUS":"8"}
+            rows=[["i1","g","manifest_organism","Species",str(r1),str(r2),"/prebuilt"]]
+            atomic_json(run_dir/"provenance"/"resolved_config.json",cfg); write_tsv(run_dir/"provenance"/"manifest.tsv",["isolate_id","group_id","grouping_source","organism","R1","R2","pangenome_dir"],rows); write_tsv(run_dir/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["g","i1"]])
+            commands=[]
+            def fake_run(command,**kwargs):
+                commands.append(command)
+                if command[0]=="kraken2": Path(command[command.index("--report")+1]).write_text("100.00\t1\t1\tS\t1\tSpecies\n")
+            with patch("cleangene.workers.run",side_effect=fake_run), patch.dict(os.environ,{"SLURM_TMPDIR":str(Path(d)/"scratch")},clear=False): preprocess(run_dir,0)
+            kraken=next(c for c in commands if c[0]=="kraken2")
+            self.assertEqual(kraken[kraken.index("--threads")+1],"8")
+            self.assertEqual(kraken[kraken.index("--output")+1],"/dev/null")
+            shared=run_dir/"results"/"groups"/"g"/"01_isolates"/"i1"
+            self.assertFalse((shared/"kraken2.output.tsv").exists()); self.assertTrue((shared/"kraken2.report.tsv").is_file()); self.assertTrue((shared/"qc.tsv").is_file())
+
+    def test_kraken_database_stages_once_in_node_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            source=Path(d)/"source"; cache=Path(d)/"cache"; source.mkdir(); (source/"hash.k2d").write_text("hash"); (source/"opts.k2d").write_text("opts")
+            cfg={"KRAKEN2_DB_ACCESS":"copy","KRAKEN2_NODE_CACHE_DIR":str(cache),"KRAKEN2_NODE_CACHE_MIN_FREE_GB":"0"}
+            first,mmap1=kraken_db_for_worker(str(source),cfg); second,mmap2=kraken_db_for_worker(str(source),cfg)
+            self.assertEqual(first,second); self.assertTrue(mmap1 and mmap2); self.assertTrue((Path(first)/".cleangene-ready").is_file())
+
+    def test_preprocess_scratch_uses_slurm_tmpdir(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ,{"SLURM_TMPDIR":d},clear=False):
+            scratch=_preprocess_scratch({"PREPROCESS_USE_NODE_LOCAL_SCRATCH":"true","PREPROCESS_SCRATCH_DIR":""},Path(d)/"run","iso")
+            self.assertEqual(scratch.parent,Path(d)); self.assertTrue(scratch.is_dir())
+
     def test_available_slots_respects_headroom(self):
         self.assertEqual(available_slots(2000,10,0),1990)
         self.assertEqual(available_slots(2000,10,1800),190)
@@ -174,8 +195,9 @@ class CleanGeneCoreTests(unittest.TestCase):
 
     def test_user_job_count_counts_squeue_rows_for_all_user_jobs(self):
         done=subprocess.CompletedProcess(["squeue"],0,stdout="1\n2\n3\n",stderr="")
-        with patch("cleangene.slurm.subprocess.run",return_value=done):
+        with patch("cleangene.slurm.subprocess.run",return_value=done) as command:
             self.assertEqual(user_job_count("andriy"),3)
+        self.assertIn("%F|%T",command.call_args.args[0])
 
     def test_qos_retry_recalculates_and_resubmits(self):
         err=RuntimeError("sbatch failed\nstderr: QOSMaxSubmitJobPerUserLimit")
@@ -187,16 +209,39 @@ class CleanGeneCoreTests(unittest.TestCase):
 
     def test_controller_does_not_oversubmit_when_partially_full(self):
         seen=[]
-        cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+        cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"400","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_MAX_OUTSTANDING_CHUNKS":"8","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
         with tempfile.TemporaryDirectory() as d, \
-             patch("cleangene.workers.user_job_count",return_value=1800), \
-             patch("cleangene.workers._wait_jobs"), \
              patch("cleangene.workers.submit_with_qos_retry",side_effect=lambda cmd,cfg,task_count,label:(seen.append((cmd,task_count)) or "1")):
+            run=Path(d); write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],(("g",f"i{i}") for i in range(500)))
+            scheduler=_RollingScheduler(run,cfg); scheduler.snapshot={"total":1800,"jobs":{}}
             with contextlib.redirect_stdout(StringIO()):
-                _run_array_stage(Path(d),cfg,"preprocess",500,"1","1G","1:00:00","x")
+                scheduler.submit_ready("preprocess",list(range(500)),"1","1G","1:00:00","x",400)
         array=seen[0][0][seen[0][0].index("--array")+1]
-        self.assertEqual(array,"0-189%100")
+        self.assertEqual(array,"0-189%400")
         self.assertEqual(seen[0][1],190)
+
+    def test_rolling_scheduler_refills_before_prior_array_finishes(self):
+        cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_MAX_PARALLEL":"400","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_MAX_OUTSTANDING_CHUNKS":"8","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d); write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],(("g",f"i{i}") for i in range(600)))
+            scheduler=_RollingScheduler(run,cfg)
+            with patch("cleangene.workers.submit_with_qos_retry",side_effect=["10","11"]):
+                scheduler.snapshot={"total":0,"jobs":{}}
+                self.assertEqual(scheduler.submit_ready("preprocess",list(range(600)),"1","1G","1:00:00","x",400),400)
+                for i in range(200): atomic_json(run/"state"/"preprocess"/f"i{i}.done.json",{})
+                scheduler.snapshot={"total":200,"jobs":{"10":{"RUNNING":200}}}
+                self.assertEqual(scheduler.submit_ready("preprocess",list(range(600)),"1","1G","1:00:00","x",400),200)
+            self.assertIn("10",scheduler.active)
+            self.assertIn("11",scheduler.active)
+
+    def test_progress_counts_done_markers_not_submitted_boundary(self):
+        cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10"}
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d); write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],(("g",f"i{i}") for i in range(3))); atomic_json(run/"state"/"preprocess"/"i0.done.json",{})
+            scheduler=_RollingScheduler(run,cfg); scheduler.snapshot={"total":2,"jobs":{}}; scheduler.submitted={"preprocess":{0,1,2}}
+            output=StringIO()
+            with contextlib.redirect_stdout(output): scheduler.progress("preprocess",[0,1,2],"CleanGene preprocess")
+            self.assertIn("complete=1/3 submitted=3",output.getvalue())
 
     def test_wait_jobs_sleep_branch_has_time_import(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0"}
@@ -237,9 +282,9 @@ class CleanGeneCoreTests(unittest.TestCase):
             write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[["g",1,"small"]])
             atomic_json(run/"state"/"preprocess"/"iso1.done.json",{})
             atomic_json(run/"state"/"resolve_groups.done.json",{})
-            with patch("cleangene.workers._run_index_stage") as arrays, patch("cleangene.workers._run_single_job") as singles, patch("cleangene.workers.controller_downstream"):
+            with patch("cleangene.workers._controller_pipeline") as pipeline, patch("cleangene.workers._run_single_job") as singles:
                 slurm_controller(run)
-            self.assertFalse(any("preprocess" in str(c) for c in arrays.call_args_list))
+            pipeline.assert_called_once_with(run,True)
             self.assertFalse(any("resolve_groups" in str(c) for c in singles.call_args_list))
 
     def test_resume_reruns_failed_panaroo_only(self):
@@ -256,6 +301,41 @@ class CleanGeneCoreTests(unittest.TestCase):
                 controller_downstream(run)
             self.assertIn(("panaroo",[1]),seen)
             self.assertNotIn(("panaroo",[0]),seen)
+
+    def test_known_groups_overlap_downstream_with_preprocess(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; atomic_json(run/"provenance"/"resolved_config.json",{})
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id"],[["small_iso","small"],["large_iso","large"]])
+            write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["small","small_iso"],["large","large_iso"]])
+            write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[["small",1,"small"],["large",2001,"large"]])
+            atomic_json(run/"state"/"preprocess"/"small_iso.done.json",{})
+            class ImmediateScheduler:
+                def __init__(self,*args): self.active={}; self.calls=[]
+                def refresh(self): pass
+                def active_indices(self,stage): return set()
+                def submit_ready(self,stage,indices,*args):
+                    self.calls.append((stage,list(indices)))
+                    kind="isolate" if stage in {"preprocess","validate"} else "group"; rows=read_tsv(run/"state"/f"{kind}_tasks.tsv")
+                    for i in indices:
+                        name=rows[i]["isolate_id" if kind=="isolate" else "group_id"]; atomic_json(run/"state"/stage/f"{name}.done.json",{})
+                    return len(indices)
+                def progress(self,*args): pass
+                def wait_tick(self): pass
+            scheduler=ImmediateScheduler()
+            with patch("cleangene.workers._RollingScheduler",return_value=scheduler), patch("cleangene.workers._run_single_job",return_value="summary"):
+                _controller_pipeline(run,True)
+            panaroo_calls=[indices for stage,indices in scheduler.calls if stage=="panaroo"]
+            self.assertEqual(panaroo_calls[0],[0])
+            self.assertEqual(panaroo_calls[1],[1])
+            self.assertLess(scheduler.calls.index(("panaroo",[0])),scheduler.calls.index(("preprocess",[0,1])))
+
+    def test_resume_config_updates_execution_values_and_preserves_db(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; config=Path(d)/"arc.env"; atomic_json(run/"provenance"/"resolved_config.json",{"KRAKEN2_DB":"/resolved/db","SLURM_MAX_PARALLEL":"100"})
+            config.write_text('SLURM_MAX_PARALLEL="400"\nSLURM_PREPROCESS_MAX_INFLIGHT="400"\nKRAKEN2_DB=""\n')
+            updated=refresh_resume_config(run,config)
+            self.assertEqual(updated["SLURM_MAX_PARALLEL"],"400"); self.assertEqual(updated["KRAKEN2_DB"],"/resolved/db")
+            self.assertTrue((run/"provenance"/"resolved_config.pre_resume.json").is_file())
 
     def test_reduce_preserves_initial_call_for_identity_unresolved(self):
         with tempfile.TemporaryDirectory() as d:

@@ -1,17 +1,20 @@
 from __future__ import annotations
-import csv, json, os, shutil, subprocess, sys, time
+import csv, fcntl, hashlib, os, shutil, sys, tempfile, time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from .config import truthy
+from .defaults import DEFAULTS
 from .evidence import validate_isolate, validation_decision_logic_rows
 from .fasta import assembly_metrics
 from .manifest import groups, write_resolved
 from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_binary
 from .plotting import plot_presence_absence
-from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count
+from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 
 def context(run_dir: Path):
-    cfg=load_json(run_dir/"provenance"/"resolved_config.json"); rows=read_tsv(run_dir/"provenance"/"manifest.tsv"); return cfg, rows
+    cfg={**DEFAULTS,**load_json(run_dir/"provenance"/"resolved_config.json")}; rows=read_tsv(run_dir/"provenance"/"manifest.tsv"); return cfg, rows
 
 def task_row(run_dir: Path, kind: str, index: int) -> dict[str,str]:
     rows=read_tsv(run_dir/"state"/f"{kind}_tasks.tsv")
@@ -57,6 +60,59 @@ def ensure_kraken2_db(run_dir: Path, cfg: dict[str,str], rows: list[dict[str,str
     db_path=default_kraken2_db(run_dir,cfg)
     if (db_path/"hash.k2d").is_file(): return str(db_path)
     raise SystemExit(f"Kraken2 database is not ready: {db_path}. The kraken_db_setup SLURM stage must complete before preprocess.")
+
+def _directory_size(path: Path) -> int:
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+def kraken_db_for_worker(db: str, cfg: dict[str,str]) -> tuple[str,bool]:
+    mode=cfg.get("KRAKEN2_DB_ACCESS","auto").strip().lower()
+    if mode not in {"auto","copy","mmap","direct"}:
+        raise SystemExit("KRAKEN2_DB_ACCESS must be auto, copy, mmap, or direct")
+    source=Path(db).resolve()
+    if mode in {"mmap","direct"}: return str(source),mode=="mmap"
+    cache_setting=cfg.get("KRAKEN2_NODE_CACHE_DIR","").strip()
+    cache_root=Path(cache_setting).expanduser() if cache_setting else Path("/tmp")/f"cleangene-{os.getuid()}"/"kraken2"
+    try:
+        cache_root.mkdir(parents=True,exist_ok=True,mode=0o700)
+        token=hashlib.sha256(f"{source}:{(source/'hash.k2d').stat().st_size}:{(source/'hash.k2d').stat().st_mtime_ns}".encode()).hexdigest()[:16]
+        target=cache_root/f"{safe_name(source.name)}-{token}"
+        lock_path=cache_root/f"{token}.lock"
+        with lock_path.open("w") as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            if not (target/".cleangene-ready").is_file():
+                needed=_directory_size(source)+int(float(cfg.get("KRAKEN2_NODE_CACHE_MIN_FREE_GB","2"))*1024**3)
+                if shutil.disk_usage(cache_root).free < needed: raise OSError(f"insufficient free space under {cache_root}")
+                staging=Path(tempfile.mkdtemp(prefix=f"{token}.",dir=cache_root))
+                try:
+                    copied=staging/"db"; shutil.copytree(source,copied); (copied/".cleangene-ready").write_text(str(source)+"\n")
+                    if target.exists(): shutil.rmtree(target)
+                    os.replace(copied,target)
+                finally:
+                    shutil.rmtree(staging,ignore_errors=True)
+        return str(target),True
+    except OSError as error:
+        if mode=="copy": raise SystemExit(f"Could not stage Kraken2 database in node-local cache {cache_root}: {error}")
+        print(f"warning: Kraken2 node cache unavailable ({error}); using shared database with memory mapping",flush=True)
+        return str(source),True
+
+def _preprocess_scratch(cfg: dict[str,str], run_dir: Path, isolate: str) -> Path | None:
+    if not truthy(cfg.get("PREPROCESS_USE_NODE_LOCAL_SCRATCH","true")): return None
+    configured=cfg.get("PREPROCESS_SCRATCH_DIR","").strip()
+    base=configured or os.environ.get("SLURM_TMPDIR","") or os.environ.get("TMPDIR","") or "/tmp"
+    root=Path(base).expanduser()
+    try:
+        root.mkdir(parents=True,exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix=f"cleangene-{safe_name(run_dir.name)}-{safe_name(isolate)}-",dir=root))
+    except OSError as error:
+        print(f"warning: node-local preprocessing scratch unavailable ({error}); using run directory",flush=True)
+        return None
+
+def _sync_tree(source: Path, destination: Path) -> None:
+    if source.is_dir(): shutil.copytree(source,destination,dirs_exist_ok=True)
+
+def _shared_path(path: str, work_out: Path, shared_out: Path) -> str:
+    try: return str(shared_out/Path(path).relative_to(work_out))
+    except ValueError: return path
 
 def kraken_db_setup(run_dir: Path, index: int | None = None) -> None:
     cfg, rows=context(run_dir)
@@ -119,39 +175,55 @@ def preprocess(run_dir: Path, index: int) -> None:
     if done.is_file():
         status=load_json(done)
         if status.get("excluded") or status.get("external_pangenome") or (out/"annotation"/f"{safe}.gff").is_file(): return
-    out.mkdir(parents=True,exist_ok=True); logs=out/"logs"; logs.mkdir(exist_ok=True)
-    r1,r2,read_method,adapter_trimmed=prepare_read_inputs(row,out,logs,cfg)
-    expected=row.get("organism","").strip(); taxonomy=cfg.get("TAXONOMY_MODE","auto"); excluded=False; top=""; contam=0.0
-    taxonomy_enabled=taxonomy not in {"off","auto"} or row.get("grouping_source")=="kraken_pending"
-    if taxonomy_enabled:
-        db=ensure_kraken2_db(run_dir,cfg,rows)
-        if not db: raise SystemExit("KRAKEN2_DB is required when TAXONOMY_MODE is not off")
-        report=out/"kraken2.report.tsv"; output=out/"kraken2.output.tsv"
-        run(["kraken2","--db",db,"--paired","--report",str(report),"--output",str(output),r1,r2],stdout=logs/"kraken2.stdout",stderr=logs/"kraken2.stderr")
-        top,contam,_=parse_kraken_report(report,expected)
-        if expected and contam>float(cfg["MAJOR_CONTAMINATION_THRESHOLD"]): excluded=True
-    assembly=row.get("assembly","").strip()
-    if excluded:
-        metrics=assembly_metrics(Path(assembly)) if assembly else {"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
-        fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"]
-        data={"isolate_id":iso,"group_id":group,"excluded":1,"reason":"major_contamination","top_species":top,"contamination_pct":contam,"R1":r1,"R2":r2,"raw_bam":row.get("raw_bam",""),"read_preprocessing":read_method,"adapter_trimmed":adapter_trimmed,"assembly":assembly,"gff":"",**metrics}
-        write_tsv(out/"qc.tsv",fields,[data]); touch_done(done,{"excluded":True,"reason":"major_contamination"}); return
-    external_pangenome=bool(row.get("pangenome_dir","").strip())
-    if external_pangenome and not assembly:
-        metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
-        fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"]
-        data={"isolate_id":iso,"group_id":group,"excluded":0,"reason":"","top_species":top,"contamination_pct":contam,"R1":r1,"R2":r2,"raw_bam":row.get("raw_bam",""),"read_preprocessing":read_method,"adapter_trimmed":adapter_trimmed,"assembly":"","gff":"",**metrics}
-        write_tsv(out/"qc.tsv",fields,[data]); touch_done(done,{"excluded":False,"external_pangenome":row["pangenome_dir"]}); return
-    if not assembly:
-        shov=out/"assembly"; shov.mkdir(exist_ok=True); assembly=str(shov/"contigs.fa")
-        if not Path(assembly).is_file(): run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
-    ann=out/"annotation"; gff=ann/f"{safe}.gff"
-    if not gff.is_file():
-        if ann.exists(): shutil.rmtree(ann)
-        run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
-    metrics=assembly_metrics(Path(assembly)); fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"]
-    data={"isolate_id":iso,"group_id":group,"excluded":int(excluded),"reason":"major_contamination" if excluded else "","top_species":top,"contamination_pct":contam,"R1":r1,"R2":r2,"raw_bam":row.get("raw_bam",""),"read_preprocessing":read_method,"adapter_trimmed":adapter_trimmed,"assembly":assembly,"gff":str(gff),**metrics}
-    write_tsv(out/"qc.tsv",fields,[data]); touch_done(done,{"excluded":excluded,"gff":str(gff)})
+    out.mkdir(parents=True,exist_ok=True); scratch=_preprocess_scratch(cfg,run_dir,iso); work_out=(scratch/"output") if scratch else out; work_out.mkdir(parents=True,exist_ok=True); logs=work_out/"logs"; logs.mkdir(exist_ok=True)
+    fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"]
+    finished=False
+    def finish(data: dict[str,object], payload: dict[str,object]) -> None:
+        nonlocal finished
+        if scratch: _sync_tree(work_out,out)
+        for key in ("R1","R2","assembly","gff"):
+            if data.get(key): data[key]=_shared_path(str(data[key]),work_out,out)
+        if payload.get("gff"): payload["gff"]=_shared_path(str(payload["gff"]),work_out,out)
+        write_tsv(out/"qc.tsv",fields,[data]); touch_done(done,payload); finished=True
+    try:
+        r1,r2,read_method,adapter_trimmed=prepare_read_inputs(row,work_out,logs,cfg)
+        expected=row.get("organism","").strip(); taxonomy=cfg.get("TAXONOMY_MODE","auto"); excluded=False; top=""; contam=0.0
+        taxonomy_enabled=taxonomy not in {"off","auto"} or row.get("grouping_source")=="kraken_pending"
+        if taxonomy_enabled:
+            db=ensure_kraken2_db(run_dir,cfg,rows)
+            if not db: raise SystemExit("KRAKEN2_DB is required when TAXONOMY_MODE is not off")
+            worker_db,memory_map=kraken_db_for_worker(db,cfg); report=work_out/"kraken2.report.tsv"
+            output=str(work_out/"kraken2.output.tsv") if truthy(cfg.get("KRAKEN2_KEEP_CLASSIFICATIONS","false")) else "/dev/null"
+            command=["kraken2","--db",worker_db,"--threads",cfg.get("CPUS","4")]
+            if memory_map: command.append("--memory-mapping")
+            command += ["--paired","--report",str(report),"--output",output,r1,r2]
+            run(command,stdout=logs/"kraken2.stdout",stderr=logs/"kraken2.stderr")
+            top,contam,_=parse_kraken_report(report,expected)
+            if expected and contam>float(cfg["MAJOR_CONTAMINATION_THRESHOLD"]): excluded=True
+        assembly=row.get("assembly","").strip()
+        common={"isolate_id":iso,"group_id":group,"top_species":top,"contamination_pct":contam,"R1":r1,"R2":r2,"raw_bam":row.get("raw_bam",""),"read_preprocessing":read_method,"adapter_trimmed":adapter_trimmed}
+        if excluded:
+            metrics=assembly_metrics(Path(assembly)) if assembly else {"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
+            finish({**common,"excluded":1,"reason":"major_contamination","assembly":assembly,"gff":"",**metrics},{"excluded":True,"reason":"major_contamination"}); return
+        external_pangenome=bool(row.get("pangenome_dir","").strip())
+        if external_pangenome and not assembly:
+            metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
+            finish({**common,"excluded":0,"reason":"","assembly":"","gff":"",**metrics},{"excluded":False,"external_pangenome":row["pangenome_dir"]}); return
+        if not assembly:
+            shov=work_out/"assembly"; shov.mkdir(exist_ok=True); assembly=str(shov/"contigs.fa")
+            if not Path(assembly).is_file():
+                tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
+                run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
+        ann=work_out/"annotation"; gff=ann/f"{safe}.gff"
+        if not gff.is_file():
+            if ann.exists(): shutil.rmtree(ann)
+            run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
+        metrics=assembly_metrics(Path(assembly)); data={**common,"excluded":0,"reason":"","assembly":assembly,"gff":str(gff),**metrics}
+        finish(data,{"excluded":False,"gff":str(gff)})
+    finally:
+        if scratch:
+            if not finished: _sync_tree(logs,out/"logs")
+            shutil.rmtree(scratch,ignore_errors=True)
 
 def retained_rows(run_dir: Path, group: str) -> list[dict[str,str]]:
     _, rows=context(run_dir); result=[]
@@ -208,11 +280,6 @@ def _controller_cmd(run_dir: Path, cfg: dict[str,str], stage: str, array: str | 
     log=run_dir/"logs"/"slurm"/f"{stage}.%A_%a.log"
     return sbatch_cmd(name=f"cg-{stage}",wrap=wrap,cpus=cpus,mem=mem,time=time_limit,array=array,log=log,**base)
 
-def _array_spec(start: int, count: int, max_parallel: str) -> str:
-    end=start+count-1
-    spec=str(start) if start==end else f"{start}-{end}"
-    return f"{spec}%{max_parallel}"
-
 def _indices_spec(indices: list[int], max_parallel: str) -> str:
     if indices==list(range(indices[0],indices[-1]+1)):
         base=str(indices[0]) if len(indices)==1 else f"{indices[0]}-{indices[-1]}"
@@ -253,75 +320,164 @@ def _run_single_job(run_dir: Path, cfg: dict[str,str], stage: str, cpus: str, me
     _wait_jobs([jid],cfg,label,"single job submitted",f"job_id={jid} stage={stage} index=0 log={run_dir/'logs'/'slurm'/(stage + '.%A_%a.log')}")
     return jid
 
-def _run_array_stage(run_dir: Path, cfg: dict[str,str], stage: str, total: int, cpus: str, mem: str, time_limit: str, label: str) -> list[str]:
-    maxp=cfg["SLURM_MAX_PARALLEL"]; chunk=int(cfg["SLURM_ARRAY_CHUNK_SIZE"]); poll=int(cfg["SLURM_POLL_SECONDS"])
-    start=0; jobs=[]
-    while start < total:
-        current=user_job_count()
-        avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
-        done=f"{start}/{total} complete"
-        print(f"user jobs: {current}/{cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | {label}: {done} | waiting/submitting ...", flush=True)
-        if avail <= 0:
-            time.sleep(poll); continue
-        n=min(chunk,avail,total-start)
-        array=_array_spec(start,n,maxp)
-        cmd=_controller_cmd(run_dir,cfg,stage,array,cpus,mem,time_limit)
-        jobs.append(submit_with_qos_retry(cmd,cfg,array_task_count(array),label))
-        _wait_jobs([jobs[-1]],cfg,label,f"{start+n}/{total} complete",f"job_id={jobs[-1]} stage={stage} index={array} log={run_dir/'logs'/'slurm'/(stage + '.%A_%a.log')}")
-        start += n
-    return jobs
+def _index_done(run_dir: Path, stage: str, index: int) -> bool:
+    kind="isolate" if stage in {"preprocess","validate"} else "group"
+    row=task_row(run_dir,kind,index); name=row["isolate_id"] if kind=="isolate" else row["group_id"]
+    marker={"validate":"validate"}.get(stage,stage)
+    return _done(run_dir/"state"/marker/f"{safe_name(name)}.done.json")
+
+@dataclass
+class _ActiveBatch:
+    job_id: str
+    stage: str
+    indices: list[int]
+    array: str
+    seen: bool=False
+    missing_polls: int=0
+
+class _RollingScheduler:
+    def __init__(self,run_dir: Path,cfg: dict[str,str]):
+        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{}}
+
+    def refresh(self) -> None:
+        self.snapshot=user_queue_snapshot(); queued=self.snapshot["jobs"]
+        for jid,batch in list(self.active.items()):
+            if jid in queued:
+                batch.seen=True; batch.missing_polls=0; continue
+            batch.missing_polls += 1
+            if batch.missing_polls<2: continue
+            details=f"job_id={jid} stage={batch.stage} index={batch.array} log={self.run_dir/'logs'/'slurm'/(batch.stage + '.%A_%a.log')}"
+            assert_jobs_succeeded([jid],details)
+            missing=[i for i in batch.indices if not _index_done(self.run_dir,batch.stage,i)]
+            if missing: raise RuntimeError(f"SLURM job {jid} completed without {batch.stage} markers for indices: {','.join(map(str,missing[:10]))} | {details}")
+            del self.active[jid]
+
+    def active_indices(self,stage: str) -> set[int]:
+        return {i for b in self.active.values() if b.stage==stage for i in b.indices}
+
+    def stage_queue(self,stage: str) -> tuple[int,int]:
+        running=pending=0; jobs=self.snapshot["jobs"]
+        for jid,batch in self.active.items():
+            if batch.stage!=stage: continue
+            states=jobs.get(jid,{})
+            running += states.get("RUNNING",0); pending += states.get("PENDING",0)+states.get("UNKNOWN",0)
+        return running,pending
+
+    def submit_ready(self,stage: str,indices: list[int],cpus: str,mem: str,time_limit: str,label: str,max_inflight: int) -> int:
+        active_indices=self.active_indices(stage); ready=[i for i in indices if i not in active_indices and not _index_done(self.run_dir,stage,i)]
+        submitted=0; max_batches=int(self.cfg["SLURM_MAX_OUTSTANDING_CHUNKS"]); chunk=int(self.cfg["SLURM_ARRAY_CHUNK_SIZE"])
+        running,pending=self.stage_queue(stage); stage_queued=running+pending
+        current=int(self.snapshot["total"]); avail=available_slots(int(self.cfg["SLURM_USER_JOB_LIMIT"]),int(self.cfg["SLURM_JOB_HEADROOM"]),current)
+        batches=sum(1 for b in self.active.values() if b.stage==stage)
+        while ready and avail>0 and stage_queued<max_inflight and batches<max_batches:
+            n=min(chunk,avail,max_inflight-stage_queued,len(ready)); part=ready[:n]; ready=ready[n:]
+            array=_indices_spec(part,self.cfg["SLURM_MAX_PARALLEL"]); cmd=_controller_cmd(self.run_dir,self.cfg,stage,array,cpus,mem,time_limit)
+            jid=submit_with_qos_retry(cmd,self.cfg,array_task_count(array),label); batch=_ActiveBatch(jid,stage,part,array,seen=True)
+            self.active[jid]=batch; self.jobs.append(jid); self.submitted.setdefault(stage,set()).update(part)
+            local_jobs=self.snapshot["jobs"]; local_jobs[jid]={"PENDING":n}; self.snapshot["total"]=int(self.snapshot["total"])+n
+            submitted += n; stage_queued += n; avail -= n; batches += 1
+        return submitted
+
+    def progress(self,stage: str,total_indices: list[int],label: str) -> None:
+        complete=sum(_index_done(self.run_dir,stage,i) for i in total_indices); running,pending=self.stage_queue(stage)
+        submitted=len({i for i in total_indices if _index_done(self.run_dir,stage,i)}|self.submitted.get(stage,set()))
+        current=int(self.snapshot["total"]); avail=available_slots(int(self.cfg["SLURM_USER_JOB_LIMIT"]),int(self.cfg["SLURM_JOB_HEADROOM"]),current)
+        print(f"user jobs: {current}/{self.cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | {label}: complete={complete}/{len(total_indices)} submitted={submitted} running={running} pending={pending} failed=0 | waiting/submitting ...",flush=True)
+
+    def wait_tick(self) -> None: time.sleep(int(self.cfg["SLURM_POLL_SECONDS"]))
+
+def _stage_limit(cfg: dict[str,str],stage: str) -> int:
+    if stage=="preprocess": return int(cfg["SLURM_PREPROCESS_MAX_INFLIGHT"])
+    if stage=="validate": return int(cfg["SLURM_VALIDATION_MAX_INFLIGHT"])
+    return int(cfg["SLURM_GROUP_MAX_INFLIGHT"])
 
 def _run_index_stage(run_dir: Path, cfg: dict[str,str], stage: str, indices: list[int], cpus: str, mem: str, time_limit: str, label: str) -> list[str]:
-    maxp=cfg["SLURM_MAX_PARALLEL"]; chunk=int(cfg["SLURM_ARRAY_CHUNK_SIZE"]); poll=int(cfg["SLURM_POLL_SECONDS"])
-    pos=0; jobs=[]; total=len(indices)
-    while pos < total:
-        current=user_job_count()
-        avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
-        print(f"user jobs: {current}/{cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | {label}: {pos}/{total} complete | waiting/submitting ...", flush=True)
-        if avail <= 0:
-            time.sleep(poll); continue
-        n=min(chunk,avail,total-pos)
-        array=_indices_spec(indices[pos:pos+n],maxp)
-        cmd=_controller_cmd(run_dir,cfg,stage,array,cpus,mem,time_limit)
-        jobs.append(submit_with_qos_retry(cmd,cfg,array_task_count(array),label))
-        _wait_jobs([jobs[-1]],cfg,label,f"{pos+n}/{total} complete",f"job_id={jobs[-1]} stage={stage} index={array} log={run_dir/'logs'/'slurm'/(stage + '.%A_%a.log')}")
-        pos += n
-    return jobs
+    scheduler=_RollingScheduler(run_dir,cfg)
+    while any(not _index_done(run_dir,stage,i) for i in indices):
+        scheduler.refresh(); scheduler.submit_ready(stage,indices,cpus,mem,time_limit,label,_stage_limit(cfg,stage)); scheduler.progress(stage,indices,label)
+        if any(not _index_done(run_dir,stage,i) for i in indices): scheduler.wait_tick()
+    return scheduler.jobs
+
+def _group_resources(cfg: dict[str,str],group_row: dict[str,str]) -> tuple[str,str,str]:
+    prefix=f"PANAROO_{group_row.get('group_size_class','small').upper()}"
+    return cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"])
+
+def _controller_pipeline(run_dir: Path,include_preprocess: bool) -> None:
+    cfg,_=context(run_dir); group_rows=read_tsv(run_dir/"state"/"group_tasks.tsv"); isolate_rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv"); scheduler=_RollingScheduler(run_dir,cfg)
+    group_index={r["group_id"]:i for i,r in enumerate(group_rows)}; members={g:[] for g in group_index}
+    for i,row in enumerate(isolate_rows): members.setdefault(row["group_id"],[]).append(i)
+    rank={r["group_id"]:i for i,r in enumerate(group_rows)}; prep_order=sorted(range(len(isolate_rows)),key=lambda i:(rank.get(isolate_rows[i]["group_id"],len(rank)),i))
+    all_prep=list(range(len(isolate_rows))); all_groups=list(range(len(group_rows))); all_validate=list(range(len(isolate_rows)))
+    while True:
+        scheduler.refresh()
+        active=lambda stage:scheduler.active_indices(stage)
+        group_prepared=lambda gi:all(_index_done(run_dir,"preprocess",i) for i in members.get(group_rows[gi]["group_id"],[]))
+        panaroo_ready=[i for i in all_groups if group_prepared(i) and i not in active("panaroo") and not _index_done(run_dir,"panaroo",i)]
+        for klass in ("small","medium","large"):
+            ready=[i for i in panaroo_ready if group_rows[i].get("group_size_class")==klass]
+            if ready:
+                cpus,mem,limit=_group_resources(cfg,group_rows[ready[0]]); scheduler.submit_ready("panaroo",ready,cpus,mem,limit,"CleanGene panaroo",_stage_limit(cfg,"panaroo"))
+        prepare_ready=[i for i in all_groups if _index_done(run_dir,"panaroo",i) and i not in active("prepare_validation") and not _index_done(run_dir,"prepare_validation",i)]
+        for klass in ("small","medium","large"):
+            ready=[i for i in prepare_ready if group_rows[i].get("group_size_class")==klass]
+            if ready:
+                cpus,mem,limit=_group_resources(cfg,group_rows[ready[0]]); scheduler.submit_ready("prepare_validation",ready,cpus,mem,limit,"CleanGene prepare_validation",_stage_limit(cfg,"prepare_validation"))
+        validation_ready=[i for i,row in enumerate(isolate_rows) if _index_done(run_dir,"prepare_validation",group_index[row["group_id"]])]
+        scheduler.submit_ready("validate",validation_ready,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],"CleanGene validate",_stage_limit(cfg,"validate"))
+        reduce_ready=[gi for gi,row in enumerate(group_rows) if _index_done(run_dir,"prepare_validation",gi) and all(_index_done(run_dir,"validate",i) for i in members[row["group_id"]])]
+        scheduler.submit_ready("reduce",reduce_ready,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene reduce",_stage_limit(cfg,"reduce"))
+        plot_ready=[i for i in all_groups if _index_done(run_dir,"reduce",i)]
+        scheduler.submit_ready("plot",plot_ready,cfg["PLOT_CPUS"],cfg["PLOT_MEM"],cfg["PLOT_TIME"],"CleanGene plot",_stage_limit(cfg,"plot"))
+        if include_preprocess: scheduler.submit_ready("preprocess",prep_order,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess",_stage_limit(cfg,"preprocess"))
+        if include_preprocess and any(not _index_done(run_dir,"preprocess",i) for i in all_prep): scheduler.progress("preprocess",all_prep,"CleanGene preprocess")
+        elif any(not _index_done(run_dir,"validate",i) for i in all_validate): scheduler.progress("validate",all_validate,"CleanGene validate")
+        elif any(not _index_done(run_dir,"plot",i) for i in all_groups): scheduler.progress("plot",all_groups,"CleanGene group completion")
+        pipeline_done=(not include_preprocess or all(_index_done(run_dir,"preprocess",i) for i in all_prep)) and all(_index_done(run_dir,"plot",i) for i in all_groups)
+        if pipeline_done and not scheduler.active: break
+        scheduler.wait_tick()
+    if not _done(run_dir/"state"/"summary.done.json"): _run_single_job(run_dir,cfg,"summary",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene summary")
+    touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":len(group_rows),"isolates":len(isolate_rows)})
 
 def controller_downstream(run_dir: Path) -> None:
     cfg,_=context(run_dir); group_rows=read_tsv(run_dir/"state"/"group_tasks.tsv"); isolate_rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
-    prepare_deps=[]
-    for klass in ("small","medium","large"):
-        missing=set(incomplete_indices(run_dir,"panaroo"))
-        indices=[i for i,r in enumerate(group_rows) if r.get("group_size_class")==klass and i in missing]
-        if not indices: continue
-        prefix=f"PANAROO_{klass.upper()}"
-        prepare_deps.extend(_run_index_stage(run_dir,cfg,"panaroo",indices,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),"CleanGene panaroo"))
-    for klass in ("small","medium","large"):
-        missing=set(incomplete_indices(run_dir,"prepare_validation"))
-        indices=[i for i,r in enumerate(group_rows) if r.get("group_size_class")==klass and i in missing]
-        if not indices: continue
-        prefix=f"PANAROO_{klass.upper()}"
-        prepare_deps.extend(_run_index_stage(run_dir,cfg,"prepare_validation",indices,cfg.get(f"{prefix}_CPUS",cfg["PANAROO_CPUS"]),cfg.get(f"{prefix}_MEM",cfg["PANAROO_MEM"]),cfg.get(f"{prefix}_TIME",cfg["PANAROO_TIME"]),"CleanGene prepare_validation"))
-    ni=len(isolate_rows); ng=len(group_rows)
+    for stage in ("panaroo","prepare_validation"):
+        for klass in ("small","medium","large"):
+            missing=set(incomplete_indices(run_dir,stage)); indices=[i for i,r in enumerate(group_rows) if r.get("group_size_class")==klass and i in missing]
+            if indices:
+                cpus,mem,limit=_group_resources(cfg,group_rows[indices[0]]); _run_index_stage(run_dir,cfg,stage,indices,cpus,mem,limit,f"CleanGene {stage}")
     val_indices=incomplete_validate_indices(run_dir)
     if val_indices: _run_index_stage(run_dir,cfg,"validate",val_indices,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],"CleanGene validate")
-    red_indices=incomplete_indices(run_dir,"reduce")
-    if red_indices: _run_index_stage(run_dir,cfg,"reduce",red_indices,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene reduce")
-    plot_indices=incomplete_indices(run_dir,"plot")
-    if plot_indices: _run_index_stage(run_dir,cfg,"plot",plot_indices,cfg["PLOT_CPUS"],cfg["PLOT_MEM"],cfg["PLOT_TIME"],"CleanGene plot")
+    for stage,cpus,mem,limit in (("reduce",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"]),("plot",cfg["PLOT_CPUS"],cfg["PLOT_MEM"],cfg["PLOT_TIME"])):
+        indices=incomplete_indices(run_dir,stage)
+        if indices: _run_index_stage(run_dir,cfg,stage,indices,cpus,mem,limit,f"CleanGene {stage}")
     if not _done(run_dir/"state"/"summary.done.json"): _run_single_job(run_dir,cfg,"summary",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene summary")
-    touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":ng,"isolates":ni})
+    touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":len(group_rows),"isolates":len(isolate_rows)})
+
+@contextmanager
+def _controller_lock(run_dir: Path):
+    path=run_dir/"state"/"controller.lock"; path.parent.mkdir(parents=True,exist_ok=True)
+    with path.open("w") as handle:
+        try: fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise SystemExit(f"Another CleanGene controller is already active for {run_dir}")
+        handle.write(f"job_id={os.environ.get('SLURM_JOB_ID','unknown')} pid={os.getpid()}\n"); handle.flush(); yield
 
 def slurm_controller(run_dir: Path, index: int | None = None) -> None:
-    cfg, rows=context(run_dir)
-    if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip() and not _done(run_dir/"state"/"kraken_db_setup.done.json"):
-        _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
-    prep_indices=incomplete_indices(run_dir,"preprocess")
-    if prep_indices: _run_index_stage(run_dir,cfg,"preprocess",prep_indices,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess")
-    if not _done(run_dir/"state"/"resolve_groups.done.json"):
-        _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
-    controller_downstream(run_dir)
+    with _controller_lock(run_dir):
+        cfg, rows=context(run_dir)
+        if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip() and not _done(run_dir/"state"/"kraken_db_setup.done.json"):
+            _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
+            cfg,rows=context(run_dir)
+        unresolved=any(r.get("grouping_source")=="kraken_pending" for r in rows)
+        if not unresolved and not _done(run_dir/"state"/"resolve_groups.done.json"):
+            _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
+        if unresolved:
+            prep_indices=incomplete_indices(run_dir,"preprocess")
+            if prep_indices: _run_index_stage(run_dir,cfg,"preprocess",prep_indices,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess")
+            if not _done(run_dir/"state"/"resolve_groups.done.json"):
+                _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
+            controller_downstream(run_dir)
+        else:
+            _controller_pipeline(run_dir,True)
 
 def manifest_pangenome_dir(rows: list[dict[str,str]], group: str) -> Path | None:
     paths=sorted({r.get("pangenome_dir","").strip() for r in rows if r["group_id"]==group and r.get("pangenome_dir","").strip()})
@@ -356,7 +512,8 @@ def panaroo(run_dir: Path, index: int) -> None:
         touch_done(done,{"n_isolates":len(isolates),"n_genes":len(rows),"external_pangenome_dir":str(external)})
         return
     gffs=[r["gff"] for r in retained]
-    run(["panaroo","-i",*gffs,"-o",str(out),"--clean-mode",cfg["PANAROO_CLEAN_MODE"],"-t",cfg.get("PANAROO_CPUS",cfg.get("CPUS","4"))],stdout=logs/"panaroo.stdout",stderr=logs/"panaroo.stderr")
+    threads=os.environ.get("SLURM_CPUS_PER_TASK",cfg.get("PANAROO_CPUS",cfg.get("CPUS","4")))
+    run(["panaroo","-i",*gffs,"-o",str(out),"--clean-mode",cfg["PANAROO_CLEAN_MODE"],"-t",threads],stdout=logs/"panaroo.stdout",stderr=logs/"panaroo.stderr")
     isolates=[r["isolate_id"] for r in retained]; rows=normalize_panaroo(out/"gene_presence_absence.csv",isolates); calls=root/"02_pangenome"/"initial_calls"; calls.mkdir(parents=True,exist_ok=True); write_binary(calls/"gene_presence_absence.binary.tsv",rows,isolates)
     touch_done(done,{"n_isolates":len(isolates),"n_genes":len(rows)})
 

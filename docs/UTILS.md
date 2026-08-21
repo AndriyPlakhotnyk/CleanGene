@@ -20,7 +20,7 @@ A selected cohort can be compared with the remaining isolates by using `--sample
 
 ```bash
 cleangene utils get-differential-genes \
-  --run 260817_120729_cleangene --analysis-root /work/project/CleanGene \
+  --run <run-id> --analysis-root /path/to/CleanGene \
   --manifest cohort.tsv --max-q-value 0.05
 ```
 
@@ -49,6 +49,18 @@ cleangene utils get-variants \
 
 Unique qualifying sequences receive stable analysis-local variant IDs. `unique_variants.fasta`, a MAFFT alignment, `unique_variant_alignment.pdf`, `gene_variants.tsv`, and `variant_summary.tsv` link the sequence and tabular results.
 
+## Wrong-call diagnostics
+
+```bash
+cleangene utils diagnose-call \
+  --run-dir /path/to/run --organism "Species name" \
+  --genes geneA --samples isolate1 isolate2
+```
+
+Without `--samples`, CleanGene selects up to `--max-samples` isolates whose initial Panaroo call differs from the read-validated call. The SLURM job identifies the exact BWA-supporting read IDs and sequences, compares raw and processed support, and replays Shovill with retained intermediates. It then checks whether supporting reads survived Shovill's `seqkit` depth sampling and whether they map to the SPAdes graph, SPAdes contigs, replayed Shovill contigs, and original final contigs. Final-contig sequence localization and overlapping Prokka features distinguish assembly, annotation, and Panaroo failures.
+
+Outputs include `diagnostic_summary.tsv`, `supporting_reads.tsv`, `source_artifacts.tsv`, tool versions, mapping artifacts, and per-isolate Shovill replay directories. `--skip-assembly-replay` performs the lighter raw/processed/BWA/final-assembly audit. KMC is reported separately because it estimates k-mer/genome statistics; the direct Shovill read-removal step is depth sampling by `seqkit`.
+
 ## iTOL datasets
 
 ```bash
@@ -63,4 +75,4 @@ Gene calls are emitted as an iTOL `DATASET_BINARY`; operon and variant IDs are e
 
 ## Resources
 
-Matrix utilities use `UTILS_CPUS`, `UTILS_MEM`, and `UTILS_TIME`. Read-backed variant analyses use `UTILS_VARIANT_CPUS`, `UTILS_VARIANT_MEM`, and `UTILS_VARIANT_TIME`. Account and partition behavior comes from the original run configuration.
+Matrix utilities use `UTILS_CPUS`, `UTILS_MEM`, and `UTILS_TIME`. Read-backed variant analyses use `UTILS_VARIANT_*`; wrong-call replays use `UTILS_DIAGNOSTIC_*`. Account and partition behavior comes from the original run configuration.
