@@ -76,6 +76,8 @@
 
    `cleangene resume --run-dir /path/to/run --config config/cleangene.arc.env` refreshes execution settings for an existing run while retaining completed task markers and the resolved Kraken2 database path.
 
+   Each completed organism/group publishes its final read-validated presence/absence matrix at `results/groups/<group>/cleaned_pangenome.tsv`. Panaroo intermediates and the detailed BWA validation evidence remain in the numbered subdirectories.
+
 9. **Local debugging** (small tests)
 
    ```bash

@@ -6,10 +6,17 @@ from unittest.mock import patch
 
 from cleangene.cli import main
 from cleangene.diagnostics import infer_failure_stage
-from cleangene.downstream import differential_genes, get_operon, get_samples, get_variants, make_itol, resolve_organism
+from cleangene.downstream import differential_genes, get_operon, get_samples, get_variants, make_itol, matrix_path, resolve_organism
 from cleangene.util import atomic_json, read_tsv, write_tsv
 
 class CleanGeneUtilsTests(unittest.TestCase):
+    def test_utils_prefer_primary_cleaned_pangenome(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d); root=run/"results"/"groups"/"Species_one"
+            write_tsv(root/"cleaned_pangenome.tsv",["Gene","i1"],[["primary",1]])
+            write_tsv(root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv",["Gene","i1"],[["legacy",1]])
+            self.assertEqual(matrix_path(run,"Species one"),root/"cleaned_pangenome.tsv")
+
     def test_diagnostic_failure_stage_tracks_sampling_and_assembler(self):
         self.assertEqual(infer_failure_stage(0,1,20,20,0,0,0,0,False,False)[0],"shovill_seqkit_sampling")
         self.assertEqual(infer_failure_stage(0,1,20,20,20,0,0,0,False,False)[0],"spades_graph_construction")

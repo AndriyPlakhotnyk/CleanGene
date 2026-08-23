@@ -13,6 +13,20 @@ from .plotting import plot_presence_absence
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 
+STAGE_DESCRIPTIONS = (
+    ("kraken_db_setup", "prepare the shared Kraken2 database when required"),
+    ("preprocess", "check/trim adapters, run Kraken2 QC, assemble with Shovill, and annotate with Prokka"),
+    ("resolve_groups", "resolve organism groups and order the smallest groups first"),
+    ("panaroo", "build and clean each group pangenome with Panaroo"),
+    ("prepare_validation", "select genes and recover pangenome reference sequences"),
+    ("validate", "map isolate reads with BWA and measure gene coverage, depth, and identity"),
+    ("reduce", "apply read evidence and publish the final cleaned pangenome matrix"),
+    ("plot", "render each group presence/absence summary"),
+    ("summary", "compile cohort and group QC tables"),
+)
+
+ARRAY_STAGES = {"preprocess","panaroo","prepare_validation","validate","reduce","plot"}
+
 def context(run_dir: Path):
     cfg={**DEFAULTS,**load_json(run_dir/"provenance"/"resolved_config.json")}; rows=read_tsv(run_dir/"provenance"/"manifest.tsv"); return cfg, rows
 
@@ -324,7 +338,10 @@ def _index_done(run_dir: Path, stage: str, index: int) -> bool:
     kind="isolate" if stage in {"preprocess","validate"} else "group"
     row=task_row(run_dir,kind,index); name=row["isolate_id"] if kind=="isolate" else row["group_id"]
     marker={"validate":"validate"}.get(stage,stage)
-    return _done(run_dir/"state"/marker/f"{safe_name(name)}.done.json")
+    done_path=run_dir/"state"/marker/f"{safe_name(name)}.done.json"; done=_done(done_path)
+    if stage=="reduce" and done:
+        done=load_json(done_path).get("status")=="skipped" or _done(run_dir/"results"/"groups"/safe_name(name)/"cleaned_pangenome.tsv")
+    return done
 
 @dataclass
 class _ActiveBatch:
@@ -337,10 +354,26 @@ class _ActiveBatch:
 
 class _RollingScheduler:
     def __init__(self,run_dir: Path,cfg: dict[str,str]):
-        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{}}
+        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}
+
+    def _adopt_live_batches(self) -> None:
+        discovered: dict[tuple[str,str],list[int]]={}
+        run_arg=str(self.run_dir)
+        for entry in self.snapshot.get("entries",[]):
+            name=str(entry.get("name","")); command=str(entry.get("command",""))
+            stage=name[3:] if name.startswith("cg-") else ""
+            if stage not in ARRAY_STAGES or run_arg not in command: continue
+            try: index=int(str(entry.get("task_id","")))
+            except ValueError: continue
+            discovered.setdefault((str(entry["job_id"]),stage),[]).append(index)
+        for (jid,stage),indices in discovered.items():
+            if jid not in self.active:
+                unique=sorted(set(indices)); self.active[jid]=_ActiveBatch(jid,stage,unique,",".join(map(str,unique)),seen=True)
+            self.submitted.setdefault(stage,set()).update(indices)
 
     def refresh(self) -> None:
         self.snapshot=user_queue_snapshot(); queued=self.snapshot["jobs"]
+        self._adopt_live_batches()
         for jid,batch in list(self.active.items()):
             if jid in queued:
                 batch.seen=True; batch.missing_polls=0; continue
@@ -464,6 +497,8 @@ def _controller_lock(run_dir: Path):
 def slurm_controller(run_dir: Path, index: int | None = None) -> None:
     with _controller_lock(run_dir):
         cfg, rows=context(run_dir)
+        print("CleanGene workflow:",flush=True)
+        for stage,description in STAGE_DESCRIPTIONS: print(f"  {stage}: {description}",flush=True)
         if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip() and not _done(run_dir/"state"/"kraken_db_setup.done.json"):
             _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
             cfg,rows=context(run_dir)
@@ -546,8 +581,8 @@ def validate(run_dir: Path, index: int) -> None:
     rr=retained[iso]; validate_isolate(ref,key,rr["R1"],rr["R2"],ev,int(cfg["VALIDATION_CPUS"]),float(cfg["READ_VALIDATION_MIN_BREADTH"]),float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"]),float(cfg["READ_VALIDATION_MIN_IDENTITY"]),int(cfg["READ_VALIDATION_MIN_MAPQ"]),int(cfg["BASEQUAL"])); touch_done(done)
 
 def reduce_group(run_dir: Path, index: int) -> None:
-    cfg,_=context(run_dir); group=task_row(run_dir,"group",index)["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); done=run_dir/"state"/"reduce"/f"{safe_name(group)}.done.json"
-    if done.is_file(): return
+    cfg,_=context(run_dir); group=task_row(run_dir,"group",index)["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); done=run_dir/"state"/"reduce"/f"{safe_name(group)}.done.json"; cleaned=root/"cleaned_pangenome.tsv"
+    if done.is_file() and cleaned.is_file(): return
     retained=retained_rows(run_dir,group)
     if len(retained)<2: touch_done(done,{"status":"skipped"}); return
     isolates=[r["isolate_id"] for r in retained]; initial_path=root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv"; initial=read_tsv(initial_path); by_gene={r["Gene"]:{i:int(r[i]) for i in isolates} for r in initial}; out=root/"03_read_validation"; metrics=[]
@@ -568,7 +603,7 @@ def reduce_group(run_dir: Path, index: int) -> None:
             validated[r["Gene"]][r["isolate_id"]]=int(r["initial_call"])
         elif str(r.get("validated_call",""))!="":
             validated[r["Gene"]][r["isolate_id"]]=int(r["validated_call"])
-    fields=["Gene",*isolates]; write_tsv(out/"validated_gene_presence_absence.binary.tsv",fields,([g,*[validated[g][i] for i in isolates]] for g in by_gene))
+    fields=["Gene",*isolates]; validated_matrix=out/"validated_gene_presence_absence.binary.tsv"; write_tsv(validated_matrix,fields,([g,*[validated[g][i] for i in isolates]] for g in by_gene)); shutil.copy2(validated_matrix,cleaned)
     metric_fields=["Gene","isolate_id","initial_call","validated_call","validation_state","decision_reason","final_call_source","breadth","percent_coverage","mean_depth","identity","percent_identity","identity_method","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"]
     write_tsv(out/"read_validation_metrics.tsv",metric_fields,metrics)
     evidence_rows=[]
@@ -582,7 +617,7 @@ def reduce_group(run_dir: Path, index: int) -> None:
     for g in by_gene:
         a=[by_gene[g][i] for i in isolates]; b=[validated[g][i] for i in isolates]; changes.append([g,sum(a),sum(b),sum(x==0 and y==1 for x,y in zip(a,b)),sum(x==1 and y==0 for x,y in zip(a,b)),sum(x==y for x,y in zip(a,b))])
     write_tsv(out/"tested_genes.tsv",["Gene","n_initial_present","n_validated_present","n_added","n_removed","n_unchanged"],changes)
-    touch_done(done,{"n_isolates":len(isolates),"n_genes":len(by_gene)})
+    touch_done(done,{"n_isolates":len(isolates),"n_genes":len(by_gene),"cleaned_pangenome":str(cleaned)})
 
 def plot_group(run_dir: Path, index: int) -> None:
     cfg,_=context(run_dir); group=task_row(run_dir,"group",index)["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); done=run_dir/"state"/"plot"/f"{safe_name(group)}.done.json"

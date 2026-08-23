@@ -26,7 +26,8 @@ def resolve_organism(run_dir: Path, organism: str | None, samples: list[str] | N
     raise SystemExit("Organism was not provided. Available organisms: " + (", ".join(organisms) or "<none>"))
 
 def matrix_path(run_dir: Path, organism: str) -> Path:
-    path=run_dir/"results"/"groups"/safe_name(organism)/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"
+    root=run_dir/"results"/"groups"/safe_name(organism); primary=root/"cleaned_pangenome.tsv"
+    path=primary if primary.is_file() else root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"
     if not path.is_file(): raise SystemExit(f"Validated presence/absence matrix not found for {organism}: {path}")
     return path
 

@@ -6,9 +6,9 @@ from cleangene.manifest import groups, load_manifest
 from cleangene.evidence import classify_gene_evidence, fixed_coordinate_identity
 from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
-from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, sbatch_cmd, submit
+from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _RollingScheduler, _controller_pipeline, _preprocess_scratch, _wait_jobs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.workers import _RollingScheduler, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
 from cleangene.cli import invalidate_legacy_identity_metrics, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
@@ -197,7 +197,33 @@ class CleanGeneCoreTests(unittest.TestCase):
         done=subprocess.CompletedProcess(["squeue"],0,stdout="1\n2\n3\n",stderr="")
         with patch("cleangene.slurm.subprocess.run",return_value=done) as command:
             self.assertEqual(user_job_count("andriy"),3)
-        self.assertIn("%F|%T",command.call_args.args[0])
+        self.assertIn("%F|%K|%T|%j|%o",command.call_args.args[0])
+
+    def test_squeue_snapshot_parses_array_elements_and_states(self):
+        stdout="123|7|R|cg-preprocess|python -m cleangene _worker\n123|8|PENDING|cg-preprocess|python -m cleangene _worker\n999|N/A|RUNNING|unrelated|sleep 10\n"
+        done=subprocess.CompletedProcess(["squeue"],0,stdout=stdout,stderr="")
+        with patch("cleangene.slurm.subprocess.run",return_value=done): snapshot=user_queue_snapshot("andriy")
+        self.assertEqual(snapshot["total"],3)
+        self.assertEqual(snapshot["jobs"]["123"]["RUNNING"],1)
+        self.assertEqual(snapshot["jobs"]["123"]["PENDING"],1)
+        self.assertEqual(snapshot["entries"][0]["task_id"],"7")
+
+    def test_resumed_controller_adopts_live_run_arrays(self):
+        cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_MAX_OUTSTANDING_CHUNKS":"8","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],(("g",f"i{i}") for i in range(3)))
+            snapshot={"total":3,"jobs":{"123":{"RUNNING":1,"PENDING":1},"999":{"RUNNING":1}},"entries":[
+                {"job_id":"123","task_id":"1","state":"RUNNING","name":"cg-preprocess","command":f"python -m cleangene _worker --stage preprocess --run-dir {run} --index 1"},
+                {"job_id":"123","task_id":"2","state":"PENDING","name":"cg-preprocess","command":f"python -m cleangene _worker --stage preprocess --run-dir {run} --index 2"},
+                {"job_id":"999","task_id":"0","state":"RUNNING","name":"cg-preprocess","command":"python -m cleangene _worker --stage preprocess --run-dir /another/run --index 0"},
+            ]}
+            scheduler=_RollingScheduler(run,cfg)
+            with patch("cleangene.workers.user_queue_snapshot",return_value=snapshot): scheduler.refresh()
+            self.assertEqual(scheduler.active_indices("preprocess"),{1,2})
+            self.assertEqual(scheduler.stage_queue("preprocess"),(1,1))
+            output=StringIO()
+            with contextlib.redirect_stdout(output): scheduler.progress("preprocess",[0,1,2],"CleanGene preprocess")
+            self.assertIn("running=1 pending=1",output.getvalue())
 
     def test_qos_retry_recalculates_and_resubmits(self):
         err=RuntimeError("sbatch failed\nstderr: QOSMaxSubmitJobPerUserLimit")
@@ -282,10 +308,11 @@ class CleanGeneCoreTests(unittest.TestCase):
             write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[["g",1,"small"]])
             atomic_json(run/"state"/"preprocess"/"iso1.done.json",{})
             atomic_json(run/"state"/"resolve_groups.done.json",{})
-            with patch("cleangene.workers._controller_pipeline") as pipeline, patch("cleangene.workers._run_single_job") as singles:
-                slurm_controller(run)
+            output=StringIO()
+            with patch("cleangene.workers._controller_pipeline") as pipeline, patch("cleangene.workers._run_single_job") as singles, contextlib.redirect_stdout(output): slurm_controller(run)
             pipeline.assert_called_once_with(run,True)
             self.assertFalse(any("resolve_groups" in str(c) for c in singles.call_args_list))
+            self.assertIn("preprocess: check/trim adapters",output.getvalue())
 
     def test_resume_reruns_failed_panaroo_only(self):
         with tempfile.TemporaryDirectory() as d:
@@ -318,6 +345,7 @@ class CleanGeneCoreTests(unittest.TestCase):
                     kind="isolate" if stage in {"preprocess","validate"} else "group"; rows=read_tsv(run/"state"/f"{kind}_tasks.tsv")
                     for i in indices:
                         name=rows[i]["isolate_id" if kind=="isolate" else "group_id"]; atomic_json(run/"state"/stage/f"{name}.done.json",{})
+                        if stage=="reduce": write_tsv(run/"results"/"groups"/name/"cleaned_pangenome.tsv",["Gene"],[])
                     return len(indices)
                 def progress(self,*args): pass
                 def wait_tick(self): pass
@@ -351,6 +379,13 @@ class CleanGeneCoreTests(unittest.TestCase):
             reduce_group(run,0)
             rows=read_tsv(root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv")
             self.assertEqual(rows[0][iso],"1")
+            self.assertEqual(read_tsv(root/"cleaned_pangenome.tsv"),rows)
+            self.assertTrue(_index_done(run,"reduce",0))
+
+    def test_reduce_done_without_primary_output_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[["g",2,"small"]]); atomic_json(run/"state"/"reduce"/"g.done.json",{})
+            self.assertFalse(_index_done(run,"reduce",0))
 
     def test_plot_group_writes_done_marker(self):
         with tempfile.TemporaryDirectory() as d:
