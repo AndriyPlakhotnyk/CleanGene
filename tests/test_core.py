@@ -67,9 +67,9 @@ class CleanGeneCoreTests(unittest.TestCase):
 
     def test_direct_spades_uses_original_symlinked_reads(self):
         with tempfile.TemporaryDirectory() as d:
-            root=Path(d); r1=root/"r1.fastq.gz"; r2=root/"r2.fastq.gz"; r1.write_text("reads1"); r2.write_text("reads2")
+            root=Path(d); r1=root/"r1.fastq.gz"; r2=root/"r2.fastq.gz"; sequence="A"*120; quality="I"*120; r1.write_text(f"@r\n{sequence}\n+\n{quality}\n"); r2.write_text(f"@r\n{sequence}\n+\n{quality}\n")
             manifest=root/"manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tR1\tR2\niso1\tg\t{r1}\t{r2}\n")
-            cfg={"TAXONOMY_MODE":"off","ASSEMBLER":"spades","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false"}; run_dir=make_run(manifest,root,cfg,"r"); commands=[]
+            cfg={"TAXONOMY_MODE":"off","ASSEMBLER":"spades","CHECKM2_MODE":"off","QC_MIN_N50_PASS":"0","QC_MIN_N50_FAIL":"0","QC_MIN_COVERAGE_PASS":"0","QC_MIN_COVERAGE_FAIL":"0","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false"}; run_dir=make_run(manifest,root,cfg,"r"); commands=[]
             def fake_run(command,**kwargs):
                 commands.append(command)
                 if command[0]=="spades.py":
@@ -80,6 +80,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertEqual(sum(command[0]=="spades.py" for command in commands),1); self.assertFalse(any(command[0]=="shovill" for command in commands))
             spades=next(command for command in commands if command[0]=="spades.py"); self.assertIn("--only-assembler",spades); self.assertTrue(Path(spades[spades.index("-1")+1]).is_symlink()); self.assertTrue(Path(spades[spades.index("-2")+1]).is_symlink())
             qc=read_tsv(run_dir/"results"/"groups"/"g"/"01_isolates"/"iso1"/"qc.tsv")[0]; self.assertEqual(Path(qc["assembly"]).name,"contigs.fasta"); self.assertIn("+symlinked",qc["read_preprocessing"])
+            for field in ("PASS/FAIL","Notes","trimmed_read_length","mean_base_quality","sequencing_coverage","checkm2_completeness","checkm2_contamination","qc_profile_source"): self.assertIn(field,qc)
 
     def test_exclude_filters_an_already_preprocessed_isolate(self):
         with tempfile.TemporaryDirectory() as d:
@@ -207,7 +208,37 @@ class CleanGeneCoreTests(unittest.TestCase):
                 self.assertTrue(Path(row["R2"]).is_symlink())
                 self.assertEqual(row["assembly"],"")
                 self.assertEqual(row["gff"],"")
+                for field in ("PASS/FAIL","Notes","trimmed_read_length","mean_base_quality","sequencing_coverage","checkm2_completeness","checkm2_contamination","qc_profile_source"): self.assertIn(field,row)
             self.assertTrue((run/"state"/"summary.done.json").is_file())
+
+    def test_assembly_qc_failure_skips_prokka(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); sequence="A"*120; quality="I"*120; r1=root/"r1.fastq.gz"; r2=root/"r2.fastq.gz"
+            r1.write_text(f"@r\n{sequence}\n+\n{quality}\n"); r2.write_text(f"@r\n{sequence}\n+\n{quality}\n")
+            manifest=root/"manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tR1\tR2\niso1\tg\t{r1}\t{r2}\n")
+            run_dir=make_run(manifest,root,{"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","CHECKM2_MODE":"off","QC_MIN_COVERAGE_PASS":"0","QC_MIN_COVERAGE_FAIL":"0","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false"},"r"); commands=[]
+            def fake_run(command,**kwargs):
+                commands.append(command)
+                if command[0]=="shovill":
+                    out=Path(command[command.index("--outdir")+1]); out.mkdir(parents=True,exist_ok=True); (out/"contigs.fa").write_text(">c\nACGT\n")
+            with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run_dir,0)
+            self.assertFalse(any(command[0]=="prokka" for command in commands))
+            qc=read_tsv(run_dir/"results"/"groups"/"g"/"01_isolates"/"iso1"/"qc.tsv")[0]
+            self.assertEqual(qc["PASS/FAIL"],"FAIL"); self.assertIn("n50_low",qc["reason"]); self.assertIn("gff_missing",qc["reason"])
+
+    def test_prokka_failure_marks_isolate_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); sequence="A"*120; quality="I"*120; r1=root/"r1.fastq.gz"; r2=root/"r2.fastq.gz"
+            r1.write_text(f"@r\n{sequence}\n+\n{quality}\n"); r2.write_text(f"@r\n{sequence}\n+\n{quality}\n")
+            manifest=root/"manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tR1\tR2\niso1\tg\t{r1}\t{r2}\n")
+            cfg={"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","CHECKM2_MODE":"off","QC_MIN_N50_PASS":"0","QC_MIN_N50_FAIL":"0","QC_MIN_COVERAGE_PASS":"0","QC_MIN_COVERAGE_FAIL":"0","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false"}; run_dir=make_run(manifest,root,cfg,"r")
+            def fake_run(command,**kwargs):
+                if command[0]=="shovill":
+                    out=Path(command[command.index("--outdir")+1]); out.mkdir(parents=True,exist_ok=True); (out/"contigs.fa").write_text(">c\nACGT\n")
+                elif command[0]=="prokka": raise subprocess.CalledProcessError(2,command)
+            with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run_dir,0)
+            qc=read_tsv(run_dir/"results"/"groups"/"g"/"01_isolates"/"iso1"/"qc.tsv")[0]
+            self.assertEqual(qc["PASS/FAIL"],"FAIL"); self.assertEqual(qc["excluded"],"1"); self.assertIn("prokka_failed",qc["reason"])
 
     def test_compress_assembly_outputs_updates_qc_path(self):
         with tempfile.TemporaryDirectory() as d:
@@ -240,7 +271,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             root=Path(d); r1=root/"r1.fastq.gz"; r2=root/"r2.fastq.gz"
             r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
             manifest=root/"manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tR1\tR2\niso1\tg\t{r1}\t{r2}\n")
-            cfg={"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","COMPRESS_ANNOTATION_OUTPUTS":"nonessential","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+            cfg={"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","CHECKM2_MODE":"off","QC_MIN_N50_PASS":"0","QC_MIN_N50_FAIL":"0","QC_MIN_COVERAGE_PASS":"0","QC_MIN_COVERAGE_FAIL":"0","COMPRESS_ANNOTATION_OUTPUTS":"nonessential","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
             run=make_run(manifest,root,cfg,"r")
             def fake_run(command,**kwargs):
                 if command[0]=="shovill":

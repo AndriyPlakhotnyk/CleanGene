@@ -22,3 +22,8 @@ def assembler_mode(cfg: dict[str,str]) -> str:
     mode=cfg.get("ASSEMBLER","shovill").strip().lower()
     if mode not in {"shovill","spades","off"}: raise SystemExit("ASSEMBLER must be shovill, spades, or off")
     return mode
+
+def checkm2_mode(cfg: dict[str,str]) -> str:
+    mode=cfg.get("CHECKM2_MODE","required").strip().lower()
+    if mode not in {"required","off"}: raise SystemExit("CHECKM2_MODE must be required or off")
+    return mode

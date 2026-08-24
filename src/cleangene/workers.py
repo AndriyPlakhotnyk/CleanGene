@@ -1,15 +1,16 @@
 from __future__ import annotations
-import csv, fcntl, gzip, hashlib, os, shutil, sys, tempfile, time
+import csv, fcntl, gzip, hashlib, os, shutil, subprocess, sys, tempfile, time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from .config import assembler_mode, truthy
+from .config import assembler_mode, checkm2_mode, truthy
 from .defaults import DEFAULTS
 from .evidence import validate_isolate, validation_decision_logic_rows
 from .fasta import assembly_metrics
 from .manifest import groups, write_resolved
 from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_binary
 from .plotting import plot_presence_absence
+from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 
@@ -48,17 +49,26 @@ def shlex_quote(x: str) -> str:
     return shlex.quote(x)
 
 def parse_kraken_report(path: Path, expected: str) -> tuple[str,float,float]:
-    top=("",-1.0); contamination=0.0; unclassified=0.0; expected_norm=" ".join(expected.lower().split())
+    top=("",-1.0); contamination=0.0; unclassified=0.0; expected_norm=" ".join(expected.casefold().split()); species=[]
     if not path.is_file(): return "",0.0,0.0
     for line in path.read_text(errors="replace").splitlines():
         f=line.split("\t")
         if len(f)<6: continue
         pct=float(f[0]); rank=f[3].strip(); name=" ".join(f[5].strip().split()); norm=name.lower()
         if rank=="S":
+            species.append((name,pct))
             if pct>top[1]: top=(name,pct)
-            if expected_norm and norm!=expected_norm: contamination += pct
         if rank=="U": unclassified=max(unclassified,pct)
+    reference=expected_norm or " ".join(top[0].casefold().split())
+    contamination=sum(pct for name,pct in species if " ".join(name.casefold().split())!=reference)
     return top[0], contamination, max(0.0,100.0-unclassified)
+
+def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isolate: str) -> tuple[float,float]:
+    input_dir=out/"input"; result_dir=out/"results"; input_dir.mkdir(parents=True,exist_ok=True); result_dir.mkdir(parents=True,exist_ok=True)
+    suffix=".fna.gz" if assembly.suffix==".gz" else ".fna"; link=input_dir/f"{safe_name(isolate)}{suffix}"
+    _replace_symlink(link,assembly.resolve())
+    run(["checkm2","predict","--threads",cfg.get("CPUS","4"),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr")
+    return parse_checkm2_report(result_dir/"quality_report.tsv")
 
 def needs_kraken(rows: list[dict[str,str]], cfg: dict[str,str]) -> bool:
     mode=cfg.get("TAXONOMY_MODE","auto")
@@ -242,9 +252,10 @@ def preprocess(run_dir: Path, index: int) -> None:
     root=run_dir/"results"/"groups"/safe_name(group); out=root/"01_isolates"/safe; done=run_dir/"state"/"preprocess"/f"{safe}.done.json"
     if done.is_file():
         status=load_json(done)
-        if status.get("excluded") or status.get("external_pangenome") or (out/"annotation"/f"{safe}.gff").is_file(): return
+        if status.get("excluded") or status.get("external_pangenome") or (status.get("qc_status") and (out/"qc.tsv").is_file()) or (out/"annotation"/f"{safe}.gff").is_file(): return
     out.mkdir(parents=True,exist_ok=True); scratch=_preprocess_scratch(cfg,run_dir,iso); work_out=(scratch/"output") if scratch else out; work_out.mkdir(parents=True,exist_ok=True); logs=work_out/"logs"; logs.mkdir(exist_ok=True)
-    fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"]
+    fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS]
+    thresholds,profile_source=isolate_thresholds(run_dir,iso,cfg,row); mode=checkm2_mode(cfg)
     finished=False
     def finish(data: dict[str,object], payload: dict[str,object]) -> None:
         nonlocal finished
@@ -253,12 +264,39 @@ def preprocess(run_dir: Path, index: int) -> None:
             if data.get(key): data[key]=_shared_path(str(data[key]),work_out,out)
         if payload.get("gff"): payload["gff"]=_shared_path(str(payload["gff"]),work_out,out)
         write_tsv(out/"qc.tsv",fields,[data]); touch_done(done,payload); finished=True
+    def assessment(*, expected: str = "", top: str = "", contamination: float | None = None,
+                   reads: dict[str,float] | None = None, metrics: dict[str,object] | None = None,
+                   completeness: float | None = None, checkm2_contamination: float | None = None,
+                   internal: bool = False, external: bool = False, assembly: str = "",
+                   gff_present: bool | None = None, warnings=(), errors=(), excluded: bool = False) -> dict[str,str]:
+        metrics=metrics or {}; length=float(metrics["assembly_length"]) if metrics.get("assembly_length") not in {"",None} else None
+        coverage=(reads["total_bases"]/length) if reads and length and length>0 else None
+        return classify_isolate_qc(thresholds=thresholds,expected_organism=expected,top_species=top,
+            kraken_contamination=contamination,read_length=None if not reads else reads["trimmed_read_length"],
+            mean_quality=None if not reads else reads["mean_base_quality"],coverage=coverage,
+            contigs=float(metrics["contigs"]) if metrics.get("contigs") not in {"",None} else None,
+            n50=float(metrics["n50"]) if metrics.get("n50") not in {"",None} else None,
+            completeness=completeness,checkm2_contamination=checkm2_contamination,checkm2_mode=mode,
+            internal_pangenome=internal,external_pangenome=external,assembly_present=bool(assembly),
+            gff_present=gff_present,user_exclusion=excluded,warnings=warnings,errors=errors)
+    def qc_columns(result: dict[str,str], reads: dict[str,float] | None, metrics: dict[str,object] | None,
+                   completeness: float | None, contamination: float | None) -> dict[str,object]:
+        length=float(metrics["assembly_length"]) if metrics and metrics.get("assembly_length") not in {"",None} else None
+        coverage=(reads["total_bases"]/length) if reads and length and length>0 else None
+        return {**result,"trimmed_read_length":qc_value(None if not reads else reads["trimmed_read_length"]),
+            "mean_base_quality":qc_value(None if not reads else reads["mean_base_quality"]),
+            "sequencing_coverage":qc_value(coverage),"checkm2_completeness":qc_value(completeness),
+            "checkm2_contamination":qc_value(contamination),"qc_profile_source":profile_source}
     try:
         if user_excluded(row):
             metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
-            finish({"isolate_id":iso,"group_id":group,"excluded":1,"reason":"user_excluded","top_species":"","contamination_pct":"","R1":row.get("R1",""),"R2":row.get("R2",""),"raw_bam":row.get("raw_bam",""),"read_preprocessing":"skipped_user_excluded","adapter_trimmed":0,"assembly":"","gff":"",**metrics},{"excluded":True,"reason":"user_excluded"}); return
+            result=assessment(excluded=True)
+            finish({"isolate_id":iso,"group_id":group,"top_species":"","contamination_pct":"","R1":row.get("R1",""),"R2":row.get("R2",""),"raw_bam":row.get("raw_bam",""),"read_preprocessing":"skipped_user_excluded","adapter_trimmed":0,"assembly":"","gff":"",**metrics,**qc_columns(result,None,metrics,None,None)},{"excluded":True,"reason":result["reason"],"qc_status":result["PASS/FAIL"]}); return
         r1,r2,read_method,adapter_trimmed=prepare_read_inputs(row,work_out,logs,cfg)
-        expected=row.get("organism","").strip(); taxonomy=cfg.get("TAXONOMY_MODE","auto"); excluded=False; top=""; contam=0.0
+        read_errors=[]
+        try: read_qc=read_metrics(Path(r1),Path(r2),work_out/"reads"/"fastp.json")
+        except (OSError,ValueError,SystemExit) as error: read_qc=None; read_errors.append(("read_metrics_failed",str(error)))
+        expected=row.get("organism","").strip(); taxonomy=cfg.get("TAXONOMY_MODE","auto"); top=""; contam=None
         taxonomy_enabled=taxonomy not in {"off","auto"} or row.get("grouping_source")=="kraken_pending"
         if taxonomy_enabled:
             db=ensure_kraken2_db(run_dir,cfg,rows)
@@ -270,40 +308,69 @@ def preprocess(run_dir: Path, index: int) -> None:
             command += ["--paired","--report",str(report),"--output",output,r1,r2]
             run(command,stdout=logs/"kraken2.stdout",stderr=logs/"kraken2.stderr")
             top,contam,_=parse_kraken_report(report,expected)
-            if expected and contam>float(cfg["MAJOR_CONTAMINATION_THRESHOLD"]): excluded=True
         assembly=row.get("assembly","").strip()
         common={"isolate_id":iso,"group_id":group,"top_species":top,"contamination_pct":contam,"R1":r1,"R2":r2,"raw_bam":row.get("raw_bam",""),"read_preprocessing":read_method,"adapter_trimmed":adapter_trimmed}
-        if excluded:
-            metrics=assembly_metrics(Path(assembly)) if assembly else {"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
-            finish({**common,"excluded":1,"reason":"major_contamination","assembly":assembly,"gff":"",**metrics},{"excluded":True,"reason":"major_contamination"}); return
         external_pangenome=bool(row.get("pangenome_dir","").strip())
-        if external_pangenome and not assembly:
-            metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
-            finish({**common,"excluded":0,"reason":"","assembly":"","gff":"",**metrics},{"excluded":False,"external_pangenome":row["pangenome_dir"]}); return
         assembler=assembler_mode(cfg)
-        if assembler=="off" and not assembly:
-            metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
-            finish({**common,"excluded":0,"reason":"shovill_skipped","assembly":"","gff":"",**metrics},{"excluded":False,"status":"shovill_skipped"}); return
+        internal_pangenome=not external_pangenome and assembler!="off"
         generated_assembly=False
-        if not assembly:
+        errors=list(read_errors); warnings=[]
+        if not assembly and internal_pangenome:
             shov=work_out/"assembly"; shov.mkdir(exist_ok=True); assembly=str(shov/("contigs.fa" if assembler=="shovill" else "contigs.fasta"))
             generated_assembly=True
             if not Path(assembly).is_file():
-                if assembler=="shovill":
-                    tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
-                    run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
-                else:
-                    if any(shov.iterdir()): shutil.rmtree(shov)
-                    run(["spades.py","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
-        ann=work_out/"annotation"; gff=ann/f"{safe}.gff"
+                try:
+                    if assembler=="shovill":
+                        tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
+                        run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
+                    else:
+                        if any(shov.iterdir()): shutil.rmtree(shov)
+                        run(["spades.py","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
+                except subprocess.CalledProcessError as error:
+                    errors.append(("assembly_failed",f"{assembler} assembly failed with exit status {error.returncode}")); assembly=""
+        if assembler=="off" and not assembly: warnings.append(("shovill_skipped","assembly and annotation were not evaluated because assembly mode is off"))
+        empty_metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
+        if assembly and Path(assembly).is_file(): metrics=assembly_metrics(Path(assembly))
+        else: metrics=empty_metrics; assembly=""
+        completeness=check_contamination=None
+        if mode=="required" and assembly:
+            db=Path(cfg.get("CHECKM2_DB","")).expanduser()
+            if not cfg.get("CHECKM2_DB","").strip() or not db.is_file(): errors.append(("checkm2_database_missing",f"CheckM2 database file was not found at '{cfg.get('CHECKM2_DB','')}'"))
+            elif not command_exists("checkm2"): errors.append(("checkm2_unavailable","CheckM2 executable was not available"))
+            else:
+                try: completeness,check_contamination=_run_checkm2(Path(assembly),work_out/"checkm2",logs,cfg,iso)
+                except (subprocess.CalledProcessError,ValueError,OSError) as error: errors.append(("checkm2_failed",f"CheckM2 evaluation failed: {error}"))
+        pre=assessment(expected=expected,top=top,contamination=contam,reads=read_qc,metrics=metrics,
+            completeness=completeness,checkm2_contamination=check_contamination,internal=internal_pangenome,
+            external=external_pangenome,assembly=assembly,gff_present=None,warnings=warnings,errors=errors)
+        if assembler=="off" and pre["PASS/FAIL"]!="FAIL": pre["reason"]="shovill_skipped"
+        if not internal_pangenome:
+            if generated_assembly and assembly: assembly=str(_compress_assembly_outputs(Path(assembly).parent,Path(assembly),cfg))
+            data={**common,"assembly":assembly,"gff":"",**metrics,**qc_columns(pre,read_qc,metrics,completeness,check_contamination)}
+            payload={"excluded":pre["PASS/FAIL"]=="FAIL","reason":pre["reason"],"qc_status":pre["PASS/FAIL"]}
+            if external_pangenome: payload["external_pangenome"]=row["pangenome_dir"]
+            finish(data,payload); return
+        assembly_failures={"coverage_low","contigs_high","n50_low","completeness_low","checkm2_contamination_high","assembly_failed","assembly_missing","checkm2_database_missing","checkm2_unavailable","checkm2_failed"}
+        if assembly_failures.intersection(pre["reason"].split(";")):
+            skipped=assessment(expected=expected,top=top,contamination=contam,reads=read_qc,metrics=metrics,
+                completeness=completeness,checkm2_contamination=check_contamination,internal=True,assembly=assembly,
+                gff_present=False,warnings=warnings,errors=errors)
+            if generated_assembly and assembly: assembly=str(_compress_assembly_outputs(Path(assembly).parent,Path(assembly),cfg))
+            data={**common,"assembly":assembly,"gff":"",**metrics,**qc_columns(skipped,read_qc,metrics,completeness,check_contamination)}
+            finish(data,{"excluded":True,"reason":skipped["reason"],"qc_status":"FAIL"}); return
+        ann=work_out/"annotation"; gff=ann/f"{safe}.gff"; gff_present=True; prokka_errors=[]
         if not gff.is_file():
             if ann.exists(): shutil.rmtree(ann)
-            run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
-        _compress_annotation_outputs(ann,gff,cfg)
-        metrics=assembly_metrics(Path(assembly))
+            try: run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
+            except subprocess.CalledProcessError as error: prokka_errors.append(("prokka_failed",f"Prokka failed with exit status {error.returncode}")); gff_present=None
+        if gff_present is not None: gff_present=gff.is_file()
+        final=assessment(expected=expected,top=top,contamination=contam,reads=read_qc,metrics=metrics,
+            completeness=completeness,checkm2_contamination=check_contamination,internal=True,assembly=assembly,
+            gff_present=gff_present,warnings=warnings,errors=[*errors,*prokka_errors])
+        if gff.is_file(): _compress_annotation_outputs(ann,gff,cfg)
         if generated_assembly: assembly=str(_compress_assembly_outputs(Path(assembly).parent,Path(assembly),cfg))
-        data={**common,"excluded":0,"reason":"","assembly":assembly,"gff":str(gff),**metrics}
-        finish(data,{"excluded":False,"gff":str(gff)})
+        data={**common,"assembly":assembly,"gff":str(gff) if gff.is_file() else "",**metrics,**qc_columns(final,read_qc,metrics,completeness,check_contamination)}
+        finish(data,{"excluded":final["PASS/FAIL"]=="FAIL","reason":final["reason"],"qc_status":final["PASS/FAIL"],"gff":str(gff) if gff.is_file() else ""})
     finally:
         if scratch:
             if not finished: _sync_tree(logs,out/"logs")
@@ -317,7 +384,7 @@ def retained_rows(run_dir: Path, group: str) -> list[dict[str,str]]:
         safe=safe_name(row["isolate_id"]); qc=find_isolate_qc(run_dir,row)
         if not qc.is_file(): raise SystemExit(f"Missing isolate QC: {qc}")
         q=read_tsv(qc)[0]
-        if q["excluded"] in {"1","true","True"}: continue
+        if q.get("PASS/FAIL")=="FAIL" or q["excluded"] in {"1","true","True"}: continue
         row=dict(row); row["assembly"]=q["assembly"]; row["gff"]=q["gff"]; row["R1"]=q.get("R1",row.get("R1","")); row["R2"]=q.get("R2",row.get("R2","")); result.append(row)
     return result
 
@@ -816,7 +883,7 @@ def summarize(run_dir: Path) -> None:
             q=read_tsv(find_isolate_qc(run_dir,row))[0]; q={**q,"group_id":group}
             if user_excluded(row): q["excluded"]="1"; q["reason"]="user_excluded"
             iso_rows.append(q)
-    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows),"storage_cleanup":storage}
+    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows),"storage_cleanup":storage}
     if truthy(cfg.get("CLEANUP_TRIMMED_FASTQ","false")):
         cleanup=cleanup_trimmed_fastqs(run_dir); payload["fastq_cleanup"]={key:value for key,value in cleanup.items() if key!="rows"}
     touch_done(run_dir/"state"/"summary.done.json",payload)

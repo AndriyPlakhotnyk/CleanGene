@@ -2,9 +2,10 @@ from __future__ import annotations
 import argparse, csv, json, os, shutil, subprocess, sys
 from datetime import datetime
 from pathlib import Path
-from .config import assembler_mode, read_env, truthy
+from .config import assembler_mode, checkm2_mode, read_env, truthy
 from .defaults import SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
+from .qc import QC_OUTPUT_FIELDS, ensure_qc_provenance, prepare_qc_provenance, resolve_threshold_rows
 from .slurm import sbatch_cmd, submit
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
@@ -48,7 +49,7 @@ def validate_fastq_inputs(rows: list[dict[str,str]]) -> None:
 def make_run(manifest: Path, analysis_root: Path, cfg: dict[str,str], run_id: str | None) -> Path:
     rid=run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=analysis_root/"runs"/rid
     (run/"provenance").mkdir(parents=True,exist_ok=True); (run/"state").mkdir(exist_ok=True); (run/"logs"/"slurm").mkdir(parents=True,exist_ok=True)
-    rows=load_manifest(manifest); validate_fastq_inputs(rows); write_resolved(run/"provenance"/"manifest.tsv",rows); atomic_json(run/"provenance"/"resolved_config.json",cfg); atomic_json(run/"provenance"/"inputs.json",{"manifest":str(manifest.resolve()),"manifest_sha256":sha256(manifest),"created":datetime.now().isoformat()})
+    rows=load_manifest(manifest); validate_fastq_inputs(rows); cfg=prepare_qc_provenance(run,rows,cfg); write_resolved(run/"provenance"/"manifest.tsv",rows); atomic_json(run/"provenance"/"resolved_config.json",cfg); atomic_json(run/"provenance"/"inputs.json",{"manifest":str(manifest.resolve()),"manifest_sha256":sha256(manifest),"created":datetime.now().isoformat()})
     write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in rows))
     counts={}
     for r in rows: counts[r["group_id"]]=counts.get(r["group_id"],0)+1
@@ -70,6 +71,7 @@ def refresh_resume_config(run: Path, config: Path | None) -> dict[str,str]:
     if not config: return current
     updated=read_env(config)
     if current.get("KRAKEN2_DB") and not updated.get("KRAKEN2_DB"): updated["KRAKEN2_DB"]=current["KRAKEN2_DB"]
+    if current.get("QC_PROFILE_FILE"): updated["QC_PROFILE_FILE"]=current["QC_PROFILE_FILE"]
     backup=run/"provenance"/"resolved_config.pre_resume.json"
     if not backup.is_file(): shutil.copy2(run/"provenance"/"resolved_config.json",backup)
     atomic_json(run/"provenance"/"resolved_config.json",updated)
@@ -116,6 +118,20 @@ def invalidate_legacy_identity_metrics(run: Path, cfg: dict[str,str]) -> int:
         invalidated += 1
     return invalidated
 
+def invalidate_legacy_isolate_qc(run: Path) -> int:
+    invalidated=0; required=set(QC_OUTPUT_FIELDS)
+    for marker in (run/"state"/"preprocess").glob("*.done.json"):
+        safe=marker.name[:-len(".done.json")]; hits=list((run/"results"/"groups").glob(f"*/01_isolates/{safe}/qc.tsv"))
+        fields=set()
+        if hits:
+            try:
+                with hits[0].open(newline="",errors="replace") as handle: fields=set(next(csv.reader(handle,delimiter="\t"),[]))
+            except OSError: fields=set()
+        if required.issubset(fields): continue
+        marker.unlink(); invalidated += 1
+    if invalidated: _remove_done(run/"state"/"summary.done.json")
+    return invalidated
+
 def latest_run(root: Path) -> Path:
     runs=sorted((root/"runs").glob("*"),key=lambda p:p.stat().st_mtime,reverse=True)
     if not runs: raise SystemExit(f"No runs found under {root/'runs'}")
@@ -123,6 +139,8 @@ def latest_run(root: Path) -> Path:
 
 def check(args) -> int:
     rows=load_manifest(args.manifest); cfg=apply_cli_overrides(read_env(args.config),args); required=[]
+    profile=Path(cfg["QC_PROFILE_FILE"]).expanduser().resolve() if cfg.get("QC_PROFILE_FILE","").strip() else None
+    resolve_threshold_rows(rows,cfg,profile)
     assembler=assembler_mode(cfg)
     if assembler=="off":
         if any(r.get("raw_bam") for r in rows): required.append("samtools")
@@ -130,9 +148,13 @@ def check(args) -> int:
         required=["shovill" if assembler=="shovill" else "spades.py","prokka","panaroo","bwa","samtools","bcftools","minimap2"]
     needs_kraken=cfg["TAXONOMY_MODE"] not in {"off","auto"} or any(r.get("grouping_source")=="kraken_pending" for r in rows)
     if needs_kraken: required.append("kraken2")
+    mode=checkm2_mode(cfg)
+    if mode=="required": required.append("checkm2")
     trim_mode="off" if assembler in {"spades","off"} or truthy(cfg.get("SKIP_TRIM","false")) else cfg.get("READ_TRIMMING_MODE","auto")
     if trim_mode=="always": required.append("fastp")
     missing=[x for x in required if not command_exists(x)]
+    checkm2_db=Path(cfg.get("CHECKM2_DB","")).expanduser() if cfg.get("CHECKM2_DB","").strip() else None
+    if mode=="required" and (not checkm2_db or not checkm2_db.is_file()): missing.append("CHECKM2_DB")
     print(f"manifest: {len(rows)} isolates / {len(groups(rows))} groups")
     print(f"inputs: {sum(1 for r in rows if r.get('raw_bam'))} raw BAM / {sum(1 for r in rows if r.get('R1') and r.get('R2'))} FASTQ-pair rows")
     print("tools: " + ("OK" if not missing else "missing " + ", ".join(missing)))
@@ -172,12 +194,17 @@ def run_command(args) -> int:
     cfg=apply_cli_overrides(read_env(args.config),args); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
         run=load_existing(root,args.resume); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
+        cfg=ensure_qc_provenance(run,read_tsv(run/"provenance"/"manifest.tsv"),cfg); atomic_json(run/"provenance"/"resolved_config.json",cfg)
         if args.skip_trim or args.skip_shovill or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
     else:
         run_id=args.run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=root/"runs"/run_id
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
         if not args.resume: run=make_run(args.manifest,root,cfg,run_id)
+        else:
+            invalidated=invalidate_legacy_identity_metrics(run,cfg); legacy_qc=invalidate_legacy_isolate_qc(run)
+            if invalidated: print(f"invalidated_legacy_identity_metrics={invalidated}")
+            if legacy_qc: print(f"invalidated_legacy_isolate_qc={legacy_qc}")
         if args.profile=="local": local(run)
         else: slurm(run,cfg,args.dry_run)
     if args.profile=="slurm": print(f"Run submitted. Please find logs in {run/'logs'/'slurm'}")
@@ -191,11 +218,14 @@ def resume_command(args) -> int:
         run=latest_run(root) if args.latest else load_existing(root,args.run)
     validate_run_dir(run)
     cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
+    cfg=ensure_qc_provenance(run,read_tsv(run/"provenance"/"manifest.tsv"),cfg); atomic_json(run/"provenance"/"resolved_config.json",cfg)
     if args.skip_trim or args.skip_shovill or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
         invalidated=invalidate_legacy_identity_metrics(run,cfg)
         if invalidated: print(f"invalidated_legacy_identity_metrics={invalidated}")
+        legacy_qc=invalidate_legacy_isolate_qc(run)
+        if legacy_qc: print(f"invalidated_legacy_isolate_qc={legacy_qc}")
         slurm(run,cfg,args.dry_run)
     print(f"Run submitted. Please find logs in {run/'logs'/'slurm'}")
     return 0
@@ -230,7 +260,10 @@ def exclude_command(args) -> int:
     if missing: raise SystemExit("Isolates not found in run manifest: " + ", ".join(missing[:20]))
     selected=set(requested)
     for row in rows:
-        if row["isolate_id"] in selected: row["user_excluded"]="true"
+        if row["isolate_id"] in selected:
+            row["user_excluded"]="true"
+            marker=run/"state"/"preprocess"/f"{safe_name(row['isolate_id'])}.done.json"
+            if marker.is_file(): marker.unlink()
     write_resolved(manifest,rows)
     write_tsv(run/"provenance"/"user_exclusions.tsv",["isolate_id","status"],([sample,"user_excluded"] for sample in requested))
     print(f"Marked {len(requested)} isolates as user-excluded without changing task indices.")
