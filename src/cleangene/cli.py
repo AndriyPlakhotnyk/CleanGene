@@ -9,7 +9,7 @@ from .qc import QC_OUTPUT_FIELDS, ensure_qc_provenance, prepare_qc_provenance, r
 from .slurm import sbatch_cmd, submit
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
-from .ux import spinner
+from .ux import submitted, spinner, welcome
 from .workers import cleanup_trimmed_fastqs, dispatch
 
 def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
@@ -190,7 +190,7 @@ def shlex_quote(x:str)->str:
     import shlex; return shlex.quote(x)
 
 def run_command(args) -> int:
-    print("Welcome to CleanGene")
+    print(welcome("Welcome to CleanGene"))
     cfg=apply_cli_overrides(read_env(args.config),args); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
         run=load_existing(root,args.resume); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
@@ -207,11 +207,11 @@ def run_command(args) -> int:
             if legacy_qc: print(f"invalidated_legacy_isolate_qc={legacy_qc}")
         if args.profile=="local": local(run)
         else: slurm(run,cfg,args.dry_run)
-    if args.profile=="slurm": print(f"Run submitted. Please find logs in {run/'logs'/'slurm'}")
+    if args.profile=="slurm": print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
     return 0
 
 def resume_command(args) -> int:
-    print("Welcome to CleanGene")
+    print(welcome("Welcome to CleanGene"))
     if args.run_dir: run=args.run_dir.expanduser().resolve()
     else:
         root=(args.analysis_root or Path.cwd()).expanduser().resolve()
@@ -227,7 +227,7 @@ def resume_command(args) -> int:
         legacy_qc=invalidate_legacy_isolate_qc(run)
         if legacy_qc: print(f"invalidated_legacy_isolate_qc={legacy_qc}")
         slurm(run,cfg,args.dry_run)
-    print(f"Run submitted. Please find logs in {run/'logs'/'slurm'}")
+    print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
     return 0
 
 def cleanup_command(args) -> int:

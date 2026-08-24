@@ -6,7 +6,7 @@ from .defaults import DEFAULTS
 from .downstream import read_ids, read_manifest_rows, resolve_organism, validate_matrix_selection
 from .slurm import sbatch_cmd, submit
 from .util import atomic_json, read_tsv, safe_name
-from .ux import spinner
+from .ux import submitted, spinner, welcome
 
 def _run_args(parser: argparse.ArgumentParser) -> None:
     group=parser.add_mutually_exclusive_group(required=True); group.add_argument("--run"); group.add_argument("--run-dir",type=Path); group.add_argument("--latest",action="store_true")
@@ -132,7 +132,7 @@ def _request(args, run: Path) -> dict[str,object]:
     return {"utility":"itol","organism":organism,"genes":args.genes,"samples":samples,"operon":_resolve_result(args.operon,"operon_calls.tsv") if args.operon else "","variants":_resolve_result(args.variants,"gene_variants.tsv") if args.variants else "","color_scheme":args.color_scheme,"custom_colors":custom}
 
 def utils_command(args) -> int:
-    print("Welcome to CleanGene Utils")
+    print(welcome("Welcome to CleanGene Utils"))
     run=locate_run(args); print(f"Located run: {run}")
     with spinner("Getting ready to submit"):
         request=_request(args,run); cfg={**DEFAULTS,**json.loads((run/"provenance"/"resolved_config.json").read_text())}; stamp=datetime.now().strftime("%y%m%d_%H%M%S"); analysis_id=safe_name(args.analysis_name or f"{stamp}_{request['utility']}"); out=run/"results"/"utils"/analysis_id; logs=run/"logs"/"slurm"/"utils"; out.mkdir(parents=True,exist_ok=False); logs.mkdir(parents=True,exist_ok=True)
@@ -143,5 +143,5 @@ def utils_command(args) -> int:
         wrap=f"{shlex.quote(sys.executable)} -m cleangene _utils_worker --request {shlex.quote(str(request_path))}"
         command=sbatch_cmd(name=f"cg-util-{safe_name(str(request['utility']))[:20]}",wrap=wrap,cpus=cpus,mem=mem,time=limit,account=cfg.get("SLURM_ACCOUNT",""),partition=cfg.get("SLURM_PARTITION",""),log=logs/f"{analysis_id}.%j.log")
         job_id=submit(command,args.dry_run); request["slurm_job_id"]=job_id; atomic_json(request_path,request)
-    print(f"Analysis submitted. Please find logs in {logs}")
+    print(submitted(f"Analysis submitted. Please find logs in {logs}"))
     return 0

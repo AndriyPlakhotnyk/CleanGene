@@ -13,6 +13,7 @@ from .plotting import plot_presence_absence
 from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
+from .ux import completed, waiting
 
 STAGE_DESCRIPTIONS = (
     ("kraken_db_setup", "prepare the shared Kraken2 database when required"),
@@ -589,7 +590,7 @@ def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str
         active=job_active(job_ids)
         current=user_job_count()
         avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
-        print(f"user jobs: {current}/{cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | {label}: {complete} | waiting ...", flush=True)
+        print(waiting(f"user jobs: {current}/{cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | step={label}: {complete} | waiting ..."), flush=True)
         if not active:
             assert_jobs_succeeded(job_ids,details)
             return
@@ -682,7 +683,8 @@ class _RollingScheduler:
         complete=sum(_index_done(self.run_dir,stage,i) for i in total_indices); running,pending=self.stage_queue(stage)
         submitted=len({i for i in total_indices if _index_done(self.run_dir,stage,i)}|self.submitted.get(stage,set()))
         current=int(self.snapshot["total"]); avail=available_slots(int(self.cfg["SLURM_USER_JOB_LIMIT"]),int(self.cfg["SLURM_JOB_HEADROOM"]),current)
-        print(f"user jobs: {current}/{self.cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | {label}: complete={complete}/{len(total_indices)} submitted={submitted} running={running} pending={pending} failed=0 | waiting/submitting ...",flush=True)
+        complete_text=completed(f"complete={complete}/{len(total_indices)} submitted={submitted}")
+        print(waiting(f"user jobs: {current}/{self.cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | step={label}: ")+complete_text+waiting(f" running={running} pending={pending} failed=0 | waiting/submitting ..."),flush=True)
 
     def wait_tick(self) -> None: time.sleep(int(self.cfg["SLURM_POLL_SECONDS"]))
 
