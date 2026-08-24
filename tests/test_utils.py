@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cleangene.cli import main
+from cleangene.defaults import DEFAULTS
 from cleangene.diagnostics import infer_failure_stage
 from cleangene.downstream import differential_genes, get_operon, get_samples, get_variants, make_itol, matrix_path, resolve_organism
 from cleangene.util import atomic_json, read_tsv, write_tsv
@@ -103,5 +104,16 @@ class CleanGeneUtilsTests(unittest.TestCase):
             stdout=StringIO()
             with contextlib.redirect_stdout(stdout): main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","messages","--dry-run"])
             text=stdout.getvalue(); self.assertIn("Welcome to CleanGene",text); self.assertIn(f"Run directory: {root/'runs'/'messages'}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Run submitted. Please find logs in",text)
+
+    def test_resume_submits_without_login_side_legacy_scans(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"runs"/"resume"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
+            atomic_json(run/"provenance"/"resolved_config.json",dict(DEFAULTS))
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","organism"],[["i1","Species one","Species one"]])
+            write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["Species one","i1"]])
+            stdout=StringIO()
+            with patch("cleangene.cli.slurm",return_value="123") as submit_job, patch("cleangene.cli.invalidate_legacy_identity_metrics",side_effect=AssertionError("slow identity scan ran")), patch("cleangene.cli.invalidate_legacy_isolate_qc",side_effect=AssertionError("slow QC scan ran")), contextlib.redirect_stdout(stdout):
+                self.assertEqual(main(["resume","--run-dir",str(run)]),0)
+            self.assertEqual(submit_job.call_count,1); text=stdout.getvalue(); self.assertIn("legacy checks will run inside the controller job",text); self.assertIn("Run submitted. Please find logs in",text)
 
 if __name__=="__main__": unittest.main()

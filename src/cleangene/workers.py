@@ -584,6 +584,92 @@ def incomplete_validate_indices(run_dir: Path) -> list[int]:
     rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
     return [i for i,r in enumerate(rows) if not _done(run_dir/"state"/"validate"/f"{safe_name(r['isolate_id'])}.done.json")]
 
+def _float_or_none(value: str | None) -> float | None:
+    try:
+        return float(value) if value not in {"", "NA", None} else None
+    except ValueError:
+        return None
+
+def _remove_done(path: Path) -> None:
+    if path.is_file(): path.unlink()
+
+def invalidate_legacy_identity_metrics(run_dir: Path, cfg: dict[str,str]) -> int:
+    min_breadth=float(cfg["READ_VALIDATION_MIN_BREADTH"]); min_depth=float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"])
+    invalidated=0
+    for metrics in (run_dir/"results"/"groups").glob("*/03_read_validation/evidence/*/metrics.tsv"):
+        rows=[]
+        try:
+            with metrics.open(newline="",errors="replace") as handle:
+                rows=list(csv.DictReader(handle,delimiter="\t"))
+        except OSError:
+            continue
+        stale=False
+        for row in rows:
+            mapped=_float_or_none(row.get("mapped_reads")) or 0
+            breadth=_float_or_none(row.get("breadth")) or 0
+            depth=_float_or_none(row.get("mean_depth")) or 0
+            identity=_float_or_none(row.get("identity"))
+            aligned=_float_or_none(row.get("aligned_positions"))
+            method=row.get("identity_method","")
+            if mapped>0 and breadth>=min_breadth and depth>=min_depth and identity==0 and (aligned in {0,None}) and not method:
+                stale=True
+                break
+        if not stale: continue
+        backup=metrics.with_name("metrics.pre_identity_fix.tsv")
+        if not backup.is_file(): shutil.copy2(metrics,backup)
+        group_safe=metrics.parents[3].name; iso_safe=metrics.parent.name
+        _remove_done(run_dir/"state"/"validate"/f"{iso_safe}.done.json")
+        _remove_done(run_dir/"state"/"reduce"/f"{group_safe}.done.json")
+        _remove_done(run_dir/"state"/"plot"/f"{group_safe}.done.json")
+        _remove_done(run_dir/"state"/"summary.done.json")
+        invalidated += 1
+    return invalidated
+
+def invalidate_legacy_isolate_qc(run_dir: Path) -> int:
+    invalidated=0; required=set(QC_OUTPUT_FIELDS)
+    tasks=run_dir/"state"/"isolate_tasks.tsv"
+    rows=read_tsv(tasks) if tasks.is_file() else []
+    targets=[(run_dir/"state"/"preprocess"/f"{safe_name(row['isolate_id'])}.done.json",run_dir/"results"/"groups"/safe_name(row["group_id"])/"01_isolates"/safe_name(row["isolate_id"])/"qc.tsv") for row in rows]
+    if not targets:
+        targets=[(marker,hits[0] if hits else None) for marker in (run_dir/"state"/"preprocess").glob("*.done.json") for hits in [list((run_dir/"results"/"groups").glob(f"*/01_isolates/{marker.name[:-len('.done.json')]}/qc.tsv"))]]
+    for marker,qc in targets:
+        if not marker.is_file(): continue
+        fields=set()
+        if qc and qc.is_file():
+            try:
+                with qc.open(newline="",errors="replace") as handle: fields=set(next(csv.reader(handle,delimiter="\t"),[]))
+            except OSError:
+                fields=set()
+        if required.issubset(fields): continue
+        marker.unlink(); invalidated += 1
+    if invalidated: _remove_done(run_dir/"state"/"summary.done.json")
+    return invalidated
+
+def resume_maintenance_signature(cfg: dict[str,str]) -> dict[str,object]:
+    return {
+        "legacy_identity_metrics":{
+            "min_breadth":cfg.get("READ_VALIDATION_MIN_BREADTH",""),
+            "min_depth":cfg.get("READ_VALIDATION_MIN_MEAN_DEPTH",""),
+        },
+        "isolate_qc_fields":list(QC_OUTPUT_FIELDS),
+    }
+
+def run_resume_maintenance(run_dir: Path, cfg: dict[str,str]) -> dict[str,int]:
+    marker=run_dir/"state"/"resume_maintenance.done.json"; signature=resume_maintenance_signature(cfg)
+    if marker.is_file():
+        try:
+            if load_json(marker).get("signature")==signature: return {"legacy_identity_metrics":0,"legacy_isolate_qc":0}
+        except (OSError, ValueError):
+            pass
+    print(waiting("step=resume maintenance: checking legacy validation and QC markers"),flush=True)
+    invalidated=invalidate_legacy_identity_metrics(run_dir,cfg)
+    legacy_qc=invalidate_legacy_isolate_qc(run_dir)
+    touch_done(marker,{"signature":signature,"legacy_identity_metrics":invalidated,"legacy_isolate_qc":legacy_qc})
+    if invalidated: print(completed(f"step=resume maintenance: invalidated_legacy_identity_metrics={invalidated}"),flush=True)
+    if legacy_qc: print(completed(f"step=resume maintenance: invalidated_legacy_isolate_qc={legacy_qc}"),flush=True)
+    print(completed("step=resume maintenance: completed"),flush=True)
+    return {"legacy_identity_metrics":invalidated,"legacy_isolate_qc":legacy_qc}
+
 def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str, details: str = "") -> None:
     poll=int(cfg["SLURM_POLL_SECONDS"])
     while True:
@@ -768,6 +854,7 @@ def slurm_controller(run_dir: Path, index: int | None = None) -> None:
         cfg, rows=context(run_dir)
         print("CleanGene workflow:",flush=True)
         for stage,description in STAGE_DESCRIPTIONS: print(f"  {stage}: {description}",flush=True)
+        run_resume_maintenance(run_dir,cfg)
         if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip() and not _done(run_dir/"state"/"kraken_db_setup.done.json"):
             _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
             cfg,rows=context(run_dir)

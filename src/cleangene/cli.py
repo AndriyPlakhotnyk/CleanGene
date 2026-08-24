@@ -1,16 +1,16 @@
 from __future__ import annotations
-import argparse, csv, json, os, shutil, subprocess, sys
+import argparse, json, os, shutil, subprocess, sys
 from datetime import datetime
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, read_env, truthy
 from .defaults import SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
-from .qc import QC_OUTPUT_FIELDS, ensure_qc_provenance, prepare_qc_provenance, resolve_threshold_rows
+from .qc import ensure_qc_provenance, prepare_qc_provenance, resolve_threshold_rows
 from .slurm import sbatch_cmd, submit
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
-from .ux import submitted, spinner, welcome
-from .workers import cleanup_trimmed_fastqs, dispatch
+from .ux import submitted, spinner, waiting, welcome
+from .workers import cleanup_trimmed_fastqs, dispatch, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, run_resume_maintenance
 
 def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
     cfg=dict(cfg)
@@ -77,60 +77,11 @@ def refresh_resume_config(run: Path, config: Path | None) -> dict[str,str]:
     atomic_json(run/"provenance"/"resolved_config.json",updated)
     return updated
 
-def _float_or_none(value: str | None) -> float | None:
-    try:
-        return float(value) if value not in {"", "NA", None} else None
-    except ValueError:
-        return None
-
-def _remove_done(path: Path) -> None:
-    if path.is_file(): path.unlink()
-
 def invalidate_legacy_identity_metrics(run: Path, cfg: dict[str,str]) -> int:
-    min_breadth=float(cfg["READ_VALIDATION_MIN_BREADTH"]); min_depth=float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"])
-    invalidated=0
-    for metrics in (run/"results"/"groups").glob("*/03_read_validation/evidence/*/metrics.tsv"):
-        rows=[]
-        try:
-            with metrics.open(newline="") as handle:
-                rows=list(csv.DictReader(handle,delimiter="\t"))
-        except OSError:
-            continue
-        stale=False
-        for row in rows:
-            mapped=_float_or_none(row.get("mapped_reads")) or 0
-            breadth=_float_or_none(row.get("breadth")) or 0
-            depth=_float_or_none(row.get("mean_depth")) or 0
-            identity=_float_or_none(row.get("identity"))
-            aligned=_float_or_none(row.get("aligned_positions"))
-            method=row.get("identity_method","")
-            if mapped>0 and breadth>=min_breadth and depth>=min_depth and identity==0 and (aligned in {0,None}) and not method:
-                stale=True
-                break
-        if not stale: continue
-        backup=metrics.with_name("metrics.pre_identity_fix.tsv")
-        if not backup.is_file(): shutil.copy2(metrics,backup)
-        group_safe=metrics.parents[3].name; iso_safe=metrics.parent.name
-        _remove_done(run/"state"/"validate"/f"{iso_safe}.done.json")
-        _remove_done(run/"state"/"reduce"/f"{group_safe}.done.json")
-        _remove_done(run/"state"/"plot"/f"{group_safe}.done.json")
-        _remove_done(run/"state"/"summary.done.json")
-        invalidated += 1
-    return invalidated
+    return _invalidate_legacy_identity_metrics(run,cfg)
 
 def invalidate_legacy_isolate_qc(run: Path) -> int:
-    invalidated=0; required=set(QC_OUTPUT_FIELDS)
-    for marker in (run/"state"/"preprocess").glob("*.done.json"):
-        safe=marker.name[:-len(".done.json")]; hits=list((run/"results"/"groups").glob(f"*/01_isolates/{safe}/qc.tsv"))
-        fields=set()
-        if hits:
-            try:
-                with hits[0].open(newline="",errors="replace") as handle: fields=set(next(csv.reader(handle,delimiter="\t"),[]))
-            except OSError: fields=set()
-        if required.issubset(fields): continue
-        marker.unlink(); invalidated += 1
-    if invalidated: _remove_done(run/"state"/"summary.done.json")
-    return invalidated
+    return _invalidate_legacy_isolate_qc(run)
 
 def latest_run(root: Path) -> Path:
     runs=sorted((root/"runs").glob("*"),key=lambda p:p.stat().st_mtime,reverse=True)
@@ -201,11 +152,10 @@ def run_command(args) -> int:
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
         if not args.resume: run=make_run(args.manifest,root,cfg,run_id)
-        else:
-            invalidated=invalidate_legacy_identity_metrics(run,cfg); legacy_qc=invalidate_legacy_isolate_qc(run)
-            if invalidated: print(f"invalidated_legacy_identity_metrics={invalidated}")
-            if legacy_qc: print(f"invalidated_legacy_isolate_qc={legacy_qc}")
-        if args.profile=="local": local(run)
+        else: print(waiting("step=resume: submitting controller; legacy checks will run inside the controller job"),flush=True)
+        if args.profile=="local":
+            if args.resume: run_resume_maintenance(run,cfg)
+            local(run)
         else: slurm(run,cfg,args.dry_run)
     if args.profile=="slurm": print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
     return 0
@@ -222,10 +172,7 @@ def resume_command(args) -> int:
     if args.skip_trim or args.skip_shovill or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
-        invalidated=invalidate_legacy_identity_metrics(run,cfg)
-        if invalidated: print(f"invalidated_legacy_identity_metrics={invalidated}")
-        legacy_qc=invalidate_legacy_isolate_qc(run)
-        if legacy_qc: print(f"invalidated_legacy_isolate_qc={legacy_qc}")
+        print(waiting("step=resume: submitting controller; legacy checks will run inside the controller job"),flush=True)
         slurm(run,cfg,args.dry_run)
     print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
     return 0
