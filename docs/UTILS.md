@@ -77,7 +77,8 @@ Gene calls are emitted as an iTOL `DATASET_BINARY`; operon and variant IDs are e
 
 Matrix utilities use `UTILS_CPUS`, `UTILS_MEM`, and `UTILS_TIME`. Read-backed variant analyses use `UTILS_VARIANT_*`; wrong-call replays use `UTILS_DIAGNOSTIC_*`. Account and partition behavior comes from the original run configuration.
 
-If `CLEANUP_TRIMMED_FASTQ=true`, the final workflow summary replaces retained
+If `--cleanup_trimmed_fastq` is passed to `run`/`resume`, or
+`CLEANUP_TRIMMED_FASTQ=true`, the final workflow summary replaces retained
 fastp outputs with symlinks to the original manifest FASTQs. Read-backed
 utilities keep using the paths recorded in isolate QC, but after cleanup they
 analyze the original untrimmed reads. The same cleanup can be applied to a
@@ -90,7 +91,9 @@ Assembly compression is controlled during preprocessing with
 `spades.fasta` and `spades.gfa` and does not affect downstream utilities. The
 `all` mode also compresses the final `contigs.fa`; CleanGene records
 `contigs.fa.gz` in QC and its variant/diagnostic utilities can read that
-compressed assembly path.
+compressed assembly path. The final summary repeats this operation as a safe,
+idempotent sweep so that preprocess tasks completed before a resumed controller
+are covered. A report is written to `results/cohort/storage_cleanup.tsv`.
 
 Annotation compression is controlled with
 `COMPRESS_ANNOTATION_OUTPUTS=off|nonessential`, or
@@ -98,4 +101,5 @@ Annotation compression is controlled with
 files uncompressed because Panaroo consumes them, preprocess resume checks look
 for them, and variant/diagnostic utilities read neighboring CDS features from
 them. The nonessential mode gzips other Prokka outputs such as `.sqn`, `.gbk`,
-`.err`, `.ffn`, and `.fna`.
+`.err`, `.ffn`, and `.fna`; the final summary sweep also covers annotations
+created before a resumed controller starts.

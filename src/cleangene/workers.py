@@ -373,6 +373,42 @@ def cleanup_trimmed_fastqs(run_dir: Path, dry_run: bool = False) -> dict[str,obj
     counts={status:sum(1 for item in report if item[1]==status) for status in sorted({item[1] for item in report})}
     return {"isolates":len(report),"bytes_reclaimed":reclaimed,"counts":counts,"rows":report}
 
+def compress_completed_outputs(run_dir: Path) -> dict[str,object]:
+    """Compress safe run-local outputs, including preprocesses completed before resume."""
+    cfg,rows=context(run_dir); assembly_mode=cfg.get("COMPRESS_ASSEMBLY_OUTPUTS","off").strip().lower(); annotation_mode=cfg.get("COMPRESS_ANNOTATION_OUTPUTS","off").strip().lower()
+    if assembly_mode not in {"off","intermediates","all"}: raise SystemExit("COMPRESS_ASSEMBLY_OUTPUTS must be off, intermediates, or all")
+    if annotation_mode not in {"off","nonessential"}: raise SystemExit("COMPRESS_ANNOTATION_OUTPUTS must be off or nonessential")
+    report=[]; reclaimed=0
+    for row in rows:
+        qc=find_isolate_qc(run_dir,row)
+        if not qc.is_file(): continue
+        qc_rows=read_tsv(qc)
+        if not qc_rows: continue
+        q=qc_rows[0]; changed=False; iso=row["isolate_id"]
+        assembly_dir=qc.parent/"assembly"
+        if assembly_mode!="off" and assembly_dir.is_dir():
+            recorded=Path(q.get("assembly","")).expanduser()
+            recorded=recorded.absolute() if recorded else recorded
+            for path in sorted(assembly_dir.rglob("*")):
+                if not path.is_file() or path.is_symlink() or path.suffix==".gz": continue
+                if path.name=="contigs.fa" and assembly_mode!="all": continue
+                if path.suffix.lower() not in {".fa",".fasta",".gfa",".fastg"}: continue
+                before=path.stat().st_size; original=str(path); gz=_gzip_file(path); saved=max(0,before-gz.stat().st_size); reclaimed += saved
+                report.append([iso,"assembly",original,str(gz),saved])
+                if recorded and recorded==path.absolute(): q["assembly"]=str(gz); changed=True
+        annotation_dir=qc.parent/"annotation"
+        if annotation_mode=="nonessential" and annotation_dir.is_dir():
+            gff=Path(q.get("gff","")).expanduser(); gff=gff.absolute() if gff else gff
+            for path in sorted(annotation_dir.iterdir()):
+                if not path.is_file() or path.is_symlink() or path.suffix==".gz" or path.suffix.lower()==".gff": continue
+                if gff and path.absolute()==gff: continue
+                before=path.stat().st_size; original=str(path); gz=_gzip_file(path); saved=max(0,before-gz.stat().st_size); reclaimed += saved
+                report.append([iso,"annotation",original,str(gz),saved])
+        if changed: write_tsv(qc,list(q.keys()),[q])
+    write_tsv(run_dir/"results"/"cohort"/"storage_cleanup.tsv",["isolate_id","category","original_path","compressed_path","bytes_reclaimed"],report)
+    counts={category:sum(1 for item in report if item[1]==category) for category in sorted({item[1] for item in report})}
+    return {"files_compressed":len(report),"bytes_reclaimed":reclaimed,"counts":counts}
+
 def group_size_class(n: int, cfg: dict[str,str]) -> str:
     if n <= int(cfg.get("PANAROO_SMALL_MAX_ISOLATES","499")): return "small"
     if n <= int(cfg.get("PANAROO_MEDIUM_MAX_ISOLATES","2000")): return "medium"
@@ -751,14 +787,14 @@ def plot_group(run_dir: Path, index: int) -> None:
     touch_done(done,{"matrix":str(matrix),"outdir":str(out)})
 
 def summarize(run_dir: Path) -> None:
-    cfg,rows=context(run_dir); iso_rows=[]; group_rows=[]
+    cfg,rows=context(run_dir); storage=compress_completed_outputs(run_dir); iso_rows=[]; group_rows=[]
     for group in groups(rows):
         root=run_dir/"results"/"groups"/safe_name(group); retained=retained_rows(run_dir,group); val=root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"
         n_genes=max(0,len(read_tsv(val))) if val.is_file() else 0; group_rows.append([group,len([r for r in rows if r["group_id"]==group]),len(retained),n_genes])
         for row in rows:
             if row["group_id"]!=group: continue
             q=read_tsv(find_isolate_qc(run_dir,row))[0]; q={**q,"group_id":group}; iso_rows.append(q)
-    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows)}
+    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows),"storage_cleanup":storage}
     if truthy(cfg.get("CLEANUP_TRIMMED_FASTQ","false")):
         cleanup=cleanup_trimmed_fastqs(run_dir); payload["fastq_cleanup"]={key:value for key,value in cleanup.items() if key!="rows"}
     touch_done(run_dir/"state"/"summary.done.json",payload)

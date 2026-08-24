@@ -119,6 +119,23 @@
 
    `cleangene resume --run-dir /path/to/run --config config/cleangene.arc.env` refreshes execution settings for an existing run while retaining completed task markers and the resolved Kraken2 database path.
 
+   For a storage-saving resume after all orphaned SLURM tasks have stopped, use:
+
+   ```bash
+   cleangene resume \
+       --run-dir /path/to/run \
+       --config config/cleangene.arc.env \
+       --cleanup_trimmed_fastq \
+       --compress_assembly_outputs intermediates \
+       --compress_annotation_outputs nonessential
+   ```
+
+   The final summary job also sweeps outputs from preprocess tasks that finished
+   before the resumed controller was submitted. It compresses safe run-local
+   assembly intermediates and nonessential annotation files, then replaces
+   CleanGene's trimmed FASTQs with symlinks to the original manifest FASTQs.
+   The original inputs are opened only as symlink targets and are never modified.
+
    Each completed organism/group publishes its final read-validated presence/absence matrix at `results/groups/<group>/cleaned_pangenome.tsv`. Panaroo intermediates and the detailed BWA validation evidence remain in the numbered subdirectories.
 
 10. **Local debugging** (small tests)
@@ -153,8 +170,9 @@
    cleangene cleanup --run-dir /path/to/run
    ```
 
-   For automatic cleanup at the end of future runs, set
-   `CLEANUP_TRIMMED_FASTQ=true` in the run configuration. Cleanup occurs in the
+   For automatic cleanup at the end of future runs, pass
+   `--cleanup_trimmed_fastq` or set `CLEANUP_TRIMMED_FASTQ=true` in the run
+   configuration. Cleanup occurs in the
    final summary job, after all core read consumers finish. FASTQs extracted
    from raw BAM inputs are retained because they have no original FASTQ target.
    Details and reclaimed byte counts are written to

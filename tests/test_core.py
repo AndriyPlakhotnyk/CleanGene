@@ -8,8 +8,8 @@ from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _RollingScheduler, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, cleanup_trimmed_fastqs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
-from cleangene.cli import invalidate_legacy_identity_metrics, local, make_run, refresh_resume_config, slurm
+from cleangene.workers import _RollingScheduler, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.cli import apply_cli_overrides, invalidate_legacy_identity_metrics, local, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
 
@@ -29,6 +29,27 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertEqual(result["counts"],{"linked":1}); self.assertTrue(tr1.is_symlink()); self.assertTrue(tr2.is_symlink())
             self.assertEqual(tr1.read_bytes(),r1.read_bytes()); self.assertEqual(tr2.read_bytes(),r2.read_bytes())
             self.assertTrue((run/"results"/"cohort"/"fastq_cleanup.tsv").is_file())
+
+    def test_final_storage_sweep_compresses_previously_completed_preprocess(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; iso_dir=run/"results"/"groups"/"g"/"01_isolates"/"iso1"
+            assembly=iso_dir/"assembly"; annotation=iso_dir/"annotation"; assembly.mkdir(parents=True); annotation.mkdir()
+            contigs=assembly/"contigs.fa"; contigs.write_text(">c\nACGT\n"); (assembly/"spades.fasta").write_text(">s\nACGT\n"); (assembly/"spades.gfa").write_text("H\tVN:Z:1.0\n")
+            gff=annotation/"iso1.gff"; gff.write_text("##gff-version 3\n"); (annotation/"iso1.gbk").write_text("LOCUS\n"); (annotation/"iso1.sqn").write_text("sqn\n")
+            atomic_json(run/"provenance"/"resolved_config.json",{"COMPRESS_ASSEMBLY_OUTPUTS":"intermediates","COMPRESS_ANNOTATION_OUTPUTS":"nonessential"})
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2"],[["iso1","g","r1","r2"]])
+            write_tsv(iso_dir/"qc.tsv",["isolate_id","group_id","assembly","gff"],[["iso1","g",contigs,gff]])
+            result=compress_completed_outputs(run)
+            self.assertEqual(result["files_compressed"],4)
+            self.assertTrue(contigs.is_file())
+            self.assertTrue((assembly/"spades.fasta.gz").is_file()); self.assertTrue((assembly/"spades.gfa.gz").is_file())
+            self.assertTrue(gff.is_file()); self.assertTrue((annotation/"iso1.gbk.gz").is_file()); self.assertTrue((annotation/"iso1.sqn.gz").is_file())
+            self.assertEqual(read_tsv(iso_dir/"qc.tsv")[0]["assembly"],str(contigs))
+            self.assertTrue((run/"results"/"cohort"/"storage_cleanup.tsv").is_file())
+
+    def test_cleanup_flag_sets_final_summary_cleanup(self):
+        args=type("Args",(),{"cleanup_trimmed_fastq":True})()
+        self.assertEqual(apply_cli_overrides({},args)["CLEANUP_TRIMMED_FASTQ"],"true")
 
     def test_present(self):
         self.assertEqual(present(""),0); self.assertEqual(present("0"),0); self.assertEqual(present("abc_1"),1)
