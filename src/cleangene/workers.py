@@ -177,6 +177,15 @@ def _compress_assembly_outputs(assembly_dir: Path, assembly: Path, cfg: dict[str
     gz_assembly=assembly.with_name(assembly.name + ".gz")
     return gz_assembly if mode=="all" and gz_assembly.is_file() else assembly
 
+def _compress_annotation_outputs(annotation_dir: Path, gff: Path, cfg: dict[str,str]) -> None:
+    mode=cfg.get("COMPRESS_ANNOTATION_OUTPUTS","off").strip().lower()
+    if mode not in {"off","nonessential"}:
+        raise SystemExit("COMPRESS_ANNOTATION_OUTPUTS must be off or nonessential")
+    if mode=="off" or not annotation_dir.is_dir(): return
+    for path in sorted(annotation_dir.iterdir()):
+        if not path.is_file() or path.suffix==".gz" or path.resolve()==gff.resolve(): continue
+        _gzip_file(path)
+
 def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int]:
     r1=row.get("R1","").strip(); r2=row.get("R2","").strip(); mode=cfg.get("READ_TRIMMING_MODE","auto").strip().lower()
     if truthy(cfg.get("SKIP_TRIM","false")) or truthy(cfg.get("SKIP_SHOVILL","false")): mode="off"
@@ -279,6 +288,7 @@ def preprocess(run_dir: Path, index: int) -> None:
         if not gff.is_file():
             if ann.exists(): shutil.rmtree(ann)
             run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
+        _compress_annotation_outputs(ann,gff,cfg)
         metrics=assembly_metrics(Path(assembly))
         if generated_assembly: assembly=str(_compress_assembly_outputs(Path(assembly).parent,Path(assembly),cfg))
         data={**common,"excluded":0,"reason":"","assembly":assembly,"gff":str(gff),**metrics}

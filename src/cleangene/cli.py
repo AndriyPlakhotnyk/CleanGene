@@ -22,6 +22,8 @@ def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
         cfg["READ_TRIMMING_MODE"]="off"
     compress=getattr(args,"compress_assembly_outputs",None)
     if compress: cfg["COMPRESS_ASSEMBLY_OUTPUTS"]=compress
+    compress_annotation=getattr(args,"compress_annotation_outputs",None)
+    if compress_annotation: cfg["COMPRESS_ANNOTATION_OUTPUTS"]=compress_annotation
     return cfg
 
 def validate_fastq_inputs(rows: list[dict[str,str]]) -> None:
@@ -160,7 +162,7 @@ def run_command(args) -> int:
     cfg=apply_cli_overrides(read_env(args.config),args); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
         run=load_existing(root,args.resume); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
-        if args.skip_trim or args.skip_shovill or args.compress_assembly_outputs: atomic_json(run/"provenance"/"resolved_config.json",cfg)
+        if args.skip_trim or args.skip_shovill or args.compress_assembly_outputs or args.compress_annotation_outputs: atomic_json(run/"provenance"/"resolved_config.json",cfg)
     else:
         run_id=args.run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=root/"runs"/run_id
     print(f"Run directory: {run}")
@@ -179,7 +181,7 @@ def resume_command(args) -> int:
         run=latest_run(root) if args.latest else load_existing(root,args.run)
     validate_run_dir(run)
     cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
-    if args.skip_trim or args.skip_shovill or args.compress_assembly_outputs: atomic_json(run/"provenance"/"resolved_config.json",cfg)
+    if args.skip_trim or args.skip_shovill or args.compress_assembly_outputs or args.compress_annotation_outputs: atomic_json(run/"provenance"/"resolved_config.json",cfg)
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
         invalidated=invalidate_legacy_identity_metrics(run,cfg)
@@ -202,10 +204,10 @@ def cleanup_command(args) -> int:
 
 def main(argv=None) -> int:
     p=argparse.ArgumentParser(prog="cleangene"); sub=p.add_subparsers(dest="cmd",required=True)
-    c=sub.add_parser("check"); c.add_argument("--manifest",type=Path,required=True); c.add_argument("--config",type=Path); c.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); c.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); c.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); c.set_defaults(func=check)
+    c=sub.add_parser("check"); c.add_argument("--manifest",type=Path,required=True); c.add_argument("--config",type=Path); c.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); c.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); c.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); c.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); c.set_defaults(func=check)
     e=sub.add_parser("estimate"); e.add_argument("--manifest",type=Path,required=True); e.set_defaults(func=estimate)
-    r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); r.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); r.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); r.set_defaults(func=run_command)
-    rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--config",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); rs.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); rs.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); rs.set_defaults(func=resume_command)
+    r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); r.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); r.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); r.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); r.set_defaults(func=run_command)
+    rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--config",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); rs.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); rs.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); rs.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); rs.set_defaults(func=resume_command)
     cl=sub.add_parser("cleanup",help="replace retained trimmed FASTQs with links to original FASTQ inputs"); cl.add_argument("--run-dir",type=Path,required=True); cl.add_argument("--dry-run",action="store_true"); cl.set_defaults(func=cleanup_command)
     w=sub.add_parser("_worker"); w.add_argument("--stage",required=True); w.add_argument("--run-dir",type=Path,required=True); w.add_argument("--index",type=int,default=0); w.set_defaults(func=lambda a:(dispatch(a.stage,a.run_dir,a.index),0)[1])
     uw=sub.add_parser("_utils_worker"); uw.add_argument("--request",type=Path,required=True); uw.set_defaults(func=lambda a:(__import__("cleangene.downstream",fromlist=["run_request"]).run_request(a.request),0)[1])

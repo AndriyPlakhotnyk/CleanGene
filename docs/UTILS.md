@@ -91,3 +91,11 @@ Assembly compression is controlled during preprocessing with
 `all` mode also compresses the final `contigs.fa`; CleanGene records
 `contigs.fa.gz` in QC and its variant/diagnostic utilities can read that
 compressed assembly path.
+
+Annotation compression is controlled with
+`COMPRESS_ANNOTATION_OUTPUTS=off|nonessential`, or
+`--compress_annotation_outputs nonessential`. CleanGene keeps Prokka `.gff`
+files uncompressed because Panaroo consumes them, preprocess resume checks look
+for them, and variant/diagnostic utilities read neighboring CDS features from
+them. The nonessential mode gzips other Prokka outputs such as `.sqn`, `.gbk`,
+`.err`, `.ffn`, and `.fna`.

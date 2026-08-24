@@ -99,6 +99,15 @@
    final `contigs.fa` plain. `COMPRESS_ASSEMBLY_OUTPUTS=all` also gzips
    `contigs.fa` and records `contigs.fa.gz` in isolate QC.
 
+   To compress nonessential Prokka annotation outputs while keeping `.gff`
+   available for Panaroo, resume checks, and utilities, set:
+
+   ```bash
+   COMPRESS_ANNOTATION_OUTPUTS=nonessential
+   ```
+
+   or pass `--compress_annotation_outputs nonessential` to `run`/`resume`.
+
 9. **Resume an unfinished run**
 
    ```bash

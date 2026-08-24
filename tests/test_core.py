@@ -169,6 +169,30 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertTrue((assembly.parent/"spades.gfa.gz").is_file())
             self.assertEqual(assembly_metrics(assembly)["assembly_length"],4)
 
+    def test_compress_annotation_outputs_keeps_gff_plain(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); r1=root/"r1.fastq.gz"; r2=root/"r2.fastq.gz"
+            r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
+            manifest=root/"manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tR1\tR2\niso1\tg\t{r1}\t{r2}\n")
+            cfg={"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","COMPRESS_ANNOTATION_OUTPUTS":"nonessential","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+            run=make_run(manifest,root,cfg,"r")
+            def fake_run(command,**kwargs):
+                if command[0]=="shovill":
+                    out=Path(command[command.index("--outdir")+1]); out.mkdir(parents=True,exist_ok=True)
+                    (out/"contigs.fa").write_text(">c1\nACGT\n")
+                elif command[0]=="prokka":
+                    out=Path(command[command.index("--outdir")+1]); prefix=command[command.index("--prefix")+1]; out.mkdir(parents=True,exist_ok=True)
+                    for ext in ("gff","sqn","gbk","err","ffn","fna"):
+                        (out/f"{prefix}.{ext}").write_text(f"{ext}\n")
+            with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run,0)
+            ann=run/"results"/"groups"/"g"/"01_isolates"/"iso1"/"annotation"
+            qc=read_tsv(ann.parent/"qc.tsv")[0]
+            self.assertEqual(Path(qc["gff"]).name,"iso1.gff")
+            self.assertTrue((ann/"iso1.gff").is_file())
+            for ext in ("sqn","gbk","err","ffn","fna"):
+                self.assertFalse((ann/f"iso1.{ext}").exists())
+                self.assertTrue((ann/f"iso1.{ext}.gz").is_file())
+
     def test_normalize_panaroo_accepts_safe_isolate_names(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/"gene_presence_absence.csv"
