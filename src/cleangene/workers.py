@@ -12,6 +12,7 @@ from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_
 from .plotting import plot_presence_absence
 from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
+from .task_store import build_isolate_task_store, load_isolate_task, migrate_isolate_task_store, task_store_ready
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 from .ux import completed, log_line, waiting
 
@@ -37,11 +38,16 @@ def context(run_dir: Path):
     cfg={**DEFAULTS,**load_json(run_dir/"provenance"/"resolved_config.json")}; rows=read_tsv(run_dir/"provenance"/"manifest.tsv"); return cfg, rows
 
 def task_row(run_dir: Path, kind: str, index: int) -> dict[str,str]:
+    if kind=="isolate" and task_store_ready(run_dir):
+        record=load_isolate_task(run_dir,index)
+        return {key:("" if value is None else str(value)) for key,value in record.items() if key not in {"qc_thresholds","qc_thresholds_resolved"}}
     rows=read_tsv(run_dir/"state"/f"{kind}_tasks.tsv")
     if index<0 or index>=len(rows): raise SystemExit(f"Task index {index} outside {kind} task list")
     return rows[index]
 
 def manifest_row_for_task(task: dict[str,str], rows: list[dict[str,str]]) -> dict[str,str]:
+    if any(key in task for key in ("R1","R2","raw_bam","assembly","pangenome_dir")):
+        return task
     matches=[r for r in rows if r["isolate_id"]==task["isolate_id"]]
     if len(matches)!=1: raise SystemExit(f"Could not resolve manifest row for isolate {task['isolate_id']}")
     return {**matches[0], **task}
@@ -204,9 +210,25 @@ def _compress_annotation_outputs(annotation_dir: Path, gff: Path, cfg: dict[str,
         if not path.is_file() or path.suffix==".gz" or path.resolve()==gff.resolve(): continue
         _gzip_file(path)
 
-def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int]:
+def _artifact_provenance(path_text: str, artifact: str, source: str = "manifest") -> dict[str,object]:
+    if not path_text.strip(): return {}
+    path=Path(path_text).expanduser()
+    if not path.is_file(): raise SystemExit(f"Supplied {artifact} not found: {path}")
+    stat=path.stat()
+    small=stat.st_size <= 100 * 1024 * 1024
+    return {"artifact":artifact,"source":source,"path":str(path),"size_bytes":stat.st_size,
+        "mtime":int(stat.st_mtime),"sha256":hashlib.sha256(path.read_bytes()).hexdigest() if small else ""}
+
+def _write_provenance(path: Path, rows: list[dict[str,object]]) -> None:
+    if not rows: return
+    fields=["artifact","source","path","size_bytes","mtime","sha256","tool","version","parameters"]
+    write_tsv(path,fields,rows)
+
+def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int,str]:
     r1=row.get("R1","").strip(); r2=row.get("R2","").strip(); mode=cfg.get("READ_TRIMMING_MODE","auto").strip().lower()
-    if truthy(cfg.get("SKIP_TRIM","false")) or assembler_mode(cfg) in {"spades","off"}: mode="off"
+    decision=""
+    if truthy(cfg.get("SKIP_TRIM","false")) or assembler_mode(cfg) in {"spades","off"}:
+        mode="off"; decision="skipped_skip_trim_or_nonshovill"
     method="manifest_fastq"; trimmed=0
     raw_bam=row.get("raw_bam","").strip()
 
@@ -233,34 +255,45 @@ def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str
             + ", ".join(missing)
         )
     if mode not in {"off","auto","always"}: raise SystemExit("READ_TRIMMING_MODE must be off, auto, or always")
+    if mode=="auto" and truthy(row.get("reads_processed","false")):
+        mode="off"; decision="skipped_reads_processed_true"
     if mode=="off" and not raw_bam:
         r1,r2=_link_manifest_fastqs(out/"reads",r1,r2)
         method += "+symlinked"
+        if not decision: decision="skipped_trimming_mode_off"
     elif mode in {"auto","always"}:
         if command_exists("fastp"):
-            reads=out/"reads"; reads.mkdir(exist_ok=True)
+            reads=out/"reads"; reads.mkdir(parents=True,exist_ok=True)
             tr1=str(reads/"trimmed_R1.fastq.gz"); tr2=str(reads/"trimmed_R2.fastq.gz")
             run(["fastp","--detect_adapter_for_pe","--in1",r1,"--in2",r2,"--out1",tr1,"--out2",tr2,"--thread",cfg.get("CPUS","4"),"--json",str(reads/"fastp.json"),"--html",str(reads/"fastp.html")],
                 stdout=logs/"fastp.stdout",stderr=logs/"fastp.stderr")
             r1,r2=tr1,tr2
             method += "+fastp"
             trimmed=1
+            decision=f"ran_fastp_{mode}"
         elif mode=="always":
             raise SystemExit("READ_TRIMMING_MODE=always requires fastp")
         elif not raw_bam:
             r1,r2=_link_manifest_fastqs(out/"reads",r1,r2)
             method += "+symlinked"
-    return r1,r2,method,trimmed
+            decision="skipped_fastp_unavailable_auto"
+    if not decision: decision="not_applicable_raw_bam" if raw_bam else "unknown"
+    return r1,r2,method,trimmed,decision
 
 def preprocess(run_dir: Path, index: int) -> None:
-    cfg, rows=context(run_dir); row=manifest_row_for_task(task_row(run_dir,"isolate",index),rows); iso=row["isolate_id"]; group=row["group_id"]; safe=safe_name(iso)
+    cfg={**DEFAULTS,**load_json(run_dir/"provenance"/"resolved_config.json")}
+    if not task_store_ready(run_dir): migrate_isolate_task_store(run_dir)
+    record=load_isolate_task(run_dir,index)
+    row={key:("" if value is None else str(value)) for key,value in record.items() if key not in {"qc_thresholds","qc_thresholds_resolved"}}
+    iso=row["isolate_id"]; group=row["group_id"]; safe=safe_name(iso)
     root=run_dir/"results"/"groups"/safe_name(group); out=root/"01_isolates"/safe; done=run_dir/"state"/"preprocess"/f"{safe}.done.json"
     if done.is_file():
         status=load_json(done)
         if status.get("excluded") or status.get("external_pangenome") or (status.get("qc_status") and (out/"qc.tsv").is_file()) or (out/"annotation"/f"{safe}.gff").is_file(): return
     out.mkdir(parents=True,exist_ok=True); scratch=_preprocess_scratch(cfg,run_dir,iso); work_out=(scratch/"output") if scratch else out; work_out.mkdir(parents=True,exist_ok=True); logs=work_out/"logs"; logs.mkdir(exist_ok=True)
-    fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS]
-    thresholds,profile_source=isolate_thresholds(run_dir,iso,cfg,row); mode=checkm2_mode(cfg)
+    fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","read_processing_decision","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS]
+    thresholds=dict(record.get("qc_thresholds_resolved") or {})
+    profile_source=str(record.get("qc_profile_source","global")); mode=checkm2_mode(cfg)
     finished=False
     def finish(data: dict[str,object], payload: dict[str,object]) -> None:
         nonlocal finished
@@ -293,18 +326,19 @@ def preprocess(run_dir: Path, index: int) -> None:
             "sequencing_coverage":qc_value(coverage),"checkm2_completeness":qc_value(completeness),
             "checkm2_contamination":qc_value(contamination),"qc_profile_source":profile_source}
     try:
+        provenance=[]
         if user_excluded(row):
             metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
             result=assessment(excluded=True)
-            finish({"isolate_id":iso,"group_id":group,"top_species":"","contamination_pct":"","R1":row.get("R1",""),"R2":row.get("R2",""),"raw_bam":row.get("raw_bam",""),"read_preprocessing":"skipped_user_excluded","adapter_trimmed":0,"assembly":"","gff":"",**metrics,**qc_columns(result,None,metrics,None,None)},{"excluded":True,"reason":result["reason"],"qc_status":result["PASS/FAIL"]}); return
-        r1,r2,read_method,adapter_trimmed=prepare_read_inputs(row,work_out,logs,cfg)
+            finish({"isolate_id":iso,"group_id":group,"top_species":"","contamination_pct":"","R1":row.get("R1",""),"R2":row.get("R2",""),"raw_bam":row.get("raw_bam",""),"read_preprocessing":"skipped_user_excluded","read_processing_decision":"skipped_user_excluded","adapter_trimmed":0,"assembly":"","gff":"",**metrics,**qc_columns(result,None,metrics,None,None)},{"excluded":True,"reason":result["reason"],"qc_status":result["PASS/FAIL"]}); return
+        r1,r2,read_method,adapter_trimmed,read_decision=prepare_read_inputs(row,work_out,logs,cfg)
         read_errors=[]
         try: read_qc=read_metrics(Path(r1),Path(r2),work_out/"reads"/"fastp.json")
         except (OSError,ValueError,SystemExit) as error: read_qc=None; read_errors.append(("read_metrics_failed",str(error)))
         expected=row.get("organism","").strip(); taxonomy=cfg.get("TAXONOMY_MODE","auto"); top=""; contam=None
         taxonomy_enabled=taxonomy not in {"off","auto"} or row.get("grouping_source")=="kraken_pending"
         if taxonomy_enabled:
-            db=ensure_kraken2_db(run_dir,cfg,rows)
+            db=ensure_kraken2_db(run_dir,cfg,[row])
             if not db: raise SystemExit("KRAKEN2_DB is required when TAXONOMY_MODE is not off")
             worker_db,memory_map=kraken_db_for_worker(db,cfg); report=work_out/"kraken2.report.tsv"
             output=str(work_out/"kraken2.output.tsv") if truthy(cfg.get("KRAKEN2_KEEP_CLASSIFICATIONS","false")) else "/dev/null"
@@ -314,7 +348,8 @@ def preprocess(run_dir: Path, index: int) -> None:
             run(command,stdout=logs/"kraken2.stdout",stderr=logs/"kraken2.stderr")
             top,contam,_=parse_kraken_report(report,expected)
         assembly=row.get("assembly","").strip()
-        common={"isolate_id":iso,"group_id":group,"top_species":top,"contamination_pct":contam,"R1":r1,"R2":r2,"raw_bam":row.get("raw_bam",""),"read_preprocessing":read_method,"adapter_trimmed":adapter_trimmed}
+        if assembly: provenance.append(_artifact_provenance(assembly,"assembly"))
+        common={"isolate_id":iso,"group_id":group,"top_species":top,"contamination_pct":contam,"R1":r1,"R2":r2,"raw_bam":row.get("raw_bam",""),"read_preprocessing":read_method,"read_processing_decision":read_decision,"adapter_trimmed":adapter_trimmed}
         external_pangenome=bool(row.get("pangenome_dir","").strip())
         assembler=assembler_mode(cfg)
         internal_pangenome=not external_pangenome and assembler!="off"
@@ -338,7 +373,12 @@ def preprocess(run_dir: Path, index: int) -> None:
         if assembly and Path(assembly).is_file(): metrics=assembly_metrics(Path(assembly))
         else: metrics=empty_metrics; assembly=""
         completeness=check_contamination=None
-        if mode=="required" and assembly:
+        supplied_checkm2=row.get("checkm2_report","").strip()
+        if supplied_checkm2:
+            provenance.append(_artifact_provenance(supplied_checkm2,"checkm2_report"))
+            try: completeness,check_contamination=parse_checkm2_report(Path(supplied_checkm2).expanduser())
+            except (ValueError,OSError) as error: errors.append(("checkm2_report_invalid",f"Supplied CheckM2 report could not be parsed: {error}"))
+        elif mode=="required" and assembly:
             db=Path(cfg.get("CHECKM2_DB","")).expanduser()
             if not cfg.get("CHECKM2_DB","").strip() or not db.is_file(): errors.append(("checkm2_database_missing",f"CheckM2 database file was not found at '{cfg.get('CHECKM2_DB','')}'"))
             elif not command_exists("checkm2"): errors.append(("checkm2_unavailable","CheckM2 executable was not available"))
@@ -354,6 +394,7 @@ def preprocess(run_dir: Path, index: int) -> None:
             data={**common,"assembly":assembly,"gff":"",**metrics,**qc_columns(pre,read_qc,metrics,completeness,check_contamination)}
             payload={"excluded":pre["PASS/FAIL"]=="FAIL","reason":pre["reason"],"qc_status":pre["PASS/FAIL"]}
             if external_pangenome: payload["external_pangenome"]=row["pangenome_dir"]
+            _write_provenance(work_out/"provenance.tsv",provenance)
             finish(data,payload); return
         assembly_failures={"coverage_low","contigs_high","n50_low","completeness_low","checkm2_contamination_high","assembly_failed","assembly_missing","checkm2_database_missing","checkm2_unavailable","checkm2_failed"}
         if assembly_failures.intersection(pre["reason"].split(";")):
@@ -362,9 +403,12 @@ def preprocess(run_dir: Path, index: int) -> None:
                 gff_present=False,warnings=warnings,errors=errors)
             if generated_assembly and assembly: assembly=str(_compress_assembly_outputs(Path(assembly).parent,Path(assembly),cfg))
             data={**common,"assembly":assembly,"gff":"",**metrics,**qc_columns(skipped,read_qc,metrics,completeness,check_contamination)}
+            _write_provenance(work_out/"provenance.tsv",provenance)
             finish(data,{"excluded":True,"reason":skipped["reason"],"qc_status":"FAIL"}); return
-        ann=work_out/"annotation"; gff=ann/f"{safe}.gff"; gff_present=True; prokka_errors=[]
-        if not gff.is_file():
+        ann=work_out/"annotation"; supplied_gff=row.get("gff","").strip(); gff=Path(supplied_gff).expanduser() if supplied_gff else ann/f"{safe}.gff"; gff_present=True; prokka_errors=[]
+        if supplied_gff:
+            provenance.append(_artifact_provenance(supplied_gff,"gff"))
+        elif not gff.is_file():
             if ann.exists(): shutil.rmtree(ann)
             try: run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
             except subprocess.CalledProcessError as error: prokka_errors.append(("prokka_failed",f"Prokka failed with exit status {error.returncode}")); gff_present=None
@@ -375,6 +419,7 @@ def preprocess(run_dir: Path, index: int) -> None:
         if gff.is_file(): _compress_annotation_outputs(ann,gff,cfg)
         if generated_assembly: assembly=str(_compress_assembly_outputs(Path(assembly).parent,Path(assembly),cfg))
         data={**common,"assembly":assembly,"gff":str(gff) if gff.is_file() else "",**metrics,**qc_columns(final,read_qc,metrics,completeness,check_contamination)}
+        _write_provenance(work_out/"provenance.tsv",provenance)
         finish(data,{"excluded":final["PASS/FAIL"]=="FAIL","reason":final["reason"],"qc_status":final["PASS/FAIL"],"gff":str(gff) if gff.is_file() else ""})
     finally:
         if scratch:
@@ -546,6 +591,7 @@ def resolve_groups(run_dir: Path, index: int | None = None) -> None:
     counts={g:sum(1 for r in resolved if r["group_id"]==g) for g in groups(resolved)}
     ordered=sorted(counts, key=lambda g:(counts[g],g))
     write_resolved(run_dir/"provenance"/"manifest.tsv",resolved)
+    build_isolate_task_store(run_dir,resolved)
     write_tsv(run_dir/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in resolved))
     write_tsv(run_dir/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],([g,counts[g],group_size_class(counts[g],cfg)] for g in ordered))
     organism_index=build_organism_results_index(run_dir)
@@ -862,6 +908,8 @@ def slurm_controller(run_dir: Path, index: int | None = None) -> None:
     with _controller_lock(run_dir):
         cfg, rows=context(run_dir)
         _controller_log(f"controller_started | run_dir={run_dir} | isolates={len(rows)} | stages=" + " -> ".join(stage for stage,_ in STAGE_DESCRIPTIONS))
+        migrated=migrate_isolate_task_store(run_dir)
+        if migrated: _controller_log(f"step=prepare_tasks | migrated_isolate_task_store={migrated}",ok=True)
         run_resume_maintenance(run_dir,cfg)
         if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip() and not _done(run_dir/"state"/"kraken_db_setup.done.json"):
             _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")

@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Iterable
+
+from .qc import THRESHOLD_COLUMNS, THRESHOLD_DEFAULTS, validate_thresholds
+from .util import read_tsv
+
+OFFSET_WIDTH = 8
+TASK_DIR = Path("state") / "tasks"
+ISOLATE_JSONL = TASK_DIR / "isolate_tasks.jsonl"
+ISOLATE_INDEX = TASK_DIR / "isolate_tasks.idx"
+
+
+def isolate_store_paths(run_dir: Path) -> tuple[Path, Path]:
+    return run_dir / ISOLATE_JSONL, run_dir / ISOLATE_INDEX
+
+
+def _threshold_map(run_dir: Path) -> dict[str, dict[str, str]]:
+    path = run_dir / "provenance" / "qc_thresholds.tsv"
+    if not path.is_file():
+        return {}
+    return {row["isolate_id"]: row for row in read_tsv(path)}
+
+
+def build_isolate_task_store(run_dir: Path, rows: Iterable[dict[str, str]]) -> int:
+    """Write O(1)-addressable isolate task records.
+
+    The JSONL contains complete manifest/task rows plus resolved QC thresholds.
+    The index contains unsigned 8-byte offsets into the JSONL, one per task.
+    """
+    jsonl, index = isolate_store_paths(run_dir)
+    jsonl.parent.mkdir(parents=True, exist_ok=True)
+    thresholds = _threshold_map(run_dir)
+    tmp_jsonl = jsonl.with_suffix(".jsonl.tmp")
+    tmp_index = index.with_suffix(".idx.tmp")
+    count = 0
+    with tmp_jsonl.open("wb") as data, tmp_index.open("wb") as idx:
+        for count, row in enumerate(rows, 1):
+            threshold_row = {**THRESHOLD_DEFAULTS, **thresholds.get(row["isolate_id"], {})}
+            record = {
+                **row,
+                "task_index": count - 1,
+                "qc_profile_source": threshold_row.get("qc_profile_source", "global"),
+                "qc_thresholds": {key: threshold_row.get(key, "") for key in THRESHOLD_COLUMNS},
+            }
+            idx.write(data.tell().to_bytes(OFFSET_WIDTH, "big", signed=False))
+            data.write(json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n")
+    os.replace(tmp_jsonl, jsonl)
+    os.replace(tmp_index, index)
+    return count
+
+
+def task_store_ready(run_dir: Path) -> bool:
+    jsonl, index = isolate_store_paths(run_dir)
+    return jsonl.is_file() and index.is_file() and index.stat().st_size % OFFSET_WIDTH == 0
+
+
+def load_isolate_task(run_dir: Path, index: int) -> dict[str, object]:
+    jsonl, idx = isolate_store_paths(run_dir)
+    if index < 0:
+        raise SystemExit(f"Task index {index} outside isolate task store")
+    with idx.open("rb") as handle:
+        handle.seek(index * OFFSET_WIDTH)
+        raw = handle.read(OFFSET_WIDTH)
+    if len(raw) != OFFSET_WIDTH:
+        raise SystemExit(f"Task index {index} outside isolate task store")
+    offset = int.from_bytes(raw, "big", signed=False)
+    with jsonl.open("rb") as handle:
+        handle.seek(offset)
+        line = handle.readline()
+    if not line:
+        raise SystemExit(f"Task index {index} has no isolate task record")
+    record = json.loads(line)
+    thresholds = record.get("qc_thresholds", {})
+    record["qc_thresholds_resolved"] = validate_thresholds(thresholds, str(record.get("isolate_id", index)))
+    return record
+
+
+def migrate_isolate_task_store(run_dir: Path) -> int:
+    if task_store_ready(run_dir):
+        return 0
+    manifest = run_dir / "provenance" / "manifest.tsv"
+    tasks = run_dir / "state" / "isolate_tasks.tsv"
+    if manifest.is_file():
+        rows = read_tsv(manifest)
+    elif tasks.is_file():
+        rows = read_tsv(tasks)
+    else:
+        raise SystemExit(f"Cannot build isolate task store; missing {manifest} and {tasks}")
+    return build_isolate_task_store(run_dir, rows)

@@ -7,6 +7,7 @@ from .defaults import SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
 from .qc import ensure_qc_provenance, prepare_qc_provenance, resolve_threshold_rows
 from .slurm import sbatch_cmd, submit
+from .task_store import build_isolate_task_store
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
 from .ux import clean_gene_banner, submitted, spinner, waiting
@@ -40,6 +41,7 @@ def validate_fastq_inputs(rows: list[dict[str,str]]) -> None:
     errors=[]
     for row in rows:
         if row.get("raw_bam"): continue
+        if any(row.get(column,"").strip() for column in ("assembly","gff","protein_fasta","checkm2_report","pangenome_dir")): continue
         r1=row.get("R1","").strip(); r2=row.get("R2","").strip()
         if not r1 or not r2:
             errors.append(f"{row['isolate_id']}: missing R1/R2")
@@ -49,7 +51,7 @@ def validate_fastq_inputs(rows: list[dict[str,str]]) -> None:
 def make_run(manifest: Path, analysis_root: Path, cfg: dict[str,str], run_id: str | None) -> Path:
     rid=run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=analysis_root/"runs"/rid
     (run/"provenance").mkdir(parents=True,exist_ok=True); (run/"state").mkdir(exist_ok=True); (run/"logs"/"slurm").mkdir(parents=True,exist_ok=True)
-    rows=load_manifest(manifest); validate_fastq_inputs(rows); cfg=prepare_qc_provenance(run,rows,cfg); write_resolved(run/"provenance"/"manifest.tsv",rows); atomic_json(run/"provenance"/"resolved_config.json",cfg); atomic_json(run/"provenance"/"inputs.json",{"manifest":str(manifest.resolve()),"manifest_sha256":sha256(manifest),"created":datetime.now().isoformat()})
+    rows=load_manifest(manifest); validate_fastq_inputs(rows); cfg=prepare_qc_provenance(run,rows,cfg); write_resolved(run/"provenance"/"manifest.tsv",rows); build_isolate_task_store(run,rows); atomic_json(run/"provenance"/"resolved_config.json",cfg); atomic_json(run/"provenance"/"inputs.json",{"manifest":str(manifest.resolve()),"manifest_sha256":sha256(manifest),"created":datetime.now().isoformat()})
     write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in rows))
     counts={}
     for r in rows: counts[r["group_id"]]=counts.get(r["group_id"],0)+1
@@ -215,6 +217,7 @@ def exclude_command(args) -> int:
             marker=run/"state"/"preprocess"/f"{safe_name(row['isolate_id'])}.done.json"
             if marker.is_file(): marker.unlink()
     write_resolved(manifest,rows)
+    build_isolate_task_store(run,rows)
     write_tsv(run/"provenance"/"user_exclusions.tsv",["isolate_id","status"],([sample,"user_excluded"] for sample in requested))
     print(f"Marked {len(requested)} isolates as user-excluded without changing task indices.")
     print(f"Report: {run/'provenance'/'user_exclusions.tsv'}")

@@ -5,6 +5,12 @@ from .util import write_tsv
 
 PANGENOME_COLUMNS = ("pangenome_dir", "panaroo_dir", "pangenome")
 BAM_COLUMNS = ("raw_bam", "BAM", "bam")
+ARTIFACT_COLUMNS = (
+    "reads_processed", "read_processing_pipeline", "read_processing_version",
+    "read_qc_tsv", "fastp_json", "kraken_report", "assembly", "gff",
+    "protein_fasta", "checkm2_report", "expected_genome_size",
+    "prodigal_training_file",
+)
 
 def _clean(value: str | None) -> str:
     return (value or "").strip()
@@ -43,8 +49,9 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
         bam = next((row.get(c, "") for c in BAM_COLUMNS if row.get(c, "")), "")
         row["raw_bam"] = bam
         has_fastq = bool(row.get("R1") and row.get("R2"))
-        if not has_fastq and not bam:
-            raise SystemExit(f"Manifest row {line} must provide R1/R2 or raw_bam")
+        has_reusable_artifact = any(row.get(column, "") for column in ("assembly", "gff", "protein_fasta", "checkm2_report", *PANGENOME_COLUMNS))
+        if not has_fastq and not bam and not has_reusable_artifact:
+            raise SystemExit(f"Manifest row {line} must provide R1/R2, raw_bam, or reusable artifacts")
         if bool(row.get("R1")) != bool(row.get("R2")):
             raise SystemExit(f"Manifest row {line} must provide both R1 and R2")
         if row.get("group_id"):
@@ -71,7 +78,7 @@ def groups(rows: list[dict[str, str]]) -> list[str]:
     return seen
 
 def write_resolved(path: Path, rows: list[dict[str, str]]) -> None:
-    preferred = ["isolate_id", "group_id", "grouping_source", "organism", "R1", "R2", "raw_bam", "assembly", "pangenome_dir"]
+    preferred = ["isolate_id", "group_id", "grouping_source", "organism", "R1", "R2", "raw_bam", "pangenome_dir", *ARTIFACT_COLUMNS]
     extras = sorted({key for row in rows for key in row} - set(preferred))
     fields = [field for field in preferred if any(field in row for row in rows)] + extras
     write_tsv(path, fields, rows)

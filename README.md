@@ -65,7 +65,20 @@
    `<run>/logs/slurm/preprocess/`.
 
 7. **Large scale (≥30 k isolates)**  
-   Use `config/cleangene.arc.env` on ARC. It leaves `SLURM_PARTITION` empty and maintains a rolling, capacity-aware preprocessing window of at most 400 submitted tasks. Up to eight array batches may be active, but every submission still respects total user occupancy and QOS headroom. Known organism groups are prioritized smallest first and can enter Panaroo/validation while later groups are still preprocessing. ARC config sets `TAXONOMY_MODE=kraken2`, so Kraken2 QC runs in preprocess workers.
+   Use `config/cleangene.arc.env` on ARC. It leaves `SLURM_PARTITION` empty and maintains a rolling, capacity-aware preprocessing window of at most 400 submitted tasks. Up to eight array batches may be active, but every submission still respects total user occupancy and QOS headroom. Known organism groups are prioritized smallest first and can enter Panaroo/validation while later groups are still preprocessing. ARC config sets `TAXONOMY_MODE=auto` and `KRAKEN2_BUNDLE_SIZE=8`.
+
+   New runs write an indexed isolate task store at
+   `state/tasks/isolate_tasks.jsonl` plus `state/tasks/isolate_tasks.idx`.
+   Each isolate worker seeks directly to its own JSON record instead of
+   scanning the full manifest or QC-threshold table. Older runs are migrated by
+   the SLURM controller during resume without deleting prior evidence.
+
+   Optional manifest artifact columns are preserved for reuse and provenance:
+   `reads_processed`, `read_processing_pipeline`, `read_processing_version`,
+   `read_qc_tsv`, `fastp_json`, `kraken_report`, `assembly`, `gff`,
+   `protein_fasta`, `checkm2_report`, `expected_genome_size`, and
+   `prodigal_training_file`. Path validation happens in worker jobs, not during
+   login-node submission.
 
 8. **FASTQ QC only / skip trimming**
 
@@ -85,6 +98,10 @@
    Equivalent config options are `SKIP_SHOVILL=true` and `SKIP_TRIM=true`.
    `--skip_trim` is also useful on full runs when you want to skip fastp
    adapter trimming but still assemble with Shovill from the original reads.
+   With `READ_TRIMMING_MODE=auto`, manifest `reads_processed=true` skips fastp
+   explicitly; `READ_TRIMMING_MODE=always` still runs fastp. Isolate `qc.tsv`
+   includes `read_processing_decision` explaining why trimming ran or was
+   skipped.
 
    `--skip_shovill` is the legacy QC-only option and skips all assembly,
    including SPAdes. To bypass Shovill but still assemble the original,

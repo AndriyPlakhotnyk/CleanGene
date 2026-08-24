@@ -7,8 +7,9 @@ from cleangene.evidence import classify_gene_evidence, fixed_coordinate_identity
 from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
+from cleangene.task_store import build_isolate_task_store, load_isolate_task, migrate_isolate_task_store
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, preprocess, reduce_group, slurm_controller, task_row
 from cleangene.cli import apply_cli_overrides, exclude_command, invalidate_legacy_identity_metrics, local, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
@@ -206,6 +207,35 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertEqual(row["organism"],"Species A")
             self.assertEqual(row["R1"],str(r1))
             self.assertEqual(row["R2"],str(r2))
+
+    def test_indexed_task_store_loads_isolate_by_offset(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d); (run/"provenance").mkdir(parents=True)
+            rows=[{"isolate_id":f"iso{i}","group_id":"g","organism":"Species A","R1":f"r{i}_1.fq","R2":f"r{i}_2.fq"} for i in range(3)]
+            write_tsv(run/"provenance"/"qc_thresholds.tsv",["isolate_id","qc_profile_source","qc_max_contigs_pass","qc_max_contigs_fail","qc_min_n50_pass","qc_min_n50_fail","qc_min_coverage_pass","qc_min_coverage_fail","qc_min_read_length_pass","qc_min_read_length_fail","qc_min_mean_base_quality_pass","qc_min_mean_base_quality_fail","qc_min_completeness_pass","qc_min_completeness_fail","qc_max_checkm2_contamination_pass","qc_max_checkm2_contamination_fail","qc_max_kraken_contamination_fail"],[[r["isolate_id"],"global",300,1000,25000,5000,20,10,120,"",30,"",90,80,5,10,5] for r in rows])
+            self.assertEqual(build_isolate_task_store(run,rows),3)
+            record=load_isolate_task(run,2)
+            self.assertEqual(record["isolate_id"],"iso2")
+            self.assertEqual(record["qc_thresholds_resolved"]["qc_max_contigs_pass"],300.0)
+
+    def test_legacy_run_task_store_migrates_from_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d); (run/"provenance").mkdir(parents=True)
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2"],[["iso1","g","r1","r2"]])
+            self.assertEqual(migrate_isolate_task_store(run),1)
+            self.assertEqual(load_isolate_task(run,0)["isolate_id"],"iso1")
+
+    def test_reads_processed_auto_skips_fastp_but_always_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); r1=root/"r1.fq"; r2=root/"r2.fq"; logs=root/"logs"; out=root/"out"
+            r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n"); logs.mkdir()
+            row={"isolate_id":"iso1","R1":str(r1),"R2":str(r2),"reads_processed":"true"}
+            with patch("cleangene.workers.command_exists",return_value=True), patch("cleangene.workers.run") as tool_run:
+                _,_,_,trimmed,decision=prepare_read_inputs(row,out,logs,{"READ_TRIMMING_MODE":"auto","SKIP_TRIM":"false","ASSEMBLER":"shovill"})
+                self.assertEqual(trimmed,0); self.assertEqual(decision,"skipped_reads_processed_true"); tool_run.assert_not_called()
+            with patch("cleangene.workers.command_exists",return_value=True), patch("cleangene.workers.run") as tool_run:
+                _,_,_,trimmed,decision=prepare_read_inputs(row,root/"out2",logs,{"READ_TRIMMING_MODE":"always","SKIP_TRIM":"false","ASSEMBLER":"shovill","CPUS":"1"})
+                self.assertEqual(trimmed,1); self.assertEqual(decision,"ran_fastp_always"); tool_run.assert_called_once()
 
     def test_qc_only_skip_shovill_uses_fastq_symlinks(self):
         with tempfile.TemporaryDirectory() as d:
