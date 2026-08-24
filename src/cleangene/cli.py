@@ -141,7 +141,8 @@ def shlex_quote(x:str)->str:
     import shlex; return shlex.quote(x)
 
 def run_command(args) -> int:
-    print(welcome("Welcome to CleanGene"))
+    print(clean_gene_banner())
+    print(submitted("Welcome to CleanGene, You Grace."))
     cfg=apply_cli_overrides(read_env(args.config),args); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
         run=load_existing(root,args.resume); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
@@ -159,11 +160,11 @@ def run_command(args) -> int:
         else: slurm(run,cfg,args.dry_run)
     if args.profile=="slurm":
         print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
-        print(clean_gene_banner())
     return 0
 
 def resume_command(args) -> int:
-    print(welcome("Welcome to CleanGene"))
+    print(clean_gene_banner())
+    print(submitted("Welcome to CleanGene, You Grace."))
     if args.run_dir: run=args.run_dir.expanduser().resolve()
     else:
         root=(args.analysis_root or Path.cwd()).expanduser().resolve()
@@ -177,7 +178,6 @@ def resume_command(args) -> int:
         print(waiting("step=resume: submitting controller; legacy checks will run inside the controller job"),flush=True)
         slurm(run,cfg,args.dry_run)
     print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
-    print(clean_gene_banner())
     return 0
 
 def cleanup_command(args) -> int:

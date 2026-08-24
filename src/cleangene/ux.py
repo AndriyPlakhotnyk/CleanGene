@@ -63,7 +63,7 @@ def clean_gene_banner() -> str:
     rows.extend(line(item,GREEN,True) for item in logo)
     rows.extend([
         line(),
-        line("Welcome to CleanGene, You Grace.",GREEN,True),
+        line("Cleanse thy pangenome, my liege!",BURGUNDY,True),
         line(),
         line("Anno Domini 2026",WHITE,True),
         line(),
