@@ -76,3 +76,9 @@ Gene calls are emitted as an iTOL `DATASET_BINARY`; operon and variant IDs are e
 ## Resources
 
 Matrix utilities use `UTILS_CPUS`, `UTILS_MEM`, and `UTILS_TIME`. Read-backed variant analyses use `UTILS_VARIANT_*`; wrong-call replays use `UTILS_DIAGNOSTIC_*`. Account and partition behavior comes from the original run configuration.
+
+If `CLEANUP_TRIMMED_FASTQ=true`, the final workflow summary replaces retained
+fastp outputs with symlinks to the original manifest FASTQs. Read-backed
+utilities keep using the paths recorded in isolate QC, but after cleanup they
+analyze the original untrimmed reads. The same cleanup can be applied to a
+completed older run with `cleangene cleanup --run-dir /path/to/run`.

@@ -8,12 +8,28 @@ from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _RollingScheduler, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
-from cleangene.cli import invalidate_legacy_identity_metrics, make_run, refresh_resume_config, slurm
+from cleangene.workers import _RollingScheduler, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, cleanup_trimmed_fastqs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.cli import invalidate_legacy_identity_metrics, local, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
 
 class CleanGeneCoreTests(unittest.TestCase):
+    def test_cleanup_replaces_trimmed_fastqs_with_original_links(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; group="g"; iso="iso1"; original=Path(d)/"input"; original.mkdir()
+            r1=original/"iso1_R1.fastq.gz"; r2=original/"iso1_R2.fastq.gz"; r1.write_bytes(b"original-r1"); r2.write_bytes(b"original-r2")
+            atomic_json(run/"provenance"/"resolved_config.json",{})
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2"],[[iso,group,r1,r2]])
+            reads=run/"results"/"groups"/group/"01_isolates"/iso/"reads"; reads.mkdir(parents=True)
+            tr1=reads/"trimmed_R1.fastq.gz"; tr2=reads/"trimmed_R2.fastq.gz"; tr1.write_bytes(b"trimmed-r1"); tr2.write_bytes(b"trimmed-r2")
+            write_tsv(reads.parent/"qc.tsv",["isolate_id","group_id","excluded","R1","R2"],[[iso,group,0,tr1,tr2]])
+            preview=cleanup_trimmed_fastqs(run,dry_run=True)
+            self.assertEqual(preview["counts"],{"would_link":1}); self.assertFalse(tr1.is_symlink())
+            result=cleanup_trimmed_fastqs(run)
+            self.assertEqual(result["counts"],{"linked":1}); self.assertTrue(tr1.is_symlink()); self.assertTrue(tr2.is_symlink())
+            self.assertEqual(tr1.read_bytes(),r1.read_bytes()); self.assertEqual(tr2.read_bytes(),r2.read_bytes())
+            self.assertTrue((run/"results"/"cohort"/"fastq_cleanup.tsv").is_file())
+
     def test_present(self):
         self.assertEqual(present(""),0); self.assertEqual(present("0"),0); self.assertEqual(present("abc_1"),1)
 
@@ -99,6 +115,30 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertEqual(row["organism"],"Species A")
             self.assertEqual(row["R1"],str(r1))
             self.assertEqual(row["R2"],str(r2))
+
+    def test_qc_only_skip_shovill_uses_fastq_symlinks(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); manifest=root/"manifest.tsv"
+            rows=[]
+            for iso in ("iso1","iso2"):
+                r1=root/f"{iso}_R1.fastq.gz"; r2=root/f"{iso}_R2.fastq.gz"
+                r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
+                rows.append(f"{iso}\tg\t{r1}\t{r2}")
+            manifest.write_text("isolate_id\tgroup_id\tR1\tR2\n" + "\n".join(rows) + "\n")
+            cfg={"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"auto","SKIP_TRIM":"true","SKIP_SHOVILL":"true","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+            run=make_run(manifest,root,cfg,"r")
+            local(run)
+            qc=read_tsv(run/"results"/"cohort"/"isolate_qc.tsv")
+            self.assertEqual(len(qc),2)
+            for row in qc:
+                self.assertEqual(row["reason"],"shovill_skipped")
+                self.assertEqual(row["adapter_trimmed"],"0")
+                self.assertIn("+symlinked",row["read_preprocessing"])
+                self.assertTrue(Path(row["R1"]).is_symlink())
+                self.assertTrue(Path(row["R2"]).is_symlink())
+                self.assertEqual(row["assembly"],"")
+                self.assertEqual(row["gff"],"")
+            self.assertTrue((run/"state"/"summary.done.json").is_file())
 
     def test_normalize_panaroo_accepts_safe_isolate_names(self):
         with tempfile.TemporaryDirectory() as d:

@@ -15,7 +15,7 @@ from .util import command_exists, load_json, read_tsv, run, safe_name, touch_don
 
 STAGE_DESCRIPTIONS = (
     ("kraken_db_setup", "prepare the shared Kraken2 database when required"),
-    ("preprocess", "check/trim adapters, run Kraken2 QC, assemble with Shovill, and annotate with Prokka"),
+    ("preprocess", "check/trim adapters, run Kraken2 QC, optionally assemble with Shovill, and annotate with Prokka"),
     ("resolve_groups", "resolve organism groups and order the smallest groups first"),
     ("panaroo", "build and clean each group pangenome with Panaroo"),
     ("prepare_validation", "select genes and recover pangenome reference sequences"),
@@ -142,8 +142,22 @@ def kraken_db_setup(run_dir: Path, index: int | None = None) -> None:
     atomic_json(run_dir/"provenance"/"resolved_config.json",cfg)
     touch_done(run_dir/"state"/"kraken_db_setup.done.json",{"KRAKEN2_DB":str(db_path)})
 
+def _replace_symlink(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True,exist_ok=True)
+    tmp=link.with_name(f".{link.name}.tmp-{os.getpid()}")
+    if tmp.exists() or tmp.is_symlink(): tmp.unlink()
+    os.symlink(str(target),tmp)
+    os.replace(tmp,link)
+
+def _link_manifest_fastqs(reads: Path, r1: str, r2: str) -> tuple[str,str]:
+    link1=reads/"input_R1.fastq.gz"; link2=reads/"input_R2.fastq.gz"
+    _replace_symlink(link1,Path(r1).expanduser().resolve())
+    _replace_symlink(link2,Path(r2).expanduser().resolve())
+    return str(link1),str(link2)
+
 def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int]:
     r1=row.get("R1","").strip(); r2=row.get("R2","").strip(); mode=cfg.get("READ_TRIMMING_MODE","auto").strip().lower()
+    if truthy(cfg.get("SKIP_TRIM","false")) or truthy(cfg.get("SKIP_SHOVILL","false")): mode="off"
     method="manifest_fastq"; trimmed=0
     raw_bam=row.get("raw_bam","").strip()
 
@@ -170,7 +184,10 @@ def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str
             + ", ".join(missing)
         )
     if mode not in {"off","auto","always"}: raise SystemExit("READ_TRIMMING_MODE must be off, auto, or always")
-    if mode in {"auto","always"}:
+    if mode=="off" and not raw_bam:
+        r1,r2=_link_manifest_fastqs(out/"reads",r1,r2)
+        method += "+symlinked"
+    elif mode in {"auto","always"}:
         if command_exists("fastp"):
             reads=out/"reads"; reads.mkdir(exist_ok=True)
             tr1=str(reads/"trimmed_R1.fastq.gz"); tr2=str(reads/"trimmed_R2.fastq.gz")
@@ -181,6 +198,9 @@ def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str
             trimmed=1
         elif mode=="always":
             raise SystemExit("READ_TRIMMING_MODE=always requires fastp")
+        elif not raw_bam:
+            r1,r2=_link_manifest_fastqs(out/"reads",r1,r2)
+            method += "+symlinked"
     return r1,r2,method,trimmed
 
 def preprocess(run_dir: Path, index: int) -> None:
@@ -223,6 +243,9 @@ def preprocess(run_dir: Path, index: int) -> None:
         if external_pangenome and not assembly:
             metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
             finish({**common,"excluded":0,"reason":"","assembly":"","gff":"",**metrics},{"excluded":False,"external_pangenome":row["pangenome_dir"]}); return
+        if truthy(cfg.get("SKIP_SHOVILL","false")) and not assembly:
+            metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
+            finish({**common,"excluded":0,"reason":"shovill_skipped","assembly":"","gff":"",**metrics},{"excluded":False,"status":"shovill_skipped"}); return
         if not assembly:
             shov=work_out/"assembly"; shov.mkdir(exist_ok=True); assembly=str(shov/"contigs.fa")
             if not Path(assembly).is_file():
@@ -256,6 +279,63 @@ def find_isolate_qc(run_dir: Path, row: dict[str,str]) -> Path:
     if direct.is_file(): return direct
     hits=list((run_dir/"results"/"groups").glob(f"*/01_isolates/{safe}/qc.tsv"))
     return hits[0] if hits else direct
+
+def _original_fastq_path(run_dir: Path, value: str) -> Path:
+    """Resolve a manifest FASTQ without following a symlink at the final path."""
+    path=Path(value).expanduser()
+    if path.is_absolute(): return path
+    candidates=[Path.cwd()/path]
+    inputs=run_dir/"provenance"/"inputs.json"
+    if inputs.is_file():
+        manifest=load_json(inputs).get("manifest","")
+        if manifest: candidates.append(Path(str(manifest)).expanduser().parent/path)
+    return next((candidate.absolute() for candidate in candidates if candidate.is_file()),candidates[0].absolute())
+
+def cleanup_trimmed_fastqs(run_dir: Path, dry_run: bool = False) -> dict[str,object]:
+    """Replace retained fastp outputs with links to original manifest FASTQs."""
+    _, rows=context(run_dir); results_root=(run_dir/"results").resolve(); report=[]; reclaimed=0
+    for row in rows:
+        iso=row["isolate_id"]
+        if row.get("raw_bam","").strip():
+            report.append([iso,"skipped_raw_bam","",0,"BAM-derived FASTQs must be retained for utilities"]); continue
+        qc=find_isolate_qc(run_dir,row)
+        if not qc.is_file():
+            report.append([iso,"skipped_missing_qc","",0,str(qc)]); continue
+        q=read_tsv(qc)[0]
+        pairs=[]; problem=""
+        for mate in ("R1","R2"):
+            source=_original_fastq_path(run_dir,row.get(mate,"")); target=Path(q.get(mate,"")).expanduser()
+            if not source.is_file(): problem=f"original {mate} not found: {source}"; break
+            if not target.is_absolute(): target=(Path.cwd()/target).absolute()
+            expected=f"trimmed_{mate}.fastq.gz"
+            try: inside=target.parent.resolve().is_relative_to(results_root)
+            except OSError: inside=False
+            if target.name!=expected or not inside:
+                problem=f"QC {mate} is not a CleanGene trimmed FASTQ: {target}"; break
+            pairs.append((mate,source.absolute(),target))
+        if problem:
+            report.append([iso,"skipped",q.get("R1",""),0,problem]); continue
+        sample_bytes=sum(target.lstat().st_size for _,_,target in pairs if target.exists() and not target.is_symlink())
+        already=all(target.is_symlink() and target.resolve(strict=False)==source.resolve(strict=False) for _,source,target in pairs)
+        if already:
+            report.append([iso,"already_linked",str(pairs[0][2]),0,""]); continue
+        if not dry_run:
+            try:
+                for _,source,target in pairs:
+                    target.parent.mkdir(parents=True,exist_ok=True)
+                    temporary=target.with_name(f".{target.name}.cleanup-{os.getpid()}")
+                    if temporary.is_symlink() or temporary.exists(): temporary.unlink()
+                    temporary.symlink_to(source)
+                    os.replace(temporary,target)
+            except OSError as error:
+                if 'temporary' in locals() and (temporary.is_symlink() or temporary.exists()): temporary.unlink()
+                report.append([iso,"error",str(pairs[0][2]),0,str(error)]); continue
+        reclaimed += sample_bytes
+        report.append([iso,"would_link" if dry_run else "linked",str(pairs[0][2]),sample_bytes,""])
+    if not dry_run:
+        write_tsv(run_dir/"results"/"cohort"/"fastq_cleanup.tsv",["isolate_id","status","trimmed_R1","bytes_reclaimed","detail"],report)
+    counts={status:sum(1 for item in report if item[1]==status) for status in sorted({item[1] for item in report})}
+    return {"isolates":len(report),"bytes_reclaimed":reclaimed,"counts":counts,"rows":report}
 
 def group_size_class(n: int, cfg: dict[str,str]) -> str:
     if n <= int(cfg.get("PANAROO_SMALL_MAX_ISOLATES","499")): return "small"
@@ -546,7 +626,8 @@ def panaroo(run_dir: Path, index: int) -> None:
         isolates=[r["isolate_id"] for r in retained]; rows=normalize_panaroo(external/"gene_presence_absence.csv",isolates); calls=root/"02_pangenome"/"initial_calls"; calls.mkdir(parents=True,exist_ok=True); write_binary(calls/"gene_presence_absence.binary.tsv",rows,isolates)
         touch_done(done,{"n_isolates":len(isolates),"n_genes":len(rows),"external_pangenome_dir":str(external)})
         return
-    gffs=[r["gff"] for r in retained]
+    gffs=[r["gff"] for r in retained if r.get("gff")]
+    if len(gffs)<2: touch_done(done,{"status":"skipped","reason":"fewer_than_two_gffs"}); return
     threads=os.environ.get("SLURM_CPUS_PER_TASK",cfg.get("PANAROO_CPUS",cfg.get("CPUS","4")))
     run(["panaroo","-i",*gffs,"-o",str(out),"--clean-mode",cfg["PANAROO_CLEAN_MODE"],"-t",threads],stdout=logs/"panaroo.stdout",stderr=logs/"panaroo.stderr")
     isolates=[r["isolate_id"] for r in retained]; rows=normalize_panaroo(out/"gene_presence_absence.csv",isolates); calls=root/"02_pangenome"/"initial_calls"; calls.mkdir(parents=True,exist_ok=True); write_binary(calls/"gene_presence_absence.binary.tsv",rows,isolates)
@@ -559,6 +640,7 @@ def prepare_validation(run_dir: Path, index: int) -> None:
     retained=retained_rows(run_dir,group)
     if len(retained)<2: touch_done(done,{"status":"skipped"}); return
     isolates=[r["isolate_id"] for r in retained]; initial=root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv"; panaroo_dir=prepared_pangenome_dir(run_dir,group,root)
+    if not initial.is_file(): touch_done(done,{"status":"skipped","reason":"missing_initial_pangenome"}); return
     rows=[]
     with initial.open(newline="") as h:
         for r in csv.DictReader(h,delimiter="\t"): rows.append({"Gene":r["Gene"],**{i:int(r[i]) for i in isolates}})
@@ -585,7 +667,9 @@ def reduce_group(run_dir: Path, index: int) -> None:
     if done.is_file() and cleaned.is_file(): return
     retained=retained_rows(run_dir,group)
     if len(retained)<2: touch_done(done,{"status":"skipped"}); return
-    isolates=[r["isolate_id"] for r in retained]; initial_path=root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv"; initial=read_tsv(initial_path); by_gene={r["Gene"]:{i:int(r[i]) for i in isolates} for r in initial}; out=root/"03_read_validation"; metrics=[]
+    isolates=[r["isolate_id"] for r in retained]; initial_path=root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv"
+    if not initial_path.is_file(): touch_done(done,{"status":"skipped","reason":"missing_initial_pangenome"}); return
+    initial=read_tsv(initial_path); by_gene={r["Gene"]:{i:int(r[i]) for i in isolates} for r in initial}; out=root/"03_read_validation"; metrics=[]
     for iso in isolates:
         p=out/"evidence"/safe_name(iso)/"metrics.tsv"
         for r in read_tsv(p) if p.is_file() else []:
@@ -638,7 +722,10 @@ def summarize(run_dir: Path) -> None:
         for row in rows:
             if row["group_id"]!=group: continue
             q=read_tsv(find_isolate_qc(run_dir,row))[0]; q={**q,"group_id":group}; iso_rows.append(q)
-    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); touch_done(run_dir/"state"/"summary.done.json",{"groups":len(group_rows)})
+    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows)}
+    if truthy(cfg.get("CLEANUP_TRIMMED_FASTQ","false")):
+        cleanup=cleanup_trimmed_fastqs(run_dir); payload["fastq_cleanup"]={key:value for key,value in cleanup.items() if key!="rows"}
+    touch_done(run_dir/"state"/"summary.done.json",payload)
 
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
     if stage=="slurm_controller": slurm_controller(run_dir,index)

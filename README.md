@@ -65,7 +65,26 @@
 7. **Large scale (≥30 k isolates)**  
    Use `config/cleangene.arc.env` on ARC. It leaves `SLURM_PARTITION` empty and maintains a rolling, capacity-aware preprocessing window of at most 400 submitted tasks. Up to eight array batches may be active, but every submission still respects total user occupancy and QOS headroom. Known organism groups are prioritized smallest first and can enter Panaroo/validation while later groups are still preprocessing. ARC config sets `TAXONOMY_MODE=kraken2`, so Kraken2 QC runs in preprocess workers.
 
-8. **Resume an unfinished run**
+8. **FASTQ QC only / skip trimming**
+
+   To run only read-level QC for supplied FASTQs and avoid assembly storage,
+   skip Shovill. CleanGene records isolate QC and stores stable run-local
+   symlinks to the original FASTQ files for resume and utility lookups.
+
+   ```bash
+   cleangene run \
+       --manifest input/manifest.tsv \
+       --analysis-root ~/cleangene-output \
+       --config config/cleangene.arc.env \
+       --skip_shovill \
+       --skip_trim
+   ```
+
+   Equivalent config options are `SKIP_SHOVILL=true` and `SKIP_TRIM=true`.
+   `--skip_trim` is also useful on full runs when you want to skip fastp
+   adapter trimming but still assemble with Shovill from the original reads.
+
+9. **Resume an unfinished run**
 
    ```bash
    cleangene run \
@@ -78,7 +97,7 @@
 
    Each completed organism/group publishes its final read-validated presence/absence matrix at `results/groups/<group>/cleaned_pangenome.tsv`. Panaroo intermediates and the detailed BWA validation evidence remain in the numbered subdirectories.
 
-9. **Local debugging** (small tests)
+10. **Local debugging** (small tests)
 
    ```bash
    cleangene run \
@@ -87,7 +106,7 @@
        --profile local
    ```
 
-10. **Downstream analyses**
+11. **Downstream analyses**
 
    Completed runs can submit SLURM-native sample queries, differential-gene tests, operon typing, read-backed variant analysis, and iTOL annotation datasets:
 
@@ -98,5 +117,23 @@
    ```
 
    See [docs/UTILS.md](docs/UTILS.md) for command forms, manifest columns, outputs, and resource controls.
+
+12. **Reclaim trimmed-read storage after a completed run**
+
+   Preview and then replace generated trimmed FASTQ pairs with symlinks to the
+   original manifest FASTQs. The stable paths recorded in `qc.tsv` continue to
+   work for read-backed `cleangene utils` commands.
+
+   ```bash
+   cleangene cleanup --run-dir /path/to/run --dry-run
+   cleangene cleanup --run-dir /path/to/run
+   ```
+
+   For automatic cleanup at the end of future runs, set
+   `CLEANUP_TRIMMED_FASTQ=true` in the run configuration. Cleanup occurs in the
+   final summary job, after all core read consumers finish. FASTQs extracted
+   from raw BAM inputs are retained because they have no original FASTQ target.
+   Details and reclaimed byte counts are written to
+   `results/cohort/fastq_cleanup.tsv`.
 
 > The script is written to work for many hundreds of isolates – the array ranges handle arbitrary sizes, and job dependencies ensure that stages start only after previous ones finish. Adjust defaults in `src/cleangene/defaults.py` if your resources differ.

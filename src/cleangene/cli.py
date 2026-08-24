@@ -2,14 +2,25 @@ from __future__ import annotations
 import argparse, csv, json, os, shutil, subprocess, sys
 from datetime import datetime
 from pathlib import Path
-from .config import read_env
+from .config import read_env, truthy
 from .defaults import SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
 from .slurm import sbatch_cmd, submit
 from .util import atomic_json, command_exists, load_json, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
 from .ux import spinner
-from .workers import dispatch
+from .workers import cleanup_trimmed_fastqs, dispatch
+
+def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
+    cfg=dict(cfg)
+    if getattr(args,"skip_trim",False):
+        cfg["SKIP_TRIM"]="true"
+        cfg["READ_TRIMMING_MODE"]="off"
+    if getattr(args,"skip_shovill",False):
+        cfg["SKIP_SHOVILL"]="true"
+        cfg["SKIP_TRIM"]="true"
+        cfg["READ_TRIMMING_MODE"]="off"
+    return cfg
 
 def validate_fastq_inputs(rows: list[dict[str,str]]) -> None:
     """Lightweight structural validation only; no remote filesystem access."""
@@ -99,7 +110,11 @@ def latest_run(root: Path) -> Path:
     return runs[0]
 
 def check(args) -> int:
-    rows=load_manifest(args.manifest); cfg=read_env(args.config); required=["shovill","prokka","panaroo","bwa","samtools","bcftools","minimap2"]
+    rows=load_manifest(args.manifest); cfg=apply_cli_overrides(read_env(args.config),args); required=[]
+    if truthy(cfg.get("SKIP_SHOVILL","false")):
+        if any(r.get("raw_bam") for r in rows): required.append("samtools")
+    else:
+        required=["shovill","prokka","panaroo","bwa","samtools","bcftools","minimap2"]
     needs_kraken=cfg["TAXONOMY_MODE"] not in {"off","auto"} or any(r.get("grouping_source")=="kraken_pending" for r in rows)
     if needs_kraken: required.append("kraken2")
     if cfg.get("READ_TRIMMING_MODE","auto")=="always": required.append("fastp")
@@ -140,9 +155,10 @@ def shlex_quote(x:str)->str:
 
 def run_command(args) -> int:
     print("Welcome to CleanGene")
-    cfg=read_env(args.config); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
+    cfg=apply_cli_overrides(read_env(args.config),args); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
-        run=load_existing(root,args.resume); cfg=refresh_resume_config(run,args.config)
+        run=load_existing(root,args.resume); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
+        if args.skip_trim or args.skip_shovill: atomic_json(run/"provenance"/"resolved_config.json",cfg)
     else:
         run_id=args.run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=root/"runs"/run_id
     print(f"Run directory: {run}")
@@ -160,7 +176,8 @@ def resume_command(args) -> int:
         root=(args.analysis_root or Path.cwd()).expanduser().resolve()
         run=latest_run(root) if args.latest else load_existing(root,args.run)
     validate_run_dir(run)
-    cfg=refresh_resume_config(run,args.config)
+    cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
+    if args.skip_trim or args.skip_shovill: atomic_json(run/"provenance"/"resolved_config.json",cfg)
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
         invalidated=invalidate_legacy_identity_metrics(run,cfg)
@@ -169,12 +186,25 @@ def resume_command(args) -> int:
     print(f"Run submitted. Please find logs in {run/'logs'/'slurm'}")
     return 0
 
+def cleanup_command(args) -> int:
+    run=args.run_dir.expanduser().resolve(); validate_run_dir(run)
+    if not (run/"state"/"summary.done.json").is_file():
+        raise SystemExit("Cleanup refused: the run has not finished (state/summary.done.json is missing)")
+    result=cleanup_trimmed_fastqs(run,dry_run=args.dry_run)
+    action="would reclaim" if args.dry_run else "reclaimed"
+    print(f"{action} {int(result['bytes_reclaimed'])/1024**3:.2f} GiB")
+    for status,count in result["counts"].items(): print(f"{status}: {count}")
+    if args.dry_run: print("No files were changed. Re-run without --dry-run to apply cleanup.")
+    else: print(f"Report: {run/'results'/'cohort'/'fastq_cleanup.tsv'}")
+    return 0
+
 def main(argv=None) -> int:
     p=argparse.ArgumentParser(prog="cleangene"); sub=p.add_subparsers(dest="cmd",required=True)
-    c=sub.add_parser("check"); c.add_argument("--manifest",type=Path,required=True); c.add_argument("--config",type=Path); c.set_defaults(func=check)
+    c=sub.add_parser("check"); c.add_argument("--manifest",type=Path,required=True); c.add_argument("--config",type=Path); c.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); c.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); c.set_defaults(func=check)
     e=sub.add_parser("estimate"); e.add_argument("--manifest",type=Path,required=True); e.set_defaults(func=estimate)
-    r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.set_defaults(func=run_command)
-    rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--config",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.set_defaults(func=resume_command)
+    r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); r.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); r.set_defaults(func=run_command)
+    rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--config",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); rs.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); rs.set_defaults(func=resume_command)
+    cl=sub.add_parser("cleanup",help="replace retained trimmed FASTQs with links to original FASTQ inputs"); cl.add_argument("--run-dir",type=Path,required=True); cl.add_argument("--dry-run",action="store_true"); cl.set_defaults(func=cleanup_command)
     w=sub.add_parser("_worker"); w.add_argument("--stage",required=True); w.add_argument("--run-dir",type=Path,required=True); w.add_argument("--index",type=int,default=0); w.set_defaults(func=lambda a:(dispatch(a.stage,a.run_dir,a.index),0)[1])
     uw=sub.add_parser("_utils_worker"); uw.add_argument("--request",type=Path,required=True); uw.set_defaults(func=lambda a:(__import__("cleangene.downstream",fromlist=["run_request"]).run_request(a.request),0)[1])
     add_utils_parser(sub)
