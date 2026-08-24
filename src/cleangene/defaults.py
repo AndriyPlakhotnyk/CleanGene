@@ -10,6 +10,8 @@ SCIENTIFIC_DEFAULTS = {
     "READ_TRIMMING_MODE": "auto",
     "SKIP_TRIM": "false",
     "SKIP_SHOVILL": "false",
+    "ASSEMBLER": "shovill",
+    "SPADES_MEMORY_GB": "28",
     "COMPRESS_ASSEMBLY_OUTPUTS": "off",
     "COMPRESS_ANNOTATION_OUTPUTS": "off",
     "BASEQUAL": "30",

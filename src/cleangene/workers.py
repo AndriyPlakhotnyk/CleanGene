@@ -3,7 +3,7 @@ import csv, fcntl, gzip, hashlib, os, shutil, sys, tempfile, time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from .config import truthy
+from .config import assembler_mode, truthy
 from .defaults import DEFAULTS
 from .evidence import validate_isolate, validation_decision_logic_rows
 from .fasta import assembly_metrics
@@ -15,7 +15,7 @@ from .util import command_exists, load_json, read_tsv, run, safe_name, touch_don
 
 STAGE_DESCRIPTIONS = (
     ("kraken_db_setup", "prepare the shared Kraken2 database when required"),
-    ("preprocess", "check/trim adapters, run Kraken2 QC, optionally assemble with Shovill, and annotate with Prokka"),
+    ("preprocess", "check/trim adapters, run Kraken2 QC, optionally assemble with Shovill or direct SPAdes, and annotate with Prokka"),
     ("resolve_groups", "resolve organism groups and order the smallest groups first"),
     ("panaroo", "build and clean each group pangenome with Panaroo"),
     ("prepare_validation", "select genes and recover pangenome reference sequences"),
@@ -39,6 +39,9 @@ def manifest_row_for_task(task: dict[str,str], rows: list[dict[str,str]]) -> dic
     matches=[r for r in rows if r["isolate_id"]==task["isolate_id"]]
     if len(matches)!=1: raise SystemExit(f"Could not resolve manifest row for isolate {task['isolate_id']}")
     return {**matches[0], **task}
+
+def user_excluded(row: dict[str,str]) -> bool:
+    return truthy(row.get("user_excluded","false")) or truthy(row.get("exclude","false"))
 
 def shlex_quote(x: str) -> str:
     import shlex
@@ -172,7 +175,7 @@ def _compress_assembly_outputs(assembly_dir: Path, assembly: Path, cfg: dict[str
     if mode=="off" or not assembly_dir.is_dir(): return assembly
     for path in sorted(assembly_dir.rglob("*")):
         if not path.is_file() or path.suffix==".gz": continue
-        if path.name=="contigs.fa" and mode!="all": continue
+        if mode!="all" and path.absolute()==assembly.absolute(): continue
         if path.suffix.lower() in {".fa",".fasta",".gfa",".fastg"}: _gzip_file(path)
     gz_assembly=assembly.with_name(assembly.name + ".gz")
     return gz_assembly if mode=="all" and gz_assembly.is_file() else assembly
@@ -188,7 +191,7 @@ def _compress_annotation_outputs(annotation_dir: Path, gff: Path, cfg: dict[str,
 
 def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int]:
     r1=row.get("R1","").strip(); r2=row.get("R2","").strip(); mode=cfg.get("READ_TRIMMING_MODE","auto").strip().lower()
-    if truthy(cfg.get("SKIP_TRIM","false")) or truthy(cfg.get("SKIP_SHOVILL","false")): mode="off"
+    if truthy(cfg.get("SKIP_TRIM","false")) or assembler_mode(cfg) in {"spades","off"}: mode="off"
     method="manifest_fastq"; trimmed=0
     raw_bam=row.get("raw_bam","").strip()
 
@@ -251,6 +254,9 @@ def preprocess(run_dir: Path, index: int) -> None:
         if payload.get("gff"): payload["gff"]=_shared_path(str(payload["gff"]),work_out,out)
         write_tsv(out/"qc.tsv",fields,[data]); touch_done(done,payload); finished=True
     try:
+        if user_excluded(row):
+            metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
+            finish({"isolate_id":iso,"group_id":group,"excluded":1,"reason":"user_excluded","top_species":"","contamination_pct":"","R1":row.get("R1",""),"R2":row.get("R2",""),"raw_bam":row.get("raw_bam",""),"read_preprocessing":"skipped_user_excluded","adapter_trimmed":0,"assembly":"","gff":"",**metrics},{"excluded":True,"reason":"user_excluded"}); return
         r1,r2,read_method,adapter_trimmed=prepare_read_inputs(row,work_out,logs,cfg)
         expected=row.get("organism","").strip(); taxonomy=cfg.get("TAXONOMY_MODE","auto"); excluded=False; top=""; contam=0.0
         taxonomy_enabled=taxonomy not in {"off","auto"} or row.get("grouping_source")=="kraken_pending"
@@ -274,16 +280,21 @@ def preprocess(run_dir: Path, index: int) -> None:
         if external_pangenome and not assembly:
             metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
             finish({**common,"excluded":0,"reason":"","assembly":"","gff":"",**metrics},{"excluded":False,"external_pangenome":row["pangenome_dir"]}); return
-        if truthy(cfg.get("SKIP_SHOVILL","false")) and not assembly:
+        assembler=assembler_mode(cfg)
+        if assembler=="off" and not assembly:
             metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
             finish({**common,"excluded":0,"reason":"shovill_skipped","assembly":"","gff":"",**metrics},{"excluded":False,"status":"shovill_skipped"}); return
         generated_assembly=False
         if not assembly:
-            shov=work_out/"assembly"; shov.mkdir(exist_ok=True); assembly=str(shov/"contigs.fa")
+            shov=work_out/"assembly"; shov.mkdir(exist_ok=True); assembly=str(shov/("contigs.fa" if assembler=="shovill" else "contigs.fasta"))
             generated_assembly=True
             if not Path(assembly).is_file():
-                tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
-                run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
+                if assembler=="shovill":
+                    tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
+                    run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
+                else:
+                    if any(shov.iterdir()): shutil.rmtree(shov)
+                    run(["spades.py","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
         ann=work_out/"annotation"; gff=ann/f"{safe}.gff"
         if not gff.is_file():
             if ann.exists(): shutil.rmtree(ann)
@@ -302,6 +313,7 @@ def retained_rows(run_dir: Path, group: str) -> list[dict[str,str]]:
     _, rows=context(run_dir); result=[]
     for row in rows:
         if row["group_id"]!=group: continue
+        if user_excluded(row): continue
         safe=safe_name(row["isolate_id"]); qc=find_isolate_qc(run_dir,row)
         if not qc.is_file(): raise SystemExit(f"Missing isolate QC: {qc}")
         q=read_tsv(qc)[0]
@@ -391,7 +403,7 @@ def compress_completed_outputs(run_dir: Path) -> dict[str,object]:
             recorded=recorded.absolute() if recorded else recorded
             for path in sorted(assembly_dir.rglob("*")):
                 if not path.is_file() or path.is_symlink() or path.suffix==".gz": continue
-                if path.name=="contigs.fa" and assembly_mode!="all": continue
+                if assembly_mode!="all" and recorded and path.absolute()==recorded: continue
                 if path.suffix.lower() not in {".fa",".fasta",".gfa",".fastg"}: continue
                 before=path.stat().st_size; original=str(path); gz=_gzip_file(path); saved=max(0,before-gz.stat().st_size); reclaimed += saved
                 report.append([iso,"assembly",original,str(gz),saved])
@@ -419,6 +431,10 @@ def resolve_groups(run_dir: Path, index: int | None = None) -> None:
     resolved=[]
     for row in rows:
         row=dict(row)
+        if user_excluded(row):
+            if row.get("grouping_source")=="kraken_pending":
+                row["group_id"]="__user_excluded__"; row["grouping_source"]="user_excluded"
+            resolved.append(row); continue
         if row.get("grouping_source")=="kraken_pending":
             qc=find_isolate_qc(run_dir,row)
             top=read_tsv(qc)[0].get("top_species","").strip() if qc.is_file() else ""
@@ -438,12 +454,16 @@ def resolve_groups(run_dir: Path, index: int | None = None) -> None:
 def orchestrate_downstream(run_dir: Path, index: int | None = None) -> None:
     controller_downstream(run_dir)
 
+def _stage_log_pattern(run_dir: Path, stage: str) -> Path:
+    base=run_dir/"logs"/"slurm"
+    return base/("preprocess" if stage=="preprocess" else "")/f"{stage}.%A_%a.log"
+
 def _controller_cmd(run_dir: Path, cfg: dict[str,str], stage: str, array: str | None, cpus: str, mem: str, time_limit: str) -> list[str]:
     exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
     base=dict(account=cfg["SLURM_ACCOUNT"],partition=cfg["SLURM_PARTITION"])
     idx='${SLURM_ARRAY_TASK_ID}' if array else '0'
     wrap=f"{exe} --stage {stage} --run-dir {shlex_quote(str(run_dir))} --index {idx}"
-    log=run_dir/"logs"/"slurm"/f"{stage}.%A_%a.log"
+    log=_stage_log_pattern(run_dir,stage); log.parent.mkdir(parents=True,exist_ok=True)
     return sbatch_cmd(name=f"cg-{stage}",wrap=wrap,cpus=cpus,mem=mem,time=time_limit,array=array,log=log,**base)
 
 def _indices_spec(indices: list[int], max_parallel: str) -> str:
@@ -483,7 +503,7 @@ def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str
 def _run_single_job(run_dir: Path, cfg: dict[str,str], stage: str, cpus: str, mem: str, time_limit: str, label: str) -> str:
     cmd=_controller_cmd(run_dir,cfg,stage,None,cpus,mem,time_limit)
     jid=submit_with_qos_retry(cmd,cfg,1,label)
-    _wait_jobs([jid],cfg,label,"single job submitted",f"job_id={jid} stage={stage} index=0 log={run_dir/'logs'/'slurm'/(stage + '.%A_%a.log')}")
+    _wait_jobs([jid],cfg,label,"single job submitted",f"job_id={jid} stage={stage} index=0 log={_stage_log_pattern(run_dir,stage)}")
     return jid
 
 def _index_done(run_dir: Path, stage: str, index: int) -> bool:
@@ -531,7 +551,7 @@ class _RollingScheduler:
                 batch.seen=True; batch.missing_polls=0; continue
             batch.missing_polls += 1
             if batch.missing_polls<2: continue
-            details=f"job_id={jid} stage={batch.stage} index={batch.array} log={self.run_dir/'logs'/'slurm'/(batch.stage + '.%A_%a.log')}"
+            details=f"job_id={jid} stage={batch.stage} index={batch.array} log={_stage_log_pattern(self.run_dir,batch.stage)}"
             assert_jobs_succeeded([jid],details)
             missing=[i for i in batch.indices if not _index_done(self.run_dir,batch.stage,i)]
             if missing: raise RuntimeError(f"SLURM job {jid} completed without {batch.stage} markers for indices: {','.join(map(str,missing[:10]))} | {details}")
@@ -793,7 +813,9 @@ def summarize(run_dir: Path) -> None:
         n_genes=max(0,len(read_tsv(val))) if val.is_file() else 0; group_rows.append([group,len([r for r in rows if r["group_id"]==group]),len(retained),n_genes])
         for row in rows:
             if row["group_id"]!=group: continue
-            q=read_tsv(find_isolate_qc(run_dir,row))[0]; q={**q,"group_id":group}; iso_rows.append(q)
+            q=read_tsv(find_isolate_qc(run_dir,row))[0]; q={**q,"group_id":group}
+            if user_excluded(row): q["excluded"]="1"; q["reason"]="user_excluded"
+            iso_rows.append(q)
     cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff"],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows),"storage_cleanup":storage}
     if truthy(cfg.get("CLEANUP_TRIMMED_FASTQ","false")):
         cleanup=cleanup_trimmed_fastqs(run_dir); payload["fastq_cleanup"]={key:value for key,value in cleanup.items() if key!="rows"}

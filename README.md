@@ -60,7 +60,9 @@
    ```
 
 6. **Monitoring**  
-   Job status with `squeue -j <JOB_ID>`. Logs are in `<analysis_root>/runs/<run-id>/logs/slurm/*.log`.
+   Job status with `squeue -j <JOB_ID>`. Controller and downstream logs are in
+   `<run>/logs/slurm/`; individual preprocess logs are grouped under
+   `<run>/logs/slurm/preprocess/`.
 
 7. **Large scale (≥30 k isolates)**  
    Use `config/cleangene.arc.env` on ARC. It leaves `SLURM_PARTITION` empty and maintains a rolling, capacity-aware preprocessing window of at most 400 submitted tasks. Up to eight array batches may be active, but every submission still respects total user occupancy and QOS headroom. Known organism groups are prioritized smallest first and can enter Panaroo/validation while later groups are still preprocessing. ARC config sets `TAXONOMY_MODE=kraken2`, so Kraken2 QC runs in preprocess workers.
@@ -83,6 +85,23 @@
    Equivalent config options are `SKIP_SHOVILL=true` and `SKIP_TRIM=true`.
    `--skip_trim` is also useful on full runs when you want to skip fastp
    adapter trimming but still assemble with Shovill from the original reads.
+
+   `--skip_shovill` is the legacy QC-only option and skips all assembly,
+   including SPAdes. To bypass Shovill but still assemble the original,
+   untrimmed paired FASTQs directly with SPAdes, use:
+
+   ```bash
+   cleangene run \
+       --manifest input/manifest.tsv \
+       --analysis-root ~/cleangene-output \
+       --config config/cleangene.arc.env \
+       --assembler spades
+   ```
+
+   `--assembler shovill` is the default full Shovill workflow;
+   `--assembler off` is equivalent to `--skip_shovill`. Direct SPAdes implies
+   trimming off, invokes `spades.py --only-assembler` to skip SPAdes read-error
+   correction, and stores run-local symlinks to the original FASTQs.
 
    To reduce Shovill assembly storage without skipping assembly, use:
 
@@ -135,6 +154,20 @@
    assembly intermediates and nonessential annotation files, then replaces
    CleanGene's trimmed FASTQs with symlinks to the original manifest FASTQs.
    The original inputs are opened only as symlink targets and are never modified.
+
+   Do not delete rows from a run's `provenance/manifest.tsv`: array task indices
+   and completed state markers must remain stable. Before any downstream
+   pangenome stage starts, exclude samples safely with:
+
+   ```bash
+   cleangene exclude --run-dir /path/to/run --samples-file unwanted_samples.txt
+   ```
+
+   The file contains one isolate ID per line. This marks rows as
+   `user_excluded`, retains provenance and task indices, skips unfinished work
+   for those isolates, and removes already-preprocessed isolates from Panaroo
+   and read validation. If downstream work has already started, CleanGene
+   refuses the change and a new filtered run is required.
 
    Each completed organism/group publishes its final read-validated presence/absence matrix at `results/groups/<group>/cleaned_pangenome.tsv`. Panaroo intermediates and the detailed BWA validation evidence remain in the numbered subdirectories.
 

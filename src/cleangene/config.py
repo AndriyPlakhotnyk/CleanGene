@@ -15,3 +15,10 @@ def read_env(path: Path | None) -> dict[str, str]:
 
 def truthy(value: str | bool | None) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+def assembler_mode(cfg: dict[str,str]) -> str:
+    """Resolve the assembler while preserving legacy SKIP_SHOVILL behavior."""
+    if truthy(cfg.get("SKIP_SHOVILL","false")): return "off"
+    mode=cfg.get("ASSEMBLER","shovill").strip().lower()
+    if mode not in {"shovill","spades","off"}: raise SystemExit("ASSEMBLER must be shovill, spades, or off")
+    return mode
