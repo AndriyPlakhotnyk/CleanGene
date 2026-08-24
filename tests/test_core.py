@@ -434,7 +434,9 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertEqual(scheduler.stage_queue("preprocess"),(1,1))
             output=StringIO()
             with contextlib.redirect_stdout(output): scheduler.progress("preprocess",[0,1,2],"CleanGene preprocess")
-            self.assertIn("running=1 pending=1",output.getvalue())
+            text=output.getvalue()
+            self.assertIn("running=1",text)
+            self.assertIn("slurm_pending=1",text)
 
     def test_qos_retry_recalculates_and_resubmits(self):
         err=RuntimeError("sbatch failed\nstderr: QOSMaxSubmitJobPerUserLimit")
@@ -478,7 +480,12 @@ class CleanGeneCoreTests(unittest.TestCase):
             scheduler=_RollingScheduler(run,cfg); scheduler.snapshot={"total":2,"jobs":{}}; scheduler.submitted={"preprocess":{0,1,2}}
             output=StringIO()
             with contextlib.redirect_stdout(output): scheduler.progress("preprocess",[0,1,2],"CleanGene preprocess")
-            self.assertIn("complete=1/3 submitted=3",output.getvalue())
+            text=output.getvalue()
+            self.assertRegex(text,r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| step=CleanGene preprocess")
+            self.assertIn("total_completed=1",text)
+            self.assertIn("current_step_completed=1/3",text)
+            self.assertIn("total_submitted=3",text)
+            self.assertIn("not_submitted_yet=0",text)
 
     def test_wait_jobs_sleep_branch_has_time_import(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0"}
@@ -523,7 +530,8 @@ class CleanGeneCoreTests(unittest.TestCase):
             with patch("cleangene.workers._controller_pipeline") as pipeline, patch("cleangene.workers._run_single_job") as singles, contextlib.redirect_stdout(output): slurm_controller(run)
             pipeline.assert_called_once_with(run,True)
             self.assertFalse(any("resolve_groups" in str(c) for c in singles.call_args_list))
-            self.assertIn("preprocess: check/trim adapters",output.getvalue())
+            self.assertIn("controller_started",output.getvalue())
+            self.assertIn("stages=kraken_db_setup -> preprocess -> resolve_groups",output.getvalue())
 
     def test_resume_reruns_failed_panaroo_only(self):
         with tempfile.TemporaryDirectory() as d:

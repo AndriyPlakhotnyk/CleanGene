@@ -13,7 +13,7 @@ from .plotting import plot_presence_absence
 from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
-from .ux import completed, waiting
+from .ux import completed, log_line, waiting
 
 STAGE_DESCRIPTIONS = (
     ("kraken_db_setup", "prepare the shared Kraken2 database when required"),
@@ -28,6 +28,10 @@ STAGE_DESCRIPTIONS = (
 )
 
 ARRAY_STAGES = {"preprocess","panaroo","prepare_validation","validate","reduce","plot"}
+
+def _controller_log(message: str, *, ok: bool = False) -> None:
+    color=completed if ok else waiting
+    print(color(log_line(message)),flush=True)
 
 def context(run_dir: Path):
     cfg={**DEFAULTS,**load_json(run_dir/"provenance"/"resolved_config.json")}; rows=read_tsv(run_dir/"provenance"/"manifest.tsv"); return cfg, rows
@@ -661,13 +665,13 @@ def run_resume_maintenance(run_dir: Path, cfg: dict[str,str]) -> dict[str,int]:
             if load_json(marker).get("signature")==signature: return {"legacy_identity_metrics":0,"legacy_isolate_qc":0}
         except (OSError, ValueError):
             pass
-    print(waiting("step=resume maintenance: checking legacy validation and QC markers"),flush=True)
+    _controller_log("step=resume_maintenance | status=checking_legacy_validation_and_qc_markers")
     invalidated=invalidate_legacy_identity_metrics(run_dir,cfg)
     legacy_qc=invalidate_legacy_isolate_qc(run_dir)
     touch_done(marker,{"signature":signature,"legacy_identity_metrics":invalidated,"legacy_isolate_qc":legacy_qc})
-    if invalidated: print(completed(f"step=resume maintenance: invalidated_legacy_identity_metrics={invalidated}"),flush=True)
-    if legacy_qc: print(completed(f"step=resume maintenance: invalidated_legacy_isolate_qc={legacy_qc}"),flush=True)
-    print(completed("step=resume maintenance: completed"),flush=True)
+    if invalidated: _controller_log(f"step=resume_maintenance | invalidated_legacy_identity_metrics={invalidated}",ok=True)
+    if legacy_qc: _controller_log(f"step=resume_maintenance | invalidated_legacy_isolate_qc={legacy_qc}",ok=True)
+    _controller_log("step=resume_maintenance | status=completed",ok=True)
     return {"legacy_identity_metrics":invalidated,"legacy_isolate_qc":legacy_qc}
 
 def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str, details: str = "") -> None:
@@ -676,7 +680,7 @@ def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str
         active=job_active(job_ids)
         current=user_job_count()
         avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
-        print(waiting(f"user jobs: {current}/{cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | step={label}: {complete} | waiting ..."), flush=True)
+        _controller_log(f"step={label} | user_jobs={current}/{cfg['SLURM_USER_JOB_LIMIT']} | available_slots={avail} | total_submitted={len(job_ids)} | total_completed=0 | current_step_completed={complete} | waiting_for_jobs")
         if not active:
             assert_jobs_succeeded(job_ids,details)
             return
@@ -769,8 +773,13 @@ class _RollingScheduler:
         complete=sum(_index_done(self.run_dir,stage,i) for i in total_indices); running,pending=self.stage_queue(stage)
         submitted=len({i for i in total_indices if _index_done(self.run_dir,stage,i)}|self.submitted.get(stage,set()))
         current=int(self.snapshot["total"]); avail=available_slots(int(self.cfg["SLURM_USER_JOB_LIMIT"]),int(self.cfg["SLURM_JOB_HEADROOM"]),current)
-        complete_text=completed(f"complete={complete}/{len(total_indices)} submitted={submitted}")
-        print(waiting(f"user jobs: {current}/{self.cfg['SLURM_USER_JOB_LIMIT']} | available: {avail} | step={label}: ")+complete_text+waiting(f" running={running} pending={pending} failed=0 | waiting/submitting ..."),flush=True)
+        total=len(total_indices); not_submitted=max(0,total-submitted)
+        message=(
+            f"step={label} | user_jobs={current}/{self.cfg['SLURM_USER_JOB_LIMIT']} | available_slots={avail} | "
+            f"total_submitted={submitted} | total_completed={complete} | current_step_completed={complete}/{total} | "
+            f"running={running} | slurm_pending={pending} | not_submitted_yet={not_submitted} | failed=0"
+        )
+        _controller_log(message)
 
     def wait_tick(self) -> None: time.sleep(int(self.cfg["SLURM_POLL_SECONDS"]))
 
@@ -852,8 +861,7 @@ def _controller_lock(run_dir: Path):
 def slurm_controller(run_dir: Path, index: int | None = None) -> None:
     with _controller_lock(run_dir):
         cfg, rows=context(run_dir)
-        print("CleanGene workflow:",flush=True)
-        for stage,description in STAGE_DESCRIPTIONS: print(f"  {stage}: {description}",flush=True)
+        _controller_log(f"controller_started | run_dir={run_dir} | isolates={len(rows)} | stages=" + " -> ".join(stage for stage,_ in STAGE_DESCRIPTIONS))
         run_resume_maintenance(run_dir,cfg)
         if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip() and not _done(run_dir/"state"/"kraken_db_setup.done.json"):
             _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")

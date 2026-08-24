@@ -3,7 +3,7 @@ import shlex, subprocess
 import os, time
 from collections import Counter
 from pathlib import Path
-from .ux import waiting
+from .ux import log_line, waiting
 
 def sbatch_cmd(*, name: str, wrap: str, cpus: str, mem: str, time: str, array: str | None = None, dependency: str | None = None, account: str = "", partition: str = "", log: Path | None = None) -> list[str]:
     cmd=["sbatch","--parsable","--job-name",name,"--cpus-per-task",cpus,"--mem",mem,"--time",time]
@@ -70,7 +70,7 @@ def wait_for_capacity(needed: int, cfg: dict[str,str], *, label: str = "") -> in
     while True:
         current=user_job_count()
         avail=available_slots(limit,headroom,current)
-        print(waiting(f"user jobs: {current}/{limit} | available: {avail} | step={label} | waiting/submitting ..."), flush=True)
+        print(waiting(log_line(f"step={label} | user_jobs={current}/{limit} | available_slots={avail} | waiting_for_capacity | needed={needed}")), flush=True)
         if avail >= needed: return avail
         time.sleep(poll)
 
