@@ -48,7 +48,13 @@ def _map_reads(reference: Path, r1: str, r2: str, out: Path, threads: int, min_m
 
 def _target_support(target: Path | None, label: str, r1: str, r2: str, wanted: set[str], out: Path, threads: int, min_mapq: int) -> tuple[set[str],str]:
     if not target or not target.is_file(): return set(),"unavailable"
-    local=out/f"{label}.fasta"; shutil.copy2(target,local); run(["bwa","index",str(local)]); bam=_map_reads(local,r1,r2,out/f"{label}.bam",threads,min_mapq)
+    local=out/f"{label}.fasta"
+    local.parent.mkdir(parents=True,exist_ok=True)
+    if target.suffix==".gz":
+        with gzip.open(target,"rb") as source, local.open("wb") as sink: shutil.copyfileobj(source,sink)
+    else:
+        shutil.copy2(target,local)
+    run(["bwa","index",str(local)]); bam=_map_reads(local,r1,r2,out/f"{label}.bam",threads,min_mapq)
     result=subprocess.run(["samtools","view",str(bam)],check=True,capture_output=True,text=True)
     mapped={_norm_read(line.split("\t",1)[0]) for line in result.stdout.splitlines() if line}
     return wanted&mapped,str(target)

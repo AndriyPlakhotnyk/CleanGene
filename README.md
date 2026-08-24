@@ -84,6 +84,21 @@
    `--skip_trim` is also useful on full runs when you want to skip fastp
    adapter trimming but still assemble with Shovill from the original reads.
 
+   To reduce Shovill assembly storage without skipping assembly, use:
+
+   ```bash
+   cleangene run \
+       --manifest input/manifest.tsv \
+       --analysis-root ~/cleangene-output \
+       --config config/cleangene.arc.env \
+       --compress_assembly_outputs intermediates
+   ```
+
+   `COMPRESS_ASSEMBLY_OUTPUTS=intermediates` gzips Shovill/SPAdes leftover
+   FASTA/GFA files such as `spades.fasta` and `spades.gfa`, while keeping the
+   final `contigs.fa` plain. `COMPRESS_ASSEMBLY_OUTPUTS=all` also gzips
+   `contigs.fa` and records `contigs.fa.gz` in isolate QC.
+
 9. **Resume an unfinished run**
 
    ```bash

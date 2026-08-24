@@ -1,5 +1,5 @@
 from __future__ import annotations
-import csv, fcntl, hashlib, os, shutil, sys, tempfile, time
+import csv, fcntl, gzip, hashlib, os, shutil, sys, tempfile, time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -155,6 +155,28 @@ def _link_manifest_fastqs(reads: Path, r1: str, r2: str) -> tuple[str,str]:
     _replace_symlink(link2,Path(r2).expanduser().resolve())
     return str(link1),str(link2)
 
+def _gzip_file(path: Path) -> Path:
+    gz=path.with_name(path.name + ".gz")
+    if gz.is_file(): return gz
+    tmp=gz.with_name(f".{gz.name}.tmp-{os.getpid()}")
+    with path.open("rb") as source, gzip.open(tmp,"wb",compresslevel=6) as target:
+        shutil.copyfileobj(source,target)
+    os.replace(tmp,gz)
+    path.unlink()
+    return gz
+
+def _compress_assembly_outputs(assembly_dir: Path, assembly: Path, cfg: dict[str,str]) -> Path:
+    mode=cfg.get("COMPRESS_ASSEMBLY_OUTPUTS","off").strip().lower()
+    if mode not in {"off","intermediates","all"}:
+        raise SystemExit("COMPRESS_ASSEMBLY_OUTPUTS must be off, intermediates, or all")
+    if mode=="off" or not assembly_dir.is_dir(): return assembly
+    for path in sorted(assembly_dir.rglob("*")):
+        if not path.is_file() or path.suffix==".gz": continue
+        if path.name=="contigs.fa" and mode!="all": continue
+        if path.suffix.lower() in {".fa",".fasta",".gfa",".fastg"}: _gzip_file(path)
+    gz_assembly=assembly.with_name(assembly.name + ".gz")
+    return gz_assembly if mode=="all" and gz_assembly.is_file() else assembly
+
 def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int]:
     r1=row.get("R1","").strip(); r2=row.get("R2","").strip(); mode=cfg.get("READ_TRIMMING_MODE","auto").strip().lower()
     if truthy(cfg.get("SKIP_TRIM","false")) or truthy(cfg.get("SKIP_SHOVILL","false")): mode="off"
@@ -246,8 +268,10 @@ def preprocess(run_dir: Path, index: int) -> None:
         if truthy(cfg.get("SKIP_SHOVILL","false")) and not assembly:
             metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
             finish({**common,"excluded":0,"reason":"shovill_skipped","assembly":"","gff":"",**metrics},{"excluded":False,"status":"shovill_skipped"}); return
+        generated_assembly=False
         if not assembly:
             shov=work_out/"assembly"; shov.mkdir(exist_ok=True); assembly=str(shov/"contigs.fa")
+            generated_assembly=True
             if not Path(assembly).is_file():
                 tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
                 run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
@@ -255,7 +279,9 @@ def preprocess(run_dir: Path, index: int) -> None:
         if not gff.is_file():
             if ann.exists(): shutil.rmtree(ann)
             run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
-        metrics=assembly_metrics(Path(assembly)); data={**common,"excluded":0,"reason":"","assembly":assembly,"gff":str(gff),**metrics}
+        metrics=assembly_metrics(Path(assembly))
+        if generated_assembly: assembly=str(_compress_assembly_outputs(Path(assembly).parent,Path(assembly),cfg))
+        data={**common,"excluded":0,"reason":"","assembly":assembly,"gff":str(gff),**metrics}
         finish(data,{"excluded":False,"gff":str(gff)})
     finally:
         if scratch:

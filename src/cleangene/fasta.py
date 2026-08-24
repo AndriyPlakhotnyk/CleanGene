@@ -1,9 +1,11 @@
 from __future__ import annotations
+import gzip
 from pathlib import Path
 
 def read_fasta(path: Path) -> dict[str, str]:
     records: dict[str, list[str]] = {}; name = ""
-    with path.open(errors="replace") as handle:
+    handle_cm = gzip.open(path, "rt", errors="replace") if path.suffix == ".gz" else path.open(errors="replace")
+    with handle_cm as handle:
         for raw in handle:
             line = raw.strip()
             if not line: continue

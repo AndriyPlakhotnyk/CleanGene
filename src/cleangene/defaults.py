@@ -10,6 +10,7 @@ SCIENTIFIC_DEFAULTS = {
     "READ_TRIMMING_MODE": "auto",
     "SKIP_TRIM": "false",
     "SKIP_SHOVILL": "false",
+    "COMPRESS_ASSEMBLY_OUTPUTS": "off",
     "BASEQUAL": "30",
     "TAXONOMY_MODE": "auto",
     "MAJOR_CONTAMINATION_THRESHOLD": "5",

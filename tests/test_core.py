@@ -1,4 +1,4 @@
-import os, tempfile, unittest
+import gzip, os, tempfile, unittest
 from pathlib import Path
 from io import StringIO
 import contextlib
@@ -43,6 +43,9 @@ class CleanGeneCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/"x.fa"; p.write_text(">a\nAAAA\n>b\nGGNN\n")
             m=assembly_metrics(p); self.assertEqual(m["assembly_length"],8); self.assertEqual(m["contigs"],2); self.assertEqual(m["ambiguous_bases"],2)
+            gz=Path(d)/"x.fa.gz"
+            with gzip.open(gz,"wt") as handle: handle.write(p.read_text())
+            self.assertEqual(assembly_metrics(gz),m)
 
     def test_validation_classification_preserves_unresolved_identity(self):
         d=classify_gene_evidence(mapped_reads=274,breadth=0.998255,mean_depth=59.8726,identity=None,min_breadth=0.90,min_depth=5,min_identity=0.95)
@@ -139,6 +142,32 @@ class CleanGeneCoreTests(unittest.TestCase):
                 self.assertEqual(row["assembly"],"")
                 self.assertEqual(row["gff"],"")
             self.assertTrue((run/"state"/"summary.done.json").is_file())
+
+    def test_compress_assembly_outputs_updates_qc_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); r1=root/"r1.fastq.gz"; r2=root/"r2.fastq.gz"
+            r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
+            manifest=root/"manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tR1\tR2\niso1\tg\t{r1}\t{r2}\n")
+            cfg={"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","COMPRESS_ASSEMBLY_OUTPUTS":"all","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+            run=make_run(manifest,root,cfg,"r")
+            def fake_run(command,**kwargs):
+                if command[0]=="shovill":
+                    out=Path(command[command.index("--outdir")+1]); out.mkdir(parents=True,exist_ok=True)
+                    (out/"contigs.fa").write_text(">c1\nACGT\n")
+                    (out/"spades.fasta").write_text(">s1\nACGT\n")
+                    (out/"spades.gfa").write_text("H\tVN:Z:1.0\n")
+                elif command[0]=="prokka":
+                    out=Path(command[command.index("--outdir")+1]); prefix=command[command.index("--prefix")+1]; out.mkdir(parents=True,exist_ok=True)
+                    (out/f"{prefix}.gff").write_text("##gff-version 3\n")
+            with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run,0)
+            qc=read_tsv(run/"results"/"groups"/"g"/"01_isolates"/"iso1"/"qc.tsv")[0]
+            assembly=Path(qc["assembly"])
+            self.assertEqual(assembly.name,"contigs.fa.gz")
+            self.assertTrue(assembly.is_file())
+            self.assertFalse((assembly.parent/"contigs.fa").exists())
+            self.assertTrue((assembly.parent/"spades.fasta.gz").is_file())
+            self.assertTrue((assembly.parent/"spades.gfa.gz").is_file())
+            self.assertEqual(assembly_metrics(assembly)["assembly_length"],4)
 
     def test_normalize_panaroo_accepts_safe_isolate_names(self):
         with tempfile.TemporaryDirectory() as d:

@@ -82,3 +82,12 @@ fastp outputs with symlinks to the original manifest FASTQs. Read-backed
 utilities keep using the paths recorded in isolate QC, but after cleanup they
 analyze the original untrimmed reads. The same cleanup can be applied to a
 completed older run with `cleangene cleanup --run-dir /path/to/run`.
+
+Assembly compression is controlled during preprocessing with
+`COMPRESS_ASSEMBLY_OUTPUTS=off|intermediates|all`, or the matching
+`--compress_assembly_outputs` CLI option on `run`/`resume`. The
+`intermediates` mode compresses Shovill/SPAdes leftovers such as
+`spades.fasta` and `spades.gfa` and does not affect downstream utilities. The
+`all` mode also compresses the final `contigs.fa`; CleanGene records
+`contigs.fa.gz` in QC and its variant/diagnostic utilities can read that
+compressed assembly path.
