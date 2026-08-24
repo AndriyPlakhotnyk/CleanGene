@@ -171,6 +171,14 @@
 
    Each completed organism/group publishes its final read-validated presence/absence matrix at `results/groups/<group>/cleaned_pangenome.tsv`. Panaroo intermediates and the detailed BWA validation evidence remain in the numbered subdirectories.
 
+   After organism resolution, CleanGene also creates a storage-free isolate
+   index at `results/organisms/<organism>/<isolate_id>`. Each isolate entry is a
+   relative symlink to its complete directory under `results/groups`, exposing
+   its annotation, assembly, reads, QC, and per-isolate logs without copying
+   them. `results/cohort/organism_isolate_index.tsv` records the display names,
+   symlink paths, and canonical targets. The index is refreshed during final
+   summary and is safe to regenerate when resuming a run.
+
 10. **Local debugging** (small tests)
 
    ```bash

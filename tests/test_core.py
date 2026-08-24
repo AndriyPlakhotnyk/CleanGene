@@ -8,12 +8,33 @@ from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, preprocess, reduce_group, slurm_controller, task_row
 from cleangene.cli import apply_cli_overrides, exclude_command, invalidate_legacy_identity_metrics, local, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
 
 class CleanGeneCoreTests(unittest.TestCase):
+    def test_organism_results_index_links_complete_isolate_directories(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; source=run/"results"/"groups"/"pending"/"01_isolates"/"BI_06_0500"
+            (source/"assembly").mkdir(parents=True); (source/"annotation").mkdir(); (source/"logs").mkdir()
+            (source/"assembly"/"contigs.fa").write_text(">c\nACGT\n"); (source/"annotation"/"BI_06_0500.gff").write_text("##gff-version 3\n"); (source/"logs"/"prokka.stderr").write_text("")
+            atomic_json(run/"provenance"/"resolved_config.json",{})
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","organism"],[["BI_06_0500","pending","Expected species"]])
+            write_tsv(source/"qc.tsv",["isolate_id","top_species"],[["BI_06_0500","Identified species"]])
+            result=build_organism_results_index(run); link=run/"results"/"organisms"/"Identified_species"/"BI_06_0500"
+            self.assertEqual(result,{"organisms":1,"isolates":1}); self.assertTrue(link.is_symlink()); self.assertEqual(link.resolve(),source.resolve())
+            self.assertEqual((link/"assembly"/"contigs.fa").read_text(),">c\nACGT\n"); self.assertTrue((link/"annotation"/"BI_06_0500.gff").is_file()); self.assertTrue((link/"logs"/"prokka.stderr").is_file())
+            index=read_tsv(run/"results"/"cohort"/"organism_isolate_index.tsv"); self.assertEqual(index[0]["organism"],"Identified species"); self.assertEqual(index[0]["isolate_id"],"BI_06_0500")
+
+    def test_organism_results_index_refreshes_stale_links_and_uses_manifest_fallback(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; source=run/"results"/"groups"/"g"/"01_isolates"/"BI_1"; source.mkdir(parents=True)
+            atomic_json(run/"provenance"/"resolved_config.json",{}); write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","organism"],[["BI_1","g","Manifest species"]]); write_tsv(source/"qc.tsv",["isolate_id","top_species"],[["BI_1",""]])
+            stale=run/"results"/"organisms"/"Old_species"/"BI_1"; stale.parent.mkdir(parents=True); stale.symlink_to(source)
+            build_organism_results_index(run)
+            self.assertFalse(stale.is_symlink()); self.assertTrue((run/"results"/"organisms"/"Manifest_species"/"BI_1").is_symlink()); self.assertFalse(stale.parent.exists())
+
     def test_cleanup_replaces_trimmed_fastqs_with_original_links(self):
         with tempfile.TemporaryDirectory() as d:
             run=Path(d)/"run"; group="g"; iso="iso1"; original=Path(d)/"input"; original.mkdir()

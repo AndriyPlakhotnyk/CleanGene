@@ -493,6 +493,33 @@ def group_size_class(n: int, cfg: dict[str,str]) -> str:
     if n <= int(cfg.get("PANAROO_MEDIUM_MAX_ISOLATES","2000")): return "medium"
     return "large"
 
+def build_organism_results_index(run_dir: Path) -> dict[str,int]:
+    """Expose each complete isolate tree under its identified organism without copying data."""
+    _,rows=context(run_dir); root=run_dir/"results"/"organisms"; root.mkdir(parents=True,exist_ok=True)
+    records=[]; desired=set(); names={}
+    for row in rows:
+        qc=find_isolate_qc(run_dir,row)
+        if not qc.is_file(): continue
+        values=read_tsv(qc)
+        if not values: continue
+        q=values[0]; organism=(q.get("top_species","").strip() or row.get("organism","").strip()
+            or (row.get("group_id","").strip() if not row.get("group_id","").startswith("__") else "") or "unclassified")
+        organism_dir=root/safe_name(organism); link=organism_dir/safe_name(row["isolate_id"]); key=(organism_dir.name,link.name)
+        previous=names.get(key)
+        if previous and previous!=(organism,row["isolate_id"]):
+            raise SystemExit(f"Organism results path collision: {previous} and {(organism,row['isolate_id'])}")
+        names[key]=(organism,row["isolate_id"]); source=qc.parent.resolve(); organism_dir.mkdir(parents=True,exist_ok=True)
+        if link.exists() and not link.is_symlink(): raise SystemExit(f"Refusing to replace non-symlink organism result path: {link}")
+        relative=Path(os.path.relpath(source,link.parent)); _replace_symlink(link,relative); desired.add(link)
+        records.append([organism,row["isolate_id"],str(link),str(source)])
+    for path in root.glob("*/*"):
+        if path.is_symlink() and path not in desired: path.unlink()
+    for directory in root.iterdir():
+        if directory.is_dir() and not directory.is_symlink() and not any(directory.iterdir()): directory.rmdir()
+    write_tsv(run_dir/"results"/"cohort"/"organism_isolate_index.tsv",
+        ["organism","isolate_id","symlink","target"],records)
+    return {"organisms":len({row[0] for row in records}),"isolates":len(records)}
+
 def resolve_groups(run_dir: Path, index: int | None = None) -> None:
     cfg, rows=context(run_dir)
     resolved=[]
@@ -516,7 +543,8 @@ def resolve_groups(run_dir: Path, index: int | None = None) -> None:
     write_resolved(run_dir/"provenance"/"manifest.tsv",resolved)
     write_tsv(run_dir/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in resolved))
     write_tsv(run_dir/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],([g,counts[g],group_size_class(counts[g],cfg)] for g in ordered))
-    touch_done(run_dir/"state"/"resolve_groups.done.json",{"groups":len(ordered),"order":"smallest_first"})
+    organism_index=build_organism_results_index(run_dir)
+    touch_done(run_dir/"state"/"resolve_groups.done.json",{"groups":len(ordered),"order":"smallest_first","organism_index":organism_index})
 
 def orchestrate_downstream(run_dir: Path, index: int | None = None) -> None:
     controller_downstream(run_dir)
@@ -883,7 +911,7 @@ def summarize(run_dir: Path) -> None:
             q=read_tsv(find_isolate_qc(run_dir,row))[0]; q={**q,"group_id":group}
             if user_excluded(row): q["excluded"]="1"; q["reason"]="user_excluded"
             iso_rows.append(q)
-    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows),"storage_cleanup":storage}
+    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows),"storage_cleanup":storage,"organism_index":build_organism_results_index(run_dir)}
     if truthy(cfg.get("CLEANUP_TRIMMED_FASTQ","false")):
         cleanup=cleanup_trimmed_fastqs(run_dir); payload["fastq_cleanup"]={key:value for key,value in cleanup.items() if key!="rows"}
     touch_done(run_dir/"state"/"summary.done.json",payload)
