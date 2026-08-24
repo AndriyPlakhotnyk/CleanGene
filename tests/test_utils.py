@@ -87,7 +87,7 @@ class CleanGeneUtilsTests(unittest.TestCase):
             run=self.make_run(Path(d)); stdout=StringIO()
             with contextlib.redirect_stdout(stdout):
                 code=main(["utils","get-samples","--run-dir",str(run),"--analysis-name","query","--organism","Species one","--genes","gA"])
-            self.assertEqual(code,0); text=stdout.getvalue(); self.assertIn("Welcome to CleanGene Utils",text); self.assertIn(f"Located run: {run}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Analysis submitted. Please find logs in",text)
+            self.assertEqual(code,0); text=stdout.getvalue(); self.assertIn("Welcome to CleanGene Utils!",text); self.assertIn(f"Located run: {run}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Analysis submitted. Please find logs in",text)
             command=submit_job.call_args.args[0]; self.assertEqual(command[0],"sbatch"); self.assertIn("_utils_worker",command[-1])
             request=json.loads((run/"results"/"utils"/"query"/"request.json").read_text()); self.assertEqual(request["slurm_job_id"],"123")
 
@@ -103,7 +103,7 @@ class CleanGeneUtilsTests(unittest.TestCase):
             root=Path(d); manifest=root/"manifest.tsv"; manifest.write_text("isolate_id\torganism\tR1\tR2\ni1\tSpecies one\t/r1.fastq.gz\t/r2.fastq.gz\n")
             stdout=StringIO()
             with contextlib.redirect_stdout(stdout): main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","messages","--dry-run"])
-            text=stdout.getvalue(); self.assertIn("Welcome to CleanGene",text); self.assertIn(f"Run directory: {root/'runs'/'messages'}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Run submitted. Please find logs in",text)
+            text=stdout.getvalue(); self.assertIn("Welcome to CleanGene",text); self.assertIn(f"Run directory: {root/'runs'/'messages'}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Run submitted. Please find logs in",text); self.assertIn("Welcome to CleanGene, You Grace.",text)
 
     def test_resume_submits_without_login_side_legacy_scans(self):
         with tempfile.TemporaryDirectory() as d:
@@ -114,6 +114,6 @@ class CleanGeneUtilsTests(unittest.TestCase):
             stdout=StringIO()
             with patch("cleangene.cli.slurm",return_value="123") as submit_job, patch("cleangene.cli.invalidate_legacy_identity_metrics",side_effect=AssertionError("slow identity scan ran")), patch("cleangene.cli.invalidate_legacy_isolate_qc",side_effect=AssertionError("slow QC scan ran")), contextlib.redirect_stdout(stdout):
                 self.assertEqual(main(["resume","--run-dir",str(run)]),0)
-            self.assertEqual(submit_job.call_count,1); text=stdout.getvalue(); self.assertIn("legacy checks will run inside the controller job",text); self.assertIn("Run submitted. Please find logs in",text)
+            self.assertEqual(submit_job.call_count,1); text=stdout.getvalue(); self.assertIn("legacy checks will run inside the controller job",text); self.assertIn("Run submitted. Please find logs in",text); self.assertIn("Welcome to CleanGene, You Grace.",text)
 
 if __name__=="__main__": unittest.main()

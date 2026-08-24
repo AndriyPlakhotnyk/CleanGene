@@ -9,7 +9,7 @@ from .qc import ensure_qc_provenance, prepare_qc_provenance, resolve_threshold_r
 from .slurm import sbatch_cmd, submit
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
-from .ux import submitted, spinner, waiting, welcome
+from .ux import clean_gene_banner, submitted, spinner, waiting, welcome
 from .workers import cleanup_trimmed_fastqs, dispatch, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, run_resume_maintenance
 
 def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
@@ -157,7 +157,9 @@ def run_command(args) -> int:
             if args.resume: run_resume_maintenance(run,cfg)
             local(run)
         else: slurm(run,cfg,args.dry_run)
-    if args.profile=="slurm": print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
+    if args.profile=="slurm":
+        print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
+        print(clean_gene_banner())
     return 0
 
 def resume_command(args) -> int:
@@ -175,6 +177,7 @@ def resume_command(args) -> int:
         print(waiting("step=resume: submitting controller; legacy checks will run inside the controller job"),flush=True)
         slurm(run,cfg,args.dry_run)
     print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
+    print(clean_gene_banner())
     return 0
 
 def cleanup_command(args) -> int:
