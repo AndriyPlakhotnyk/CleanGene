@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, truthy
+from .completion import find_isolate_qc_candidates, reconcile_preprocess_outputs, validate_preprocess_completion
 from .defaults import DEFAULTS
 from .evidence import validate_isolate, validation_decision_logic_rows
 from .fasta import assembly_metrics
@@ -290,6 +291,12 @@ def preprocess(run_dir: Path, index: int) -> None:
     if done.is_file():
         status=load_json(done)
         if status.get("excluded") or status.get("external_pangenome") or (status.get("qc_status") and (out/"qc.tsv").is_file()) or (out/"annotation"/f"{safe}.gff").is_file(): return
+    guard=validate_preprocess_completion(run_dir,cfg,row,find_isolate_qc_candidates(run_dir,iso))
+    if guard.state=="complete":
+        touch_done(done,guard.marker_payload or {})
+        return
+    if guard.state=="inconsistent" and not truthy(cfg.get("RESUME_REPROCESS_INCONSISTENT_PREPROCESS","false")):
+        raise SystemExit(f"Inconsistent preprocess output for isolate {iso}: {guard.reason}. Remove/repair the output or set RESUME_REPROCESS_INCONSISTENT_PREPROCESS=true.")
     out.mkdir(parents=True,exist_ok=True); scratch=_preprocess_scratch(cfg,run_dir,iso); work_out=(scratch/"output") if scratch else out; work_out.mkdir(parents=True,exist_ok=True); logs=work_out/"logs"; logs.mkdir(exist_ok=True)
     fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","read_processing_decision","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS]
     thresholds=dict(record.get("qc_thresholds_resolved") or {})
@@ -911,6 +918,13 @@ def slurm_controller(run_dir: Path, index: int | None = None) -> None:
         migrated=migrate_isolate_task_store(run_dir)
         if migrated: _controller_log(f"step=prepare_tasks | migrated_isolate_task_store={migrated}",ok=True)
         run_resume_maintenance(run_dir,cfg)
+        try:
+            snapshot=user_queue_snapshot()
+        except (OSError, subprocess.SubprocessError) as error:
+            _controller_log(f"step=preprocess_reconciliation | active_snapshot_unavailable={error}")
+            snapshot={"total":0,"jobs":{},"entries":[]}
+        reconcile=reconcile_preprocess_outputs(run_dir,cfg,read_tsv(run_dir/"state"/"isolate_tasks.tsv"),snapshot)
+        _controller_log("step=preprocess_reconciliation | " + " | ".join(f"{key}={reconcile[key]}" for key in ("total","marker_complete","output_recovered","active","incomplete","inconsistent")),ok=reconcile.get("inconsistent",0)==0)
         if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip() and not _done(run_dir/"state"/"kraken_db_setup.done.json"):
             _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
             cfg,rows=context(run_dir)

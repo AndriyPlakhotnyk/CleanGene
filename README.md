@@ -172,6 +172,27 @@
    CleanGene's trimmed FASTQs with symlinks to the original manifest FASTQs.
    The original inputs are opened only as symlink targets and are never modified.
 
+   On resume, the SLURM controller reconciles missing preprocess markers against
+   existing terminal isolate QC outputs before submitting new preprocess arrays.
+   It scans `results/groups/*/01_isolates/*/qc.tsv` once, writes
+   `state/preprocess/reconciliation.tsv`, and recreates missing
+   `state/preprocess/<isolate>.done.json` markers only when the QC row is a
+   valid terminal result. A retained internal PASS/WARNING isolate must have
+   readable nonzero assembly and GFF files; terminal FAIL/excluded isolates,
+   external-pangenome isolates, and `ASSEMBLER=off` isolates do not require
+   assembly/GFF for marker recovery. Ambiguous, malformed, multirow, wrong
+   isolate, or legacy QC output stops before any `sbatch` submission.
+
+   Example controller summary:
+
+   ```text
+   step=preprocess_reconciliation | total=30000 | marker_complete=26000 | output_recovered=3465 | active=20 | incomplete=515 | inconsistent=0
+   ```
+
+   To deliberately reprocess inconsistent isolates without deleting their old
+   outputs, set `RESUME_REPROCESS_INCONSISTENT_PREPROCESS=true`. The default is
+   `false` so questionable evidence fails closed.
+
    Do not delete rows from a run's `provenance/manifest.tsv`: array task indices
    and completed state markers must remain stable. Before any downstream
    pangenome stage starts, exclude samples safely with:
