@@ -9,7 +9,8 @@ from cleangene.completion import reconcile_preprocess_outputs, validate_preproce
 from cleangene.defaults import DEFAULTS
 from cleangene.qc import QC_OUTPUT_FIELDS
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import slurm_controller
+from cleangene.cli import main as cli_main
+from cleangene.workers import _ActiveBatch, _RollingScheduler, slurm_controller
 
 
 class CompletionReconciliationTests(unittest.TestCase):
@@ -61,7 +62,7 @@ class CompletionReconciliationTests(unittest.TestCase):
             marker = run / "state" / "preprocess" / "BI_0000.done.json"
             self.assertEqual(counts["output_recovered"], 1)
             self.assertTrue(marker.is_file())
-            self.assertEqual(read_tsv(run / "state" / "preprocess" / "reconciliation.tsv")[0]["qc_path"], str(qc))
+            self.assertEqual(read_tsv(run / "state" / "preprocess_reconciliation.tsv")[0]["qc_path"], str(qc))
 
     def test_terminal_fail_or_excluded_does_not_require_assembly_gff(self):
         with tempfile.TemporaryDirectory() as d:
@@ -109,7 +110,7 @@ class CompletionReconciliationTests(unittest.TestCase):
                 self.write_qc(run, "BI_0000", **kwargs)
                 with self.assertRaises(SystemExit):
                     reconcile_preprocess_outputs(run, DEFAULTS, rows, {"entries": []})
-                self.assertEqual(read_tsv(run / "state" / "preprocess" / "reconciliation.tsv")[0]["state"], "inconsistent")
+                self.assertEqual(read_tsv(run / "state" / "preprocess_reconciliation.tsv")[0]["state"], "inconsistent")
         with tempfile.TemporaryDirectory() as d:
             run, rows = self.make_run(Path(d))
             self.write_qc(run, "BI_9999")
@@ -119,12 +120,45 @@ class CompletionReconciliationTests(unittest.TestCase):
     def test_multiple_qc_candidates_are_inconsistent_unless_override(self):
         with tempfile.TemporaryDirectory() as d:
             run, rows = self.make_run(Path(d), cfg={"RESUME_REPROCESS_INCONSISTENT_PREPROCESS": "true"})
-            self.write_qc(run, "BI_0000", group="g")
+            rows[0]["group_id"] = "new_group"
             self.write_qc(run, "BI_0000", group="old")
+            self.write_qc(run, "BI_0000", group="older")
             cfg = {**DEFAULTS, "RESUME_REPROCESS_INCONSISTENT_PREPROCESS": "true"}
             counts = reconcile_preprocess_outputs(run, cfg, rows, {"entries": []})
             self.assertEqual(counts["inconsistent"], 1)
             self.assertFalse((run / "state" / "preprocess" / "BI_0000.done.json").exists())
+
+    def test_expected_group_candidate_wins_over_fallback_duplicates(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, rows = self.make_run(Path(d))
+            self.write_qc(run, "BI_0000", group="g")
+            self.write_qc(run, "BI_0000", group="old")
+            counts = reconcile_preprocess_outputs(run, DEFAULTS, rows, {"entries": []})
+            report = read_tsv(run / "state" / "preprocess_reconciliation.tsv")
+            self.assertEqual(counts["output_recovered"], 1)
+            self.assertIn("/g/01_isolates/", report[0]["qc_path"])
+
+    def test_malformed_marker_is_quarantined_and_recreated_from_valid_outputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, rows = self.make_run(Path(d))
+            marker = run / "state" / "preprocess" / "BI_0000.done.json"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("{not-json")
+            self.write_qc(run, "BI_0000")
+            counts = reconcile_preprocess_outputs(run, DEFAULTS, rows, {"entries": []})
+            self.assertEqual(counts["output_recovered"], 1)
+            self.assertTrue(marker.is_file())
+            self.assertTrue(list(marker.parent.glob("BI_0000.done.json.stale.*")))
+
+    def test_stale_marker_is_quarantined_when_outputs_are_incomplete(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, rows = self.make_run(Path(d))
+            marker = run / "state" / "preprocess" / "BI_0000.done.json"
+            atomic_json(marker, {"status": "complete"})
+            counts = reconcile_preprocess_outputs(run, DEFAULTS, rows, {"entries": []})
+            self.assertEqual(counts["incomplete"], 1)
+            self.assertFalse(marker.exists())
+            self.assertTrue(list(marker.parent.glob("BI_0000.done.json.stale.*")))
 
     def test_active_old_preprocess_task_is_not_classified_from_partial_qc(self):
         with tempfile.TemporaryDirectory() as d:
@@ -143,7 +177,7 @@ class CompletionReconciliationTests(unittest.TestCase):
             counts = reconcile_preprocess_outputs(run, DEFAULTS, rows, {"entries": []})
             self.assertEqual(counts["output_recovered"], 900)
             self.assertEqual(counts["incomplete"], 100)
-            report = read_tsv(run / "state" / "preprocess" / "reconciliation.tsv")
+            report = read_tsv(run / "state" / "preprocess_reconciliation.tsv")
             self.assertEqual(sum(1 for row in report if row["state"] == "incomplete"), 100)
 
     def test_controller_stops_before_sbatch_on_inconsistent_output(self):
@@ -154,6 +188,37 @@ class CompletionReconciliationTests(unittest.TestCase):
                  patch("cleangene.workers.submit_with_qos_retry", side_effect=AssertionError("sbatch called")):
                 with self.assertRaises(SystemExit):
                     slurm_controller(run)
+
+    def test_cli_reconcile_preprocess_dry_run_then_apply(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, rows = self.make_run(Path(d))
+            self.write_qc(run, "BI_0000")
+            with patch("cleangene.cli.user_queue_snapshot", return_value={"total": 0, "jobs": {}, "entries": []}):
+                self.assertEqual(cli_main(["reconcile-preprocess", "--run-dir", str(run)]), 0)
+                self.assertFalse((run / "state" / "preprocess" / "BI_0000.done.json").exists())
+                self.assertEqual(cli_main(["reconcile-preprocess", "--run-dir", str(run), "--apply"]), 0)
+                self.assertTrue((run / "state" / "preprocess" / "BI_0000.done.json").is_file())
+
+    def test_targeted_post_job_reconciliation_recovers_completed_batch_outputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, rows = self.make_run(Path(d))
+            self.write_qc(run, "BI_0000")
+            scheduler = _RollingScheduler(run, DEFAULTS)
+            scheduler.active["123"] = _ActiveBatch("123", "preprocess", [0], "0", seen=True, missing_polls=1)
+            with patch("cleangene.workers.user_queue_snapshot", return_value={"total": 0, "jobs": {}, "entries": []}), \
+                 patch("cleangene.workers.assert_jobs_succeeded", return_value=None):
+                scheduler.refresh()
+            self.assertTrue((run / "state" / "preprocess" / "BI_0000.done.json").is_file())
+
+    def test_cpu_limit_caps_preprocess_submissions_without_affecting_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, rows = self.make_run(Path(d), n=4, cfg={"SLURM_USER_CPU_LIMIT": "16", "SLURM_CPU_HEADROOM": "0"})
+            cfg = {**DEFAULTS, "SLURM_USER_CPU_LIMIT": "16", "SLURM_CPU_HEADROOM": "0", "SLURM_ARRAY_CHUNK_SIZE": "10", "SLURM_MAX_OUTSTANDING_CHUNKS": "10", "SLURM_MAX_PARALLEL": "10", "SLURM_USER_JOB_LIMIT": "100", "SLURM_JOB_HEADROOM": "0"}
+            scheduler = _RollingScheduler(run, cfg)
+            scheduler.snapshot = {"total": 1, "jobs": {}, "entries": [{"cpus": 8}]}
+            with patch("cleangene.workers.submit_with_qos_retry", return_value="123"):
+                submitted = scheduler.submit_ready("preprocess", list(range(4)), "4", "1G", "1:00:00", "CleanGene preprocess", 100)
+            self.assertEqual(submitted, 2)
 
 
 if __name__ == "__main__":

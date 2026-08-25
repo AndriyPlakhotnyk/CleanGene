@@ -175,13 +175,17 @@
    On resume, the SLURM controller reconciles missing preprocess markers against
    existing terminal isolate QC outputs before submitting new preprocess arrays.
    It scans `results/groups/*/01_isolates/*/qc.tsv` once, writes
-   `state/preprocess/reconciliation.tsv`, and recreates missing
+   `state/preprocess_reconciliation.tsv`, and recreates missing
    `state/preprocess/<isolate>.done.json` markers only when the QC row is a
    valid terminal result. A retained internal PASS/WARNING isolate must have
    readable nonzero assembly and GFF files; terminal FAIL/excluded isolates,
    external-pangenome isolates, and `ASSEMBLER=off` isolates do not require
-   assembly/GFF for marker recovery. Ambiguous, malformed, multirow, wrong
-   isolate, or legacy QC output stops before any `sbatch` submission.
+   assembly/GFF for marker recovery. The current group path is checked first;
+   if it has no QC candidate, historical groups such as `__kraken_pending__`
+   are accepted only when exactly one candidate validates. Ambiguous, malformed,
+   multirow, wrong-isolate, stale-marker, or legacy QC output fails closed before
+   any new `sbatch` submission. Suspicious existing markers are quarantined as
+   `*.stale.<timestamp>` instead of being silently overwritten.
 
    Example controller summary:
 
@@ -192,6 +196,23 @@
    To deliberately reprocess inconsistent isolates without deleting their old
    outputs, set `RESUME_REPROCESS_INCONSISTENT_PREPROCESS=true`. The default is
    `false` so questionable evidence fails closed.
+
+   You can audit or repair marker state manually without submitting the full
+   controller:
+
+   ```bash
+   cleangene reconcile-preprocess --run-dir /path/to/run
+   cleangene reconcile-preprocess --run-dir /path/to/run --apply --require-all
+   ```
+
+   The first command is a dry run. The second recreates only markers backed by
+   valid outputs and exits nonzero if any isolate remains incomplete or
+   inconsistent. `--compress-safe` may be added with `--apply` to run the same
+   safe assembly/annotation compression sweep.
+
+   ARC users who also need a CPU-based submit cap can set
+   `SLURM_USER_CPU_LIMIT` and `SLURM_CPU_HEADROOM`; both default to `0`, which
+   preserves the existing job-count-only behavior.
 
    Do not delete rows from a run's `provenance/manifest.tsv`: array task indices
    and completed state markers must remain stable. Before any downstream

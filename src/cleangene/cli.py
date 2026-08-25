@@ -3,15 +3,16 @@ import argparse, json, os, shutil, subprocess, sys
 from datetime import datetime
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, read_env, truthy
-from .defaults import SCIENTIFIC_DEFAULTS
+from .completion import reconcile_preprocess_outputs
+from .defaults import DEFAULTS, SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
 from .qc import ensure_qc_provenance, prepare_qc_provenance, resolve_threshold_rows
-from .slurm import sbatch_cmd, submit
+from .slurm import sbatch_cmd, submit, user_queue_snapshot
 from .task_store import build_isolate_task_store
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
 from .ux import clean_gene_banner, submitted, spinner, waiting
-from .workers import cleanup_trimmed_fastqs, dispatch, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, run_resume_maintenance
+from .workers import cleanup_trimmed_fastqs, compress_completed_outputs, dispatch, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, run_resume_maintenance
 
 def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
     cfg=dict(cfg)
@@ -194,6 +195,24 @@ def cleanup_command(args) -> int:
     else: print(f"Report: {run/'results'/'cohort'/'fastq_cleanup.tsv'}")
     return 0
 
+def reconcile_preprocess_command(args) -> int:
+    run=args.run_dir.expanduser().resolve(); validate_run_dir(run)
+    apply_changes=bool(args.apply)
+    cfg={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")}
+    rows=read_tsv(run/"state"/"isolate_tasks.tsv")
+    try: snapshot=user_queue_snapshot()
+    except (OSError, subprocess.SubprocessError): snapshot={"total":0,"jobs":{},"entries":[]}
+    counts=reconcile_preprocess_outputs(run,cfg,rows,snapshot,apply=apply_changes)
+    if args.compress_safe:
+        if not apply_changes: raise SystemExit("--compress-safe requires --apply")
+        compressed=compress_completed_outputs(run)
+        print(f"compressed_outputs={compressed.get('files_compressed',0)} bytes_reclaimed={compressed.get('bytes_reclaimed',0)}")
+    print("preprocess_reconciliation: " + " ".join(f"{key}={counts[key]}" for key in ("total","marker_complete","output_recovered","active","incomplete","inconsistent")))
+    print(f"Report: {run/'state'/'preprocess_reconciliation.tsv'}")
+    if not apply_changes: print("Dry run only. Re-run with --apply to recreate safe missing markers or quarantine stale markers.")
+    if args.require_all and (counts.get("incomplete",0) or counts.get("inconsistent",0)): return 1
+    return 0
+
 def exclude_command(args) -> int:
     run=args.run_dir.expanduser().resolve(); validate_run_dir(run)
     downstream=[]
@@ -230,6 +249,7 @@ def main(argv=None) -> int:
     r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); r.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); r.add_argument("--assembler",choices=("shovill","spades","off")); r.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); r.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); r.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); r.set_defaults(func=run_command)
     rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--config",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); rs.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); rs.add_argument("--assembler",choices=("shovill","spades","off")); rs.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); rs.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); rs.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); rs.set_defaults(func=resume_command)
     cl=sub.add_parser("cleanup",help="replace retained trimmed FASTQs with links to original FASTQ inputs"); cl.add_argument("--run-dir",type=Path,required=True); cl.add_argument("--dry-run",action="store_true"); cl.set_defaults(func=cleanup_command)
+    rp=sub.add_parser("reconcile-preprocess",help="audit or repair missing preprocess markers from existing qc.tsv outputs"); rp.add_argument("--run-dir",type=Path,required=True); rp.add_argument("--dry-run",action="store_true",default=True); rp.add_argument("--apply",action="store_true"); rp.add_argument("--compress-safe",action="store_true"); rp.add_argument("--require-all",action="store_true"); rp.set_defaults(func=reconcile_preprocess_command)
     x=sub.add_parser("exclude",help="exclude isolates safely before downstream pangenome stages start"); x.add_argument("--run-dir",type=Path,required=True); x.add_argument("--samples",nargs="*"); x.add_argument("--samples-file",type=Path); x.set_defaults(func=exclude_command)
     w=sub.add_parser("_worker"); w.add_argument("--stage",required=True); w.add_argument("--run-dir",type=Path,required=True); w.add_argument("--index",type=int,default=0); w.set_defaults(func=lambda a:(dispatch(a.stage,a.run_dir,a.index),0)[1])
     uw=sub.add_parser("_utils_worker"); uw.add_argument("--request",type=Path,required=True); uw.set_defaults(func=lambda a:(__import__("cleangene.downstream",fromlist=["run_request"]).run_request(a.request),0)[1])

@@ -44,21 +44,28 @@ def user_job_count(user: str | None = None) -> int:
 
 def user_queue_snapshot(user: str | None = None) -> dict[str,object]:
     user=user or os.environ.get("USER","")
-    result=subprocess.run(["squeue","-r","-h","-u",user,"-t","R,PD","-o","%F|%K|%T|%j|%o"],capture_output=True,text=True,check=True)
+    result=subprocess.run(["squeue","-r","-h","-u",user,"-t","R,PD","-o","%F|%K|%T|%j|%C|%o"],capture_output=True,text=True,check=True)
     jobs: dict[str,Counter[str]]= {}
     entries=[]
     total=0
     for line in result.stdout.splitlines():
         if not line.strip(): continue
-        fields=line.strip().split("|",4)
+        fields=line.strip().split("|",5)
         job_id=fields[0].strip()
         task_id=fields[1].strip() if len(fields)>1 else ""
         state=fields[2].strip().upper() if len(fields)>2 else "UNKNOWN"
         state={"R":"RUNNING","PD":"PENDING"}.get(state,state or "UNKNOWN")
         name=fields[3].strip() if len(fields)>3 else ""
-        command=fields[4].strip() if len(fields)>4 else ""
+        cpus=1
+        command=""
+        if len(fields)>5:
+            try: cpus=max(0,int(fields[4].strip() or "0"))
+            except ValueError: cpus=0
+            command=fields[5].strip()
+        elif len(fields)>4:
+            command=fields[4].strip()
         jobs.setdefault(job_id,Counter())[state] += 1
-        entries.append({"job_id":job_id,"task_id":task_id,"state":state,"name":name,"command":command})
+        entries.append({"job_id":job_id,"task_id":task_id,"state":state,"name":name,"cpus":cpus,"command":command})
         total += 1
     return {"total":total,"jobs":jobs,"entries":entries}
 

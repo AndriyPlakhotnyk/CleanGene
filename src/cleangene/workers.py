@@ -174,6 +174,20 @@ def _replace_symlink(link: Path, target: Path) -> None:
     os.symlink(str(target),tmp)
     os.replace(tmp,link)
 
+def _acquire_preprocess_lock(run_dir: Path, isolate: str):
+    lock_path=run_dir/"state"/"preprocess"/"locks"/f"{safe_name(isolate)}.lock"
+    lock_path.parent.mkdir(parents=True,exist_ok=True)
+    handle=lock_path.open("w")
+    fcntl.flock(handle,fcntl.LOCK_EX)
+    handle.write(f"pid={os.getpid()} isolate_id={isolate}\n"); handle.flush()
+    return handle
+
+def _release_preprocess_lock(handle) -> None:
+    try:
+        fcntl.flock(handle,fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
 def _link_manifest_fastqs(reads: Path, r1: str, r2: str) -> tuple[str,str]:
     link1=reads/"input_R1.fastq.gz"; link2=reads/"input_R2.fastq.gz"
     _replace_symlink(link1,Path(r1).expanduser().resolve())
@@ -288,14 +302,18 @@ def preprocess(run_dir: Path, index: int) -> None:
     row={key:("" if value is None else str(value)) for key,value in record.items() if key not in {"qc_thresholds","qc_thresholds_resolved"}}
     iso=row["isolate_id"]; group=row["group_id"]; safe=safe_name(iso)
     root=run_dir/"results"/"groups"/safe_name(group); out=root/"01_isolates"/safe; done=run_dir/"state"/"preprocess"/f"{safe}.done.json"
+    lock_handle=_acquire_preprocess_lock(run_dir,iso)
     if done.is_file():
         status=load_json(done)
-        if status.get("excluded") or status.get("external_pangenome") or (status.get("qc_status") and (out/"qc.tsv").is_file()) or (out/"annotation"/f"{safe}.gff").is_file(): return
-    guard=validate_preprocess_completion(run_dir,cfg,row,find_isolate_qc_candidates(run_dir,iso))
+        if status.get("excluded") or status.get("external_pangenome") or (status.get("qc_status") and (out/"qc.tsv").is_file()) or (out/"annotation"/f"{safe}.gff").is_file():
+            _release_preprocess_lock(lock_handle); return
+    guard=validate_preprocess_completion(run_dir,cfg,row,find_isolate_qc_candidates(run_dir,iso,group))
     if guard.state=="complete":
         touch_done(done,guard.marker_payload or {})
+        _release_preprocess_lock(lock_handle)
         return
     if guard.state=="inconsistent" and not truthy(cfg.get("RESUME_REPROCESS_INCONSISTENT_PREPROCESS","false")):
+        _release_preprocess_lock(lock_handle)
         raise SystemExit(f"Inconsistent preprocess output for isolate {iso}: {guard.reason}. Remove/repair the output or set RESUME_REPROCESS_INCONSISTENT_PREPROCESS=true.")
     out.mkdir(parents=True,exist_ok=True); scratch=_preprocess_scratch(cfg,run_dir,iso); work_out=(scratch/"output") if scratch else out; work_out.mkdir(parents=True,exist_ok=True); logs=work_out/"logs"; logs.mkdir(exist_ok=True)
     fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","read_processing_decision","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS]
@@ -308,7 +326,13 @@ def preprocess(run_dir: Path, index: int) -> None:
         for key in ("R1","R2","assembly","gff"):
             if data.get(key): data[key]=_shared_path(str(data[key]),work_out,out)
         if payload.get("gff"): payload["gff"]=_shared_path(str(payload["gff"]),work_out,out)
-        write_tsv(out/"qc.tsv",fields,[data]); touch_done(done,payload); finished=True
+        qc_path=out/"qc.tsv"; tmp_qc=out/f".qc.tsv.tmp-{os.getpid()}"
+        write_tsv(tmp_qc,fields,[data]); os.replace(tmp_qc,qc_path)
+        validation=validate_preprocess_completion(run_dir,cfg,row,[qc_path])
+        if validation.state!="complete":
+            raise SystemExit(f"Preprocess output validation failed for isolate {iso}: {validation.reason}")
+        payload={**payload,**(validation.marker_payload or {})}
+        touch_done(done,payload); finished=True
     def assessment(*, expected: str = "", top: str = "", contamination: float | None = None,
                    reads: dict[str,float] | None = None, metrics: dict[str,object] | None = None,
                    completeness: float | None = None, checkm2_contamination: float | None = None,
@@ -432,6 +456,7 @@ def preprocess(run_dir: Path, index: int) -> None:
         if scratch:
             if not finished: _sync_tree(logs,out/"logs")
             shutil.rmtree(scratch,ignore_errors=True)
+        _release_preprocess_lock(lock_handle)
 
 def retained_rows(run_dir: Path, group: str) -> list[dict[str,str]]:
     _, rows=context(run_dir); result=[]
@@ -793,6 +818,10 @@ class _RollingScheduler:
             details=f"job_id={jid} stage={batch.stage} index={batch.array} log={_stage_log_pattern(self.run_dir,batch.stage)}"
             assert_jobs_succeeded([jid],details)
             missing=[i for i in batch.indices if not _index_done(self.run_dir,batch.stage,i)]
+            if missing and batch.stage=="preprocess":
+                isolate_rows=read_tsv(self.run_dir/"state"/"isolate_tasks.tsv")
+                reconcile_preprocess_outputs(self.run_dir,self.cfg,isolate_rows,self.snapshot,indices=missing)
+                missing=[i for i in batch.indices if not _index_done(self.run_dir,batch.stage,i)]
             if missing: raise RuntimeError(f"SLURM job {jid} completed without {batch.stage} markers for indices: {','.join(map(str,missing[:10]))} | {details}")
             del self.active[jid]
 
@@ -812,6 +841,11 @@ class _RollingScheduler:
         submitted=0; max_batches=int(self.cfg["SLURM_MAX_OUTSTANDING_CHUNKS"]); chunk=int(self.cfg["SLURM_ARRAY_CHUNK_SIZE"])
         running,pending=self.stage_queue(stage); stage_queued=running+pending
         current=int(self.snapshot["total"]); avail=available_slots(int(self.cfg["SLURM_USER_JOB_LIMIT"]),int(self.cfg["SLURM_JOB_HEADROOM"]),current)
+        cpu_limit=int(self.cfg.get("SLURM_USER_CPU_LIMIT","0") or 0); cpu_headroom=int(self.cfg.get("SLURM_CPU_HEADROOM","0") or 0)
+        if stage=="preprocess" and cpu_limit>0:
+            used=sum(int(entry.get("cpus",0) or 0) for entry in self.snapshot.get("entries",[]))
+            per_task=max(1,int(cpus))
+            avail=min(avail,max(0,(cpu_limit-cpu_headroom-used)//per_task))
         batches=sum(1 for b in self.active.values() if b.stage==stage)
         while ready and avail>0 and stage_queued<max_inflight and batches<max_batches:
             n=min(chunk,avail,max_inflight-stage_queued,len(ready)); part=ready[:n]; ready=ready[n:]

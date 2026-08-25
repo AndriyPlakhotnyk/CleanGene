@@ -438,16 +438,17 @@ class CleanGeneCoreTests(unittest.TestCase):
         done=subprocess.CompletedProcess(["squeue"],0,stdout="1\n2\n3\n",stderr="")
         with patch("cleangene.slurm.subprocess.run",return_value=done) as command:
             self.assertEqual(user_job_count("andriy"),3)
-        self.assertIn("%F|%K|%T|%j|%o",command.call_args.args[0])
+        self.assertIn("%F|%K|%T|%j|%C|%o",command.call_args.args[0])
 
     def test_squeue_snapshot_parses_array_elements_and_states(self):
-        stdout="123|7|R|cg-preprocess|python -m cleangene _worker\n123|8|PENDING|cg-preprocess|python -m cleangene _worker\n999|N/A|RUNNING|unrelated|sleep 10\n"
+        stdout="123|7|R|cg-preprocess|8|python -m cleangene _worker\n123|8|PENDING|cg-preprocess|8|python -m cleangene _worker\n999|N/A|RUNNING|unrelated|1|sleep 10\n"
         done=subprocess.CompletedProcess(["squeue"],0,stdout=stdout,stderr="")
         with patch("cleangene.slurm.subprocess.run",return_value=done): snapshot=user_queue_snapshot("andriy")
         self.assertEqual(snapshot["total"],3)
         self.assertEqual(snapshot["jobs"]["123"]["RUNNING"],1)
         self.assertEqual(snapshot["jobs"]["123"]["PENDING"],1)
         self.assertEqual(snapshot["entries"][0]["task_id"],"7")
+        self.assertEqual(snapshot["entries"][0]["cpus"],8)
 
     def test_resumed_controller_adopts_live_run_arrays(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_MAX_OUTSTANDING_CHUNKS":"8","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
