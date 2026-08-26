@@ -54,7 +54,7 @@ class CleanGeneCoreTests(unittest.TestCase):
 
     def test_final_storage_sweep_compresses_previously_completed_preprocess(self):
         with tempfile.TemporaryDirectory() as d:
-            run=Path(d)/"run"; iso_dir=run/"results"/"groups"/"g"/"01_isolates"/"iso1"
+            run=Path(d)/"run"; iso_dir=run/"results"/"sample_data"/"iso1"
             assembly=iso_dir/"assembly"; annotation=iso_dir/"annotation"; assembly.mkdir(parents=True); annotation.mkdir()
             contigs=assembly/"contigs.fa"; contigs.write_text(">c\nACGT\n"); (assembly/"spades.fasta").write_text(">s\nACGT\n"); (assembly/"spades.gfa").write_text("H\tVN:Z:1.0\n")
             gff=annotation/"iso1.gff"; gff.write_text("##gff-version 3\n"); (annotation/"iso1.gbk").write_text("LOCUS\n"); (annotation/"iso1.sqn").write_text("sqn\n")
@@ -82,8 +82,9 @@ class CleanGeneCoreTests(unittest.TestCase):
             exclude_command(args)
             rows=read_tsv(run/"provenance"/"manifest.tsv"); self.assertEqual(len(rows),1); self.assertEqual(rows[0]["user_excluded"],"true"); self.assertEqual(rows[0]["grouping_source"],"kraken_pending")
             with patch("cleangene.workers.run",side_effect=AssertionError("excluded isolate invoked an external tool")): preprocess(run,0)
-            qc=read_tsv(run/"results"/"groups"/"__kraken_pending__"/"01_isolates"/"iso1"/"qc.tsv")[0]
+            qc=read_tsv(run/"results"/"sample_data"/"iso1"/"qc.tsv")[0]
             self.assertEqual(qc["excluded"],"1"); self.assertEqual(qc["reason"],"user_excluded")
+            self.assertFalse((run/"results"/"groups").exists())
             from cleangene.workers import resolve_groups
             resolve_groups(run,None); resolved=read_tsv(run/"provenance"/"manifest.tsv")[0]; self.assertEqual(resolved["group_id"],"__user_excluded__")
 
@@ -101,13 +102,13 @@ class CleanGeneCoreTests(unittest.TestCase):
             with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run_dir,0)
             self.assertEqual(sum(command[0]=="spades.py" for command in commands),1); self.assertFalse(any(command[0]=="shovill" for command in commands))
             spades=next(command for command in commands if command[0]=="spades.py"); self.assertIn("--only-assembler",spades); self.assertTrue(Path(spades[spades.index("-1")+1]).is_symlink()); self.assertTrue(Path(spades[spades.index("-2")+1]).is_symlink())
-            qc=read_tsv(run_dir/"results"/"groups"/"g"/"01_isolates"/"iso1"/"qc.tsv")[0]; self.assertEqual(Path(qc["assembly"]).name,"contigs.fasta"); self.assertIn("+symlinked",qc["read_preprocessing"])
+            qc=read_tsv(run_dir/"results"/"sample_data"/"iso1"/"qc.tsv")[0]; self.assertEqual(Path(qc["assembly"]).name,"contigs.fasta"); self.assertIn("+symlinked",qc["read_preprocessing"])
             for field in ("PASS/FAIL","Notes","trimmed_read_length","mean_base_quality","sequencing_coverage","checkm2_completeness","checkm2_contamination","qc_profile_source"): self.assertIn(field,qc)
 
     def test_exclude_filters_an_already_preprocessed_isolate(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); manifest=root/"manifest.tsv"; manifest.write_text("isolate_id\tgroup_id\tR1\tR2\niso1\tg\tr1\tr2\n")
-            run=make_run(manifest,root,{},"r"); iso=run/"results"/"groups"/"g"/"01_isolates"/"iso1"; gff=iso/"annotation"/"iso1.gff"; gff.parent.mkdir(parents=True); gff.write_text("##gff-version 3\n")
+            run=make_run(manifest,root,{},"r"); iso=run/"results"/"sample_data"/"iso1"; gff=iso/"annotation"/"iso1.gff"; gff.parent.mkdir(parents=True); gff.write_text("##gff-version 3\n")
             write_tsv(iso/"qc.tsv",["isolate_id","group_id","excluded","R1","R2","assembly","gff"],[["iso1","g",0,"r1","r2","",gff]]); atomic_json(run/"state"/"preprocess"/"iso1.done.json",{"excluded":False,"gff":str(gff)})
             exclude_command(type("Args",(),{"run_dir":run,"samples":["iso1"],"samples_file":None})())
             from cleangene.workers import retained_rows
@@ -118,6 +119,12 @@ class CleanGeneCoreTests(unittest.TestCase):
             run=Path(d)/"run"; cfg={"SLURM_ACCOUNT":"","SLURM_PARTITION":""}
             command=_controller_cmd(run,cfg,"preprocess","1-2%2","1","1G","01:00:00")
             log=Path(command[command.index("--output")+1]); self.assertEqual(log.parent,run/"logs"/"slurm"/"preprocess"); self.assertTrue(log.parent.is_dir())
+
+    def test_validate_slurm_logs_use_stage_subdirectory(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; cfg={"SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+            command=_controller_cmd(run,cfg,"validate","1-2%2","1","1G","01:00:00")
+            log=Path(command[command.index("--output")+1]); self.assertEqual(log.parent,run/"logs"/"slurm"/"validate"); self.assertTrue(log.parent.is_dir())
 
     def test_present(self):
         self.assertEqual(present(""),0); self.assertEqual(present("0"),0); self.assertEqual(present("abc_1"),1)
@@ -274,7 +281,7 @@ class CleanGeneCoreTests(unittest.TestCase):
                     out=Path(command[command.index("--outdir")+1]); out.mkdir(parents=True,exist_ok=True); (out/"contigs.fa").write_text(">c\nACGT\n")
             with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run_dir,0)
             self.assertFalse(any(command[0]=="prokka" for command in commands))
-            qc=read_tsv(run_dir/"results"/"groups"/"g"/"01_isolates"/"iso1"/"qc.tsv")[0]
+            qc=read_tsv(run_dir/"results"/"sample_data"/"iso1"/"qc.tsv")[0]
             self.assertEqual(qc["PASS/FAIL"],"FAIL"); self.assertIn("n50_low",qc["reason"]); self.assertIn("gff_missing",qc["reason"])
 
     def test_prokka_failure_marks_isolate_fail(self):
@@ -288,7 +295,7 @@ class CleanGeneCoreTests(unittest.TestCase):
                     out=Path(command[command.index("--outdir")+1]); out.mkdir(parents=True,exist_ok=True); (out/"contigs.fa").write_text(">c\nACGT\n")
                 elif command[0]=="prokka": raise subprocess.CalledProcessError(2,command)
             with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run_dir,0)
-            qc=read_tsv(run_dir/"results"/"groups"/"g"/"01_isolates"/"iso1"/"qc.tsv")[0]
+            qc=read_tsv(run_dir/"results"/"sample_data"/"iso1"/"qc.tsv")[0]
             self.assertEqual(qc["PASS/FAIL"],"FAIL"); self.assertEqual(qc["excluded"],"1"); self.assertIn("prokka_failed",qc["reason"])
 
     def test_compress_assembly_outputs_updates_qc_path(self):
@@ -296,7 +303,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             root=Path(d); r1=root/"r1.fastq.gz"; r2=root/"r2.fastq.gz"
             r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
             manifest=root/"manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tR1\tR2\niso1\tg\t{r1}\t{r2}\n")
-            cfg={"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","COMPRESS_ASSEMBLY_OUTPUTS":"all","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
+            cfg={"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","CHECKM2_MODE":"off","COMPRESS_ASSEMBLY_OUTPUTS":"all","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
             run=make_run(manifest,root,cfg,"r")
             def fake_run(command,**kwargs):
                 if command[0]=="shovill":
@@ -308,7 +315,7 @@ class CleanGeneCoreTests(unittest.TestCase):
                     out=Path(command[command.index("--outdir")+1]); prefix=command[command.index("--prefix")+1]; out.mkdir(parents=True,exist_ok=True)
                     (out/f"{prefix}.gff").write_text("##gff-version 3\n")
             with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run,0)
-            qc=read_tsv(run/"results"/"groups"/"g"/"01_isolates"/"iso1"/"qc.tsv")[0]
+            qc=read_tsv(run/"results"/"sample_data"/"iso1"/"qc.tsv")[0]
             assembly=Path(qc["assembly"])
             self.assertEqual(assembly.name,"contigs.fa.gz")
             self.assertTrue(assembly.is_file())
@@ -333,7 +340,7 @@ class CleanGeneCoreTests(unittest.TestCase):
                     for ext in ("gff","sqn","gbk","err","ffn","fna"):
                         (out/f"{prefix}.{ext}").write_text(f"{ext}\n")
             with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run,0)
-            ann=run/"results"/"groups"/"g"/"01_isolates"/"iso1"/"annotation"
+            ann=run/"results"/"sample_data"/"iso1"/"annotation"
             qc=read_tsv(ann.parent/"qc.tsv")[0]
             self.assertEqual(Path(qc["gff"]).name,"iso1.gff")
             self.assertTrue((ann/"iso1.gff").is_file())
@@ -397,7 +404,7 @@ class CleanGeneCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             run_dir=Path(d)/"run"; db=Path(d)/"db"; db.mkdir(); (db/"hash.k2d").write_text("db"); (db/"opts.k2d").write_text("opts"); (db/"taxo.k2d").write_text("taxo")
             r1=Path(d)/"r1.fq"; r2=Path(d)/"r2.fq"; r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
-            cfg={"TAXONOMY_MODE":"kraken2","KRAKEN2_DB":str(db),"KRAKEN2_DB_ACCESS":"direct","KRAKEN2_KEEP_CLASSIFICATIONS":"false","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"true","READ_TRIMMING_MODE":"off","CPUS":"8"}
+            cfg={"TAXONOMY_MODE":"kraken2","KRAKEN2_DB":str(db),"KRAKEN2_DB_ACCESS":"direct","KRAKEN2_KEEP_CLASSIFICATIONS":"false","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"true","READ_TRIMMING_MODE":"off","CHECKM2_MODE":"off","CPUS":"8"}
             rows=[["i1","g","manifest_organism","Species",str(r1),str(r2),"/prebuilt"]]
             atomic_json(run_dir/"provenance"/"resolved_config.json",cfg); write_tsv(run_dir/"provenance"/"manifest.tsv",["isolate_id","group_id","grouping_source","organism","R1","R2","pangenome_dir"],rows); write_tsv(run_dir/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["g","i1"]])
             commands=[]
@@ -408,7 +415,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             kraken=next(c for c in commands if c[0]=="kraken2")
             self.assertEqual(kraken[kraken.index("--threads")+1],"8")
             self.assertEqual(kraken[kraken.index("--output")+1],"/dev/null")
-            shared=run_dir/"results"/"groups"/"g"/"01_isolates"/"i1"
+            shared=run_dir/"results"/"sample_data"/"i1"
             self.assertFalse((shared/"kraken2.output.tsv").exists()); self.assertTrue((shared/"kraken2.report.tsv").is_file()); self.assertTrue((shared/"qc.tsv").is_file())
 
     def test_kraken_database_stages_once_in_node_cache(self):
@@ -550,7 +557,7 @@ class CleanGeneCoreTests(unittest.TestCase):
     def test_resume_skips_completed_preprocess_and_resolve(self):
         with tempfile.TemporaryDirectory() as d:
             run=Path(d)/"run"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
-            cfg={"TAXONOMY_MODE":"off","SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_ACCOUNT":"","SLURM_PARTITION":"","SLURM_CPUS":"1","SLURM_MEM":"1G","SLURM_TIME":"1:00:00","GROUP_ORCHESTRATOR_CPUS":"1","GROUP_ORCHESTRATOR_MEM":"1G","GROUP_ORCHESTRATOR_TIME":"1:00:00","SUMMARY_CPUS":"1","SUMMARY_MEM":"1G","SUMMARY_TIME":"1:00:00","VALIDATION_CPUS":"1","VALIDATION_MEM":"1G","VALIDATION_TIME":"1:00:00","PANAROO_CPUS":"1","PANAROO_MEM":"1G","PANAROO_TIME":"1:00:00"}
+            cfg={"TAXONOMY_MODE":"off","CHECKM2_MODE":"off","SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_ACCOUNT":"","SLURM_PARTITION":"","SLURM_CPUS":"1","SLURM_MEM":"1G","SLURM_TIME":"1:00:00","GROUP_ORCHESTRATOR_CPUS":"1","GROUP_ORCHESTRATOR_MEM":"1G","GROUP_ORCHESTRATOR_TIME":"1:00:00","SUMMARY_CPUS":"1","SUMMARY_MEM":"1G","SUMMARY_TIME":"1:00:00","VALIDATION_CPUS":"1","VALIDATION_MEM":"1G","VALIDATION_TIME":"1:00:00","PANAROO_CPUS":"1","PANAROO_MEM":"1G","PANAROO_TIME":"1:00:00"}
             atomic_json(run/"provenance"/"resolved_config.json",cfg)
             write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id"],[["iso1","g"]])
             write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["g","iso1"]])
@@ -562,7 +569,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             pipeline.assert_called_once_with(run,True)
             self.assertFalse(any("resolve_groups" in str(c) for c in singles.call_args_list))
             self.assertIn("controller_started",output.getvalue())
-            self.assertIn("stages=kraken_db_setup -> preprocess -> resolve_groups",output.getvalue())
+            self.assertIn("stages=kraken_db_setup -> checkm2_db_setup -> preprocess -> resolve_groups",output.getvalue())
 
     def test_resume_reruns_failed_panaroo_only(self):
         with tempfile.TemporaryDirectory() as d:

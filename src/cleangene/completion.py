@@ -38,6 +38,9 @@ def marker_path(run_dir: Path, isolate_id: str) -> Path:
 
 def scan_preprocess_qc_outputs(run_dir: Path) -> dict[str, list[Path]]:
     index: dict[str, list[Path]] = {}
+    for qc in (run_dir / "results" / "sample_data").glob("*/qc.tsv"):
+        isolate = qc.parent.name
+        index.setdefault(isolate, []).append(qc)
     for qc in (run_dir / "results" / "groups").glob("*/01_isolates/*/qc.tsv"):
         isolate = qc.parent.name
         index.setdefault(isolate, []).append(qc)
@@ -46,6 +49,9 @@ def scan_preprocess_qc_outputs(run_dir: Path) -> dict[str, list[Path]]:
 
 def find_isolate_qc_candidates(run_dir: Path, isolate_id: str, group_id: str = "") -> list[Path]:
     safe = safe_name(isolate_id)
+    sample = run_dir / "results" / "sample_data" / safe / "qc.tsv"
+    if sample.is_file():
+        return [sample]
     if group_id:
         expected = run_dir / "results" / "groups" / safe_name(group_id) / "01_isolates" / safe / "qc.tsv"
         if expected.is_file():
@@ -56,6 +62,9 @@ def find_isolate_qc_candidates(run_dir: Path, isolate_id: str, group_id: str = "
 def _indexed_candidates(run_dir: Path, task: dict[str, str], qc_index: dict[str, list[Path]]) -> list[Path]:
     safe = safe_name(task["isolate_id"])
     group = task.get("group_id", "")
+    sample = run_dir / "results" / "sample_data" / safe / "qc.tsv"
+    if sample.is_file():
+        return [sample]
     if group:
         expected = run_dir / "results" / "groups" / safe_name(group) / "01_isolates" / safe / "qc.tsv"
         if expected.is_file():

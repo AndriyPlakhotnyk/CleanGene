@@ -12,7 +12,7 @@ from .task_store import build_isolate_task_store
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
 from .ux import clean_gene_banner, submitted, spinner, waiting
-from .workers import cleanup_trimmed_fastqs, compress_completed_outputs, dispatch, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, needs_kraken, run_resume_maintenance
+from .workers import cleanup_trimmed_fastqs, compress_completed_outputs, dispatch, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, needs_checkm2, needs_kraken, run_resume_maintenance
 
 def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
     cfg=dict(cfg)
@@ -74,6 +74,7 @@ def refresh_resume_config(run: Path, config: Path | None) -> dict[str,str]:
     if not config: return current
     updated=read_env(config)
     if current.get("KRAKEN2_DB") and not updated.get("KRAKEN2_DB"): updated["KRAKEN2_DB"]=current["KRAKEN2_DB"]
+    if current.get("CHECKM2_DB") and not updated.get("CHECKM2_DB"): updated["CHECKM2_DB"]=current["CHECKM2_DB"]
     if current.get("QC_PROFILE_FILE"): updated["QC_PROFILE_FILE"]=current["QC_PROFILE_FILE"]
     backup=run/"provenance"/"resolved_config.pre_resume.json"
     if not backup.is_file(): shutil.copy2(run/"provenance"/"resolved_config.json",backup)
@@ -108,7 +109,7 @@ def check(args) -> int:
     if trim_mode=="always": required.append("fastp")
     missing=[x for x in required if not command_exists(x)]
     checkm2_db=Path(cfg.get("CHECKM2_DB","")).expanduser() if cfg.get("CHECKM2_DB","").strip() else None
-    if mode=="required" and (not checkm2_db or not checkm2_db.is_file()): missing.append("CHECKM2_DB")
+    if mode=="required" and checkm2_db and not checkm2_db.is_file(): missing.append("CHECKM2_DB")
     print(f"manifest: {len(rows)} isolates / {len(groups(rows))} groups")
     print(f"inputs: {sum(1 for r in rows if r.get('raw_bam'))} raw BAM / {sum(1 for r in rows if r.get('R1') and r.get('R2'))} FASTQ-pair rows")
     print("tools: " + ("OK" if not missing else "missing " + ", ".join(missing)))
@@ -123,6 +124,8 @@ def estimate(args) -> int:
 def local(run: Path) -> None:
     cfg,rows={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")},read_tsv(run/"provenance"/"manifest.tsv")
     if needs_kraken(rows,cfg): dispatch("kraken_db_setup",run,None)
+    cfg,rows={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")},read_tsv(run/"provenance"/"manifest.tsv")
+    if needs_checkm2(rows,cfg): dispatch("checkm2_db_setup",run,None)
     ni=len((run/"state"/"isolate_tasks.tsv").read_text().splitlines())-1
     for i in range(ni): dispatch("preprocess",run,i)
     dispatch("resolve_groups",run,None)

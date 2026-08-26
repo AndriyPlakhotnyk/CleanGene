@@ -61,8 +61,9 @@
 
 6. **Monitoring**  
    Job status with `squeue -j <JOB_ID>`. Controller and downstream logs are in
-   `<run>/logs/slurm/`; individual preprocess logs are grouped under
-   `<run>/logs/slurm/preprocess/`.
+   `<run>/logs/slurm/`; individual preprocess and read-validation logs are
+   grouped under `<run>/logs/slurm/preprocess/` and
+   `<run>/logs/slurm/validate/`.
 
 7. **Large scale (≥30 k isolates)**  
    Use `config/cleangene.arc.env` on ARC. It leaves `SLURM_PARTITION` empty and maintains a rolling, capacity-aware preprocessing window of at most 400 submitted tasks. Up to eight array batches may be active, but every submission still respects total user occupancy and QOS headroom. Known organism groups are prioritized smallest first and can enter Panaroo/validation while later groups are still preprocessing. ARC config sets `TAXONOMY_MODE=auto` and `KRAKEN2_BUNDLE_SIZE=8`.
@@ -158,8 +159,8 @@
 
    `COMPRESS_ASSEMBLY_OUTPUTS=intermediates` gzips Shovill/SPAdes leftover
    FASTA/GFA files such as `spades.fasta` and `spades.gfa`, while keeping the
-   final `contigs.fa` plain. `COMPRESS_ASSEMBLY_OUTPUTS=all` also gzips
-   `contigs.fa` and records `contigs.fa.gz` in isolate QC.
+   final `contigs.fa`/`contigs.fasta` plain. `COMPRESS_ASSEMBLY_OUTPUTS=all`
+   also gzips the final contig file and records the `.gz` path in isolate QC.
 
    To compress nonessential Prokka annotation outputs while keeping `.gff`
    available for Panaroo, resume checks, and utilities, set:
@@ -200,7 +201,8 @@
 
    On resume, the SLURM controller reconciles missing preprocess markers against
    existing terminal isolate QC outputs before submitting new preprocess arrays.
-   It scans `results/groups/*/01_isolates/*/qc.tsv` once, writes
+   It scans `results/sample_data/*/qc.tsv` and legacy
+   `results/groups/*/01_isolates/*/qc.tsv` outputs once, writes
    `state/preprocess_reconciliation.tsv`, and recreates missing
    `state/preprocess/<isolate>.done.json` markers only when the QC row is a
    valid terminal result. A retained internal PASS/WARNING isolate must have
@@ -258,7 +260,7 @@
 
    After organism resolution, CleanGene also creates a storage-free isolate
    index at `results/organisms/<organism>/<isolate_id>`. Each isolate entry is a
-   relative symlink to its complete directory under `results/groups`, exposing
+   relative symlink to its complete directory under `results/sample_data`, exposing
    its annotation, assembly, reads, QC, and per-isolate logs without copying
    them. `results/cohort/organism_isolate_index.tsv` records the display names,
    symlink paths, and canonical targets. The index is refreshed during final
@@ -335,18 +337,25 @@
    the FASTQs are read without modification to obtain equivalent metrics when
    trimming is disabled. CheckM2 values come from `quality_report.tsv`.
 
-   CheckM2 is installed by `environment.yml`, but its DIAMOND database must be
-   downloaded separately and configured as the database file:
+   CleanGene automatically manages the CheckM2 DIAMOND database when
+   `CHECKM2_MODE=required`, `CHECKM2_DB=""`, and
+   `CHECKM2_AUTO_DOWNLOAD=true`. It checks the shared
+   `<CleanGene>/databases/checkm2/` directory, reuses
+   `CheckM2_database/uniref100.KO.1.dmnd` when present, and otherwise runs the
+   installed CheckM2 database downloader once under a shared lock. Later runs
+   reuse the same resolved database path. Set `CHECKM2_DATABASE_ROOT` to place
+   the managed database on a dedicated shared filesystem, or set `CHECKM2_DB`
+   only when intentionally using an exact custom `.dmnd` file.
 
-   ```bash
-   checkm2 database --download --path /work/path/checkm2-db --no_write_json_db
-   CHECKM2_MODE=required
-   CHECKM2_DB=/work/path/checkm2-db/CheckM2_database/uniref100.KO.1.dmnd
-   ```
-
-   `cleangene check` verifies both `checkm2` and `CHECKM2_DB` when required.
    Setting `CHECKM2_MODE=off` is allowed, but always produces `WARNING` with a
-   Note that completeness and contamination were not evaluated.
+   Note that completeness and contamination were not evaluated. Do not turn it
+   off merely to work around a database or environment problem; setup failures
+   should be fixed and resumed.
+
+   `CHECKM2_CPUS`, `CHECKM2_MEM`, and `CHECKM2_TIME` size the database setup
+   job. Per-isolate CheckM2 prediction currently runs inside preprocess and uses
+   `CPUS`; `CHECKM2_BATCH_SIZE` and `CHECKM2_MAX_INFLIGHT` are retained as
+   compatibility settings and are not active scheduling controls.
 
    Global thresholds are configured with:
 

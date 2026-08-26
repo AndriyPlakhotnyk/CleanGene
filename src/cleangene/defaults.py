@@ -31,6 +31,8 @@ SCIENTIFIC_DEFAULTS = {
     "CLEANUP_TRIMMED_FASTQ": "false",
     "CHECKM2_MODE": "required",
     "CHECKM2_DB": "",
+    "CHECKM2_DATABASE_ROOT": "",
+    "CHECKM2_AUTO_DOWNLOAD": "true",
     "SHOVILL_RAM_GB": "",
     "SHOVILL_DEPTH": "150",
     "SHOVILL_GENOME_SIZE": "",

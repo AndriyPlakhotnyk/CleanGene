@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, truthy
+from .checkm2 import CheckM2DbError, CheckM2DbNotReady, resolve_checkm2_db, validate_checkm2_db
 from .completion import find_isolate_qc_candidates, reconcile_preprocess_outputs, validate_preprocess_completion
 from .defaults import DEFAULTS
 from .evidence import validate_isolate, validation_decision_logic_rows
@@ -20,6 +21,7 @@ from .ux import completed, log_line, waiting
 
 STAGE_DESCRIPTIONS = (
     ("kraken_db_setup", "prepare the shared Kraken2 database when required"),
+    ("checkm2_db_setup", "prepare the shared CheckM2 database when required"),
     ("preprocess", "check/trim adapters, run Kraken2 QC, optionally assemble with Shovill or direct SPAdes, and annotate with Prokka"),
     ("resolve_groups", "resolve organism groups and order the smallest groups first"),
     ("panaroo", "build and clean each group pangenome with Panaroo"),
@@ -77,11 +79,28 @@ def parse_kraken_report(path: Path, expected: str) -> tuple[str,float,float]:
     return top[0], contamination, max(0.0,100.0-unclassified)
 
 def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isolate: str) -> tuple[float,float]:
+    try: validate_checkm2_db(cfg.get("CHECKM2_DB",""))
+    except CheckM2DbError as error: raise SystemExit(f"Preprocessing infrastructure failure: CheckM2 database is not ready: {error}")
     input_dir=out/"input"; result_dir=out/"results"; input_dir.mkdir(parents=True,exist_ok=True); result_dir.mkdir(parents=True,exist_ok=True)
     suffix=".fna.gz" if assembly.suffix==".gz" else ".fna"; link=input_dir/f"{safe_name(isolate)}{suffix}"
     _replace_symlink(link,assembly.resolve())
-    run(["checkm2","predict","--threads",cfg.get("CPUS","4"),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr")
-    return parse_checkm2_report(result_dir/"quality_report.tsv")
+    try:
+        run(["checkm2","predict","--threads",cfg.get("CPUS","4"),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr")
+        report=result_dir/"quality_report.tsv"
+        rows=read_tsv(report) if report.is_file() and report.stat().st_size>0 else []
+        if len(rows)!=1:
+            raise ValueError(f"CheckM2 report must contain exactly one genome row for {isolate}: {report}")
+        observed=(rows[0].get("Name") or rows[0].get("name") or rows[0].get("Bin Id") or rows[0].get("bin_id") or "").strip()
+        if observed and observed!=safe_name(isolate):
+            raise ValueError(f"CheckM2 report row '{observed}' does not match expected isolate {safe_name(isolate)}")
+        return parse_checkm2_report(report)
+    except (subprocess.CalledProcessError,ValueError,OSError) as error:
+        raise SystemExit(f"Preprocessing infrastructure failure: CheckM2 could not evaluate isolate {isolate}: {error}")
+
+def needs_checkm2(rows: list[dict[str,str]], cfg: dict[str,str]) -> bool:
+    if checkm2_mode(cfg)!="required": return False
+    if assembler_mode(cfg)=="off" and not any(r.get("assembly","").strip() for r in rows): return False
+    return bool(rows)
 
 def needs_kraken(rows: list[dict[str,str]], cfg: dict[str,str]) -> bool:
     mode=cfg.get("TAXONOMY_MODE","auto")
@@ -103,6 +122,84 @@ def _run_kraken2_database_builder(command: list[str], run_dir: Path) -> None:
 
 def _kraken2_setup_marker(run_dir: Path, resolution, status: str = "complete") -> dict[str,object]:
     return {"status":status,"database_size":resolution.database_size,"KRAKEN2_DB":str(resolution.path),"source":resolution.source}
+
+def _write_resolved_checkm2_config(run_dir: Path, cfg: dict[str,str], resolution) -> dict[str,str]:
+    from .util import atomic_json
+    updated=dict(cfg); updated["CHECKM2_DB"]=str(resolution.path)
+    atomic_json(run_dir/"provenance"/"resolved_config.json",updated)
+    return updated
+
+def _run_checkm2_database_downloader(command: list[str], run_dir: Path) -> None:
+    if not command_exists("checkm2"):
+        raise CheckM2DbError("CheckM2 executable not found on PATH")
+    run(command,stdout=run_dir/"logs"/"checkm2-db.stdout",stderr=run_dir/"logs"/"checkm2-db.stderr")
+
+def _checkm2_setup_marker(resolution, status: str = "complete") -> dict[str,object]:
+    return {"status":status,"CHECKM2_DB":str(resolution.path),"source":resolution.source}
+
+def _checkm2_recovery_config(run_dir: Path, cfg: dict[str,str], error: CheckM2DbError) -> dict[str,str] | None:
+    recorded=cfg.get("CHECKM2_DB","").strip()
+    if not recorded: return None
+    marker=run_dir/"state"/"checkm2_db_setup.done.json"; source=""
+    if marker.is_file():
+        try: source=str(load_json(marker).get("source",""))
+        except (OSError,ValueError): source=""
+    if source not in {"shared_existing","auto_download"}: return None
+    recovered=dict(cfg); recovered["CHECKM2_DB"]=""
+    _controller_log(f"CheckM2 database recorded in run provenance is unavailable; recovering through shared database resolution | recorded={recorded} | reason={error}")
+    return recovered
+
+def _prepare_existing_checkm2_db(run_dir: Path, cfg: dict[str,str], rows: list[dict[str,str]]) -> bool:
+    if not needs_checkm2(rows,cfg):
+        touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"})
+        return True
+    if not command_exists("checkm2"):
+        raise SystemExit("CheckM2 database setup failed: checkm2 executable not found on PATH")
+    try:
+        resolution=resolve_checkm2_db(cfg,allow_download=False,logger=lambda message: _controller_log(message,ok=True))
+    except CheckM2DbNotReady:
+        return False
+    except CheckM2DbError as error:
+        recovered=_checkm2_recovery_config(run_dir,cfg,error)
+        if recovered is None: raise SystemExit(str(error))
+        try:
+            resolution=resolve_checkm2_db(recovered,allow_download=False,logger=lambda message: _controller_log(message,ok=True))
+            cfg=recovered
+        except CheckM2DbNotReady:
+            return False
+        except CheckM2DbError as recovered_error:
+            raise SystemExit(str(recovered_error))
+    _write_resolved_checkm2_config(run_dir,cfg,resolution)
+    touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution))
+    return True
+
+def checkm2_db_setup(run_dir: Path, index: int | None = None) -> None:
+    cfg,rows=context(run_dir)
+    if not needs_checkm2(rows,cfg):
+        touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"})
+        return
+    try:
+        resolution=resolve_checkm2_db(
+            cfg,
+            allow_download=True,
+            runner=lambda command: _run_checkm2_database_downloader(list(command),run_dir),
+            logger=lambda message: _controller_log(message,ok=message.startswith("CheckM2 database: using")),
+        )
+    except CheckM2DbError as error:
+        recovered=_checkm2_recovery_config(run_dir,cfg,error)
+        if recovered is None: raise SystemExit(str(error))
+        cfg=recovered
+        try:
+            resolution=resolve_checkm2_db(
+                cfg,
+                allow_download=True,
+                runner=lambda command: _run_checkm2_database_downloader(list(command),run_dir),
+                logger=lambda message: _controller_log(message,ok=message.startswith("CheckM2 database: using")),
+            )
+        except CheckM2DbError as recovered_error:
+            raise SystemExit(str(recovered_error))
+    _write_resolved_checkm2_config(run_dir,cfg,resolution)
+    touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution))
 
 def _kraken2_recovery_config(run_dir: Path, cfg: dict[str,str], error: Kraken2DbError) -> dict[str,str] | None:
     recorded=cfg.get("KRAKEN2_DB","").strip()
@@ -206,6 +303,12 @@ def _sync_tree(source: Path, destination: Path) -> None:
 def _shared_path(path: str, work_out: Path, shared_out: Path) -> str:
     try: return str(shared_out/Path(path).relative_to(work_out))
     except ValueError: return path
+
+def sample_data_dir(run_dir: Path, isolate_id: str) -> Path:
+    return run_dir/"results"/"sample_data"/safe_name(isolate_id)
+
+def legacy_isolate_dir(run_dir: Path, group_id: str, isolate_id: str) -> Path:
+    return run_dir/"results"/"groups"/safe_name(group_id)/"01_isolates"/safe_name(isolate_id)
 
 def kraken_db_setup(run_dir: Path, index: int | None = None) -> None:
     cfg, rows=context(run_dir)
@@ -368,7 +471,7 @@ def preprocess(run_dir: Path, index: int) -> None:
     record=load_isolate_task(run_dir,index)
     row={key:("" if value is None else str(value)) for key,value in record.items() if key not in {"qc_thresholds","qc_thresholds_resolved"}}
     iso=row["isolate_id"]; group=row["group_id"]; safe=safe_name(iso)
-    root=run_dir/"results"/"groups"/safe_name(group); out=root/"01_isolates"/safe; done=run_dir/"state"/"preprocess"/f"{safe}.done.json"
+    out=sample_data_dir(run_dir,iso); done=run_dir/"state"/"preprocess"/f"{safe}.done.json"
     lock_handle=_acquire_preprocess_lock(run_dir,iso)
     if done.is_file():
         status=load_json(done)
@@ -477,12 +580,8 @@ def preprocess(run_dir: Path, index: int) -> None:
             try: completeness,check_contamination=parse_checkm2_report(Path(supplied_checkm2).expanduser())
             except (ValueError,OSError) as error: errors.append(("checkm2_report_invalid",f"Supplied CheckM2 report could not be parsed: {error}"))
         elif mode=="required" and assembly:
-            db=Path(cfg.get("CHECKM2_DB","")).expanduser()
-            if not cfg.get("CHECKM2_DB","").strip() or not db.is_file(): errors.append(("checkm2_database_missing",f"CheckM2 database file was not found at '{cfg.get('CHECKM2_DB','')}'"))
-            elif not command_exists("checkm2"): errors.append(("checkm2_unavailable","CheckM2 executable was not available"))
-            else:
-                try: completeness,check_contamination=_run_checkm2(Path(assembly),work_out/"checkm2",logs,cfg,iso)
-                except (subprocess.CalledProcessError,ValueError,OSError) as error: errors.append(("checkm2_failed",f"CheckM2 evaluation failed: {error}"))
+            if not command_exists("checkm2"): raise SystemExit("Preprocessing infrastructure failure: CheckM2 executable was not available")
+            completeness,check_contamination=_run_checkm2(Path(assembly),work_out/"checkm2",logs,cfg,iso)
         pre=assessment(expected=expected,top=top,contamination=contam,reads=read_qc,metrics=metrics,
             completeness=completeness,checkm2_contamination=check_contamination,internal=internal_pangenome,
             external=external_pangenome,assembly=assembly,gff_present=None,warnings=warnings,errors=errors)
@@ -539,7 +638,9 @@ def retained_rows(run_dir: Path, group: str) -> list[dict[str,str]]:
 
 def find_isolate_qc(run_dir: Path, row: dict[str,str]) -> Path:
     safe=safe_name(row["isolate_id"])
-    direct=run_dir/"results"/"groups"/safe_name(row["group_id"])/"01_isolates"/safe/"qc.tsv"
+    sample=sample_data_dir(run_dir,row["isolate_id"])/"qc.tsv"
+    if sample.is_file(): return sample
+    direct=legacy_isolate_dir(run_dir,row["group_id"],row["isolate_id"])/"qc.tsv"
     if direct.is_file(): return direct
     hits=list((run_dir/"results"/"groups").glob(f"*/01_isolates/{safe}/qc.tsv"))
     return hits[0] if hits else direct
@@ -643,7 +744,7 @@ def group_size_class(n: int, cfg: dict[str,str]) -> str:
     return "large"
 
 def build_organism_results_index(run_dir: Path) -> dict[str,int]:
-    """Expose each complete isolate tree under its identified organism without copying data."""
+    """Expose each complete sample-data tree under its identified organism without copying data."""
     _,rows=context(run_dir); root=run_dir/"results"/"organisms"; root.mkdir(parents=True,exist_ok=True)
     records=[]; desired=set(); names={}
     for row in rows:
@@ -701,7 +802,7 @@ def orchestrate_downstream(run_dir: Path, index: int | None = None) -> None:
 
 def _stage_log_pattern(run_dir: Path, stage: str) -> Path:
     base=run_dir/"logs"/"slurm"
-    return base/("preprocess" if stage=="preprocess" else "")/f"{stage}.%A_%a.log"
+    return base/(stage if stage in {"preprocess","validate"} else "")/f"{stage}.%A_%a.log"
 
 def _controller_cmd(run_dir: Path, cfg: dict[str,str], stage: str, array: str | None, cpus: str, mem: str, time_limit: str) -> list[str]:
     exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
@@ -778,7 +879,7 @@ def invalidate_legacy_isolate_qc(run_dir: Path) -> int:
     invalidated=0; required=set(QC_OUTPUT_FIELDS)
     tasks=run_dir/"state"/"isolate_tasks.tsv"
     rows=read_tsv(tasks) if tasks.is_file() else []
-    targets=[(run_dir/"state"/"preprocess"/f"{safe_name(row['isolate_id'])}.done.json",run_dir/"results"/"groups"/safe_name(row["group_id"])/"01_isolates"/safe_name(row["isolate_id"])/"qc.tsv") for row in rows]
+    targets=[(run_dir/"state"/"preprocess"/f"{safe_name(row['isolate_id'])}.done.json",find_isolate_qc(run_dir,row)) for row in rows]
     if not targets:
         targets=[(marker,hits[0] if hits else None) for marker in (run_dir/"state"/"preprocess").glob("*.done.json") for hits in [list((run_dir/"results"/"groups").glob(f"*/01_isolates/{marker.name[:-len('.done.json')]}/qc.tsv"))]]
     for marker,qc in targets:
@@ -1030,6 +1131,10 @@ def slurm_controller(run_dir: Path, index: int | None = None) -> None:
             if not _prepare_existing_kraken2_db(run_dir,cfg,rows):
                 _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
             cfg,rows=context(run_dir)
+        if needs_checkm2(rows,cfg):
+            if not _prepare_existing_checkm2_db(run_dir,cfg,rows):
+                _run_single_job(run_dir,cfg,"checkm2_db_setup",cfg["CHECKM2_CPUS"],cfg["CHECKM2_MEM"],cfg["CHECKM2_TIME"],"CleanGene checkm2_db_setup")
+            cfg,rows=context(run_dir)
         unresolved=any(r.get("grouping_source")=="kraken_pending" for r in rows)
         if not unresolved and not _done(run_dir/"state"/"resolve_groups.done.json"):
             _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
@@ -1180,6 +1285,7 @@ def summarize(run_dir: Path) -> None:
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
     if stage=="slurm_controller": slurm_controller(run_dir,index)
     elif stage=="kraken_db_setup": kraken_db_setup(run_dir,index)
+    elif stage=="checkm2_db_setup": checkm2_db_setup(run_dir,index)
     elif stage=="preprocess": preprocess(run_dir,int(index))
     elif stage=="resolve_groups": resolve_groups(run_dir,index)
     elif stage=="orchestrate_downstream": orchestrate_downstream(run_dir,index)
