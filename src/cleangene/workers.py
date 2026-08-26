@@ -8,6 +8,7 @@ from .completion import find_isolate_qc_candidates, reconcile_preprocess_outputs
 from .defaults import DEFAULTS
 from .evidence import validate_isolate, validation_decision_logic_rows
 from .fasta import assembly_metrics
+from .kraken import Kraken2DbError, Kraken2DbNotReady, managed_kraken2_db_path, resolve_kraken2_db, validate_kraken2_db
 from .manifest import groups, write_resolved
 from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_binary
 from .plotting import plot_presence_absence
@@ -87,18 +88,69 @@ def needs_kraken(rows: list[dict[str,str]], cfg: dict[str,str]) -> bool:
     return mode not in {"off","auto"} or any(r.get("grouping_source")=="kraken_pending" for r in rows)
 
 def default_kraken2_db(run_dir: Path, cfg: dict[str,str]) -> Path:
-    return Path(cfg.get("KRAKEN2_BUILD_DIR","") or run_dir.parent.parent/"databases"/f"kraken2_{cfg.get('KRAKEN2_DATABASE_SIZE','standard-8')}").expanduser().resolve()
+    return managed_kraken2_db_path(cfg)[0]
+
+def _write_resolved_kraken2_config(run_dir: Path, cfg: dict[str,str], resolution) -> dict[str,str]:
+    from .util import atomic_json
+    updated=dict(cfg)
+    updated["KRAKEN2_DATABASE_SIZE"]=resolution.database_size
+    updated["KRAKEN2_DB"]=str(resolution.path)
+    atomic_json(run_dir/"provenance"/"resolved_config.json",updated)
+    return updated
+
+def _run_kraken2_database_builder(command: list[str], run_dir: Path) -> None:
+    run(command,stdout=run_dir/"logs"/"kraken2-db.stdout",stderr=run_dir/"logs"/"kraken2-db.stderr")
+
+def _kraken2_setup_marker(run_dir: Path, resolution, status: str = "complete") -> dict[str,object]:
+    return {"status":status,"database_size":resolution.database_size,"KRAKEN2_DB":str(resolution.path),"source":resolution.source}
+
+def _kraken2_recovery_config(run_dir: Path, cfg: dict[str,str], error: Kraken2DbError) -> dict[str,str] | None:
+    recorded=cfg.get("KRAKEN2_DB","").strip()
+    if not recorded:
+        return None
+    marker=run_dir/"state"/"kraken_db_setup.done.json"
+    source=""
+    if marker.is_file():
+        try: source=str(load_json(marker).get("source",""))
+        except (OSError,ValueError): source=""
+    if source not in {"shared_existing","auto_download"}:
+        return None
+    recovered=dict(cfg)
+    recovered["KRAKEN2_DB"]=""
+    _controller_log(f"Kraken2 database recorded in run provenance is unavailable; recovering through shared database resolution | recorded={recorded} | reason={error}")
+    return recovered
+
+def _prepare_existing_kraken2_db(run_dir: Path, cfg: dict[str,str], rows: list[dict[str,str]]) -> bool:
+    if not needs_kraken(rows,cfg):
+        touch_done(run_dir/"state"/"kraken_db_setup.done.json",{"status":"not_required"})
+        return True
+    try:
+        resolution=resolve_kraken2_db(cfg,allow_download=False,logger=lambda message: _controller_log(message,ok=True))
+    except Kraken2DbNotReady:
+        return False
+    except Kraken2DbError as error:
+        recovered=_kraken2_recovery_config(run_dir,cfg,error)
+        if recovered is None:
+            raise SystemExit(str(error))
+        try:
+            resolution=resolve_kraken2_db(recovered,allow_download=False,logger=lambda message: _controller_log(message,ok=True))
+            cfg=recovered
+        except Kraken2DbNotReady:
+            return False
+        except Kraken2DbError as recovered_error:
+            raise SystemExit(str(recovered_error))
+    _write_resolved_kraken2_config(run_dir,cfg,resolution)
+    touch_done(run_dir/"state"/"kraken_db_setup.done.json",_kraken2_setup_marker(run_dir,resolution))
+    return True
 
 def ensure_kraken2_db(run_dir: Path, cfg: dict[str,str], rows: list[dict[str,str]]) -> str:
-    db=cfg.get("KRAKEN2_DB","").strip()
-    if db and (Path(db)/"hash.k2d").is_file(): return db
     if not needs_kraken(rows,cfg):
         return ""
-    if not truthy(cfg.get("KRAKEN2_AUTO_DOWNLOAD","true")):
-        raise SystemExit("KRAKEN2_DB is required when taxonomy or Kraken-inferred grouping is enabled")
-    db_path=default_kraken2_db(run_dir,cfg)
-    if (db_path/"hash.k2d").is_file(): return str(db_path)
-    raise SystemExit(f"Kraken2 database is not ready: {db_path}. The kraken_db_setup SLURM stage must complete before preprocess.")
+    try:
+        resolution=resolve_kraken2_db(cfg,allow_download=False)
+    except Kraken2DbError as error:
+        raise SystemExit(str(error))
+    return str(resolution.path)
 
 def _directory_size(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
@@ -108,6 +160,8 @@ def kraken_db_for_worker(db: str, cfg: dict[str,str]) -> tuple[str,bool]:
     if mode not in {"auto","copy","mmap","direct"}:
         raise SystemExit("KRAKEN2_DB_ACCESS must be auto, copy, mmap, or direct")
     source=Path(db).resolve()
+    try: validate_kraken2_db(source)
+    except Kraken2DbError as error: raise SystemExit(str(error))
     if mode in {"mmap","direct"}: return str(source),mode=="mmap"
     cache_setting=cfg.get("KRAKEN2_NODE_CACHE_DIR","").strip()
     cache_root=Path(cache_setting).expanduser() if cache_setting else Path("/tmp")/f"cleangene-{os.getuid()}"/"kraken2"
@@ -156,16 +210,29 @@ def _shared_path(path: str, work_out: Path, shared_out: Path) -> str:
 def kraken_db_setup(run_dir: Path, index: int | None = None) -> None:
     cfg, rows=context(run_dir)
     if not needs_kraken(rows,cfg): touch_done(run_dir/"state"/"kraken_db_setup.done.json",{"status":"not_required"}); return
-    db=cfg.get("KRAKEN2_DB","").strip()
-    db_path=Path(db).expanduser().resolve() if db else default_kraken2_db(run_dir,cfg)
-    if not (db_path/"hash.k2d").is_file():
-        db_path.parent.mkdir(parents=True,exist_ok=True)
-        script=Path(__file__).resolve().parents[2]/"scripts"/"build_kraken2_database.sh"
-        run([str(script),str(db_path),cfg.get("KRAKEN2_DB_CPUS",cfg.get("CPUS","4")),cfg.get("KRAKEN2_CLEAN_BUILD_FILES","true"),cfg.get("KRAKEN2_DATABASE_SIZE","standard-8")],stdout=run_dir/"logs"/"kraken2-db.stdout",stderr=run_dir/"logs"/"kraken2-db.stderr")
-    cfg["KRAKEN2_DB"]=str(db_path)
-    from .util import atomic_json
-    atomic_json(run_dir/"provenance"/"resolved_config.json",cfg)
-    touch_done(run_dir/"state"/"kraken_db_setup.done.json",{"KRAKEN2_DB":str(db_path)})
+    try:
+        resolution=resolve_kraken2_db(
+            cfg,
+            allow_download=True,
+            runner=lambda command: _run_kraken2_database_builder(list(command),run_dir),
+            logger=lambda message: _controller_log(message,ok=message.startswith("Kraken2 database: using")),
+        )
+    except Kraken2DbError as error:
+        recovered=_kraken2_recovery_config(run_dir,cfg,error)
+        if recovered is None:
+            raise SystemExit(str(error))
+        cfg=recovered
+        try:
+            resolution=resolve_kraken2_db(
+                cfg,
+                allow_download=True,
+                runner=lambda command: _run_kraken2_database_builder(list(command),run_dir),
+                logger=lambda message: _controller_log(message,ok=message.startswith("Kraken2 database: using")),
+            )
+        except Kraken2DbError as recovered_error:
+            raise SystemExit(str(recovered_error))
+    _write_resolved_kraken2_config(run_dir,cfg,resolution)
+    touch_done(run_dir/"state"/"kraken_db_setup.done.json",_kraken2_setup_marker(run_dir,resolution))
 
 def _replace_symlink(link: Path, target: Path) -> None:
     link.parent.mkdir(parents=True,exist_ok=True)
@@ -959,8 +1026,9 @@ def slurm_controller(run_dir: Path, index: int | None = None) -> None:
             snapshot={"total":0,"jobs":{},"entries":[]}
         reconcile=reconcile_preprocess_outputs(run_dir,cfg,read_tsv(run_dir/"state"/"isolate_tasks.tsv"),snapshot)
         _controller_log("step=preprocess_reconciliation | " + " | ".join(f"{key}={reconcile[key]}" for key in ("total","marker_complete","output_recovered","active","incomplete","inconsistent")),ok=reconcile.get("inconsistent",0)==0)
-        if needs_kraken(rows,cfg) and not cfg.get("KRAKEN2_DB","").strip() and not _done(run_dir/"state"/"kraken_db_setup.done.json"):
-            _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
+        if needs_kraken(rows,cfg):
+            if not _prepare_existing_kraken2_db(run_dir,cfg,rows):
+                _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene kraken_db_setup")
             cfg,rows=context(run_dir)
         unresolved=any(r.get("grouping_source")=="kraken_pending" for r in rows)
         if not unresolved and not _done(run_dir/"state"/"resolve_groups.done.json"):

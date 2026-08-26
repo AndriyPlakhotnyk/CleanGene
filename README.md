@@ -80,6 +80,32 @@
    `prodigal_training_file`. Path validation happens in worker jobs, not during
    login-node submission.
 
+   CleanGene automatically manages Kraken2 databases when Kraken2 taxonomy is
+   needed. With `KRAKEN2_DB=""` and
+   `KRAKEN2_DATABASE_SIZE="standard-8"`, CleanGene checks:
+
+   ```text
+   <CleanGene>/databases/kraken2_standard-8/
+   ```
+
+   A valid database must contain non-empty `hash.k2d`, `opts.k2d`, and
+   `taxo.k2d`. If the selected shared database exists, it is reused. If it is
+   absent and `KRAKEN2_AUTO_DOWNLOAD=true`, CleanGene downloads it once into
+   that shared directory; later runs reuse the same path. Supported sizes are
+   `standard-8`, `standard-16`, and `standard`; aliases such as `8`, `16`,
+   `standard_8`, `standard_16`, `full`, and `full-standard` normalize to those
+   canonical names.
+
+   Set `KRAKEN2_DATABASE_ROOT=/shared/databases/CleanGene` on HPC systems that
+   keep large databases on a dedicated shared filesystem. CleanGene will manage
+   selected databases below that parent, for example
+   `/shared/databases/CleanGene/kraken2_standard-8`. `KRAKEN2_DB` remains an
+   exact database-directory override for intentionally using a custom Kraken2
+   database. If CleanGene is installed in a layout where the source/project root
+   cannot be identified, the automatic root falls back to
+   `~/.cache/cleangene/databases`; set `KRAKEN2_DATABASE_ROOT` to make the
+   shared location explicit.
+
 8. **FASTQ QC only / skip trimming**
 
    To run only read-level QC for supplied FASTQs and avoid assembly storage,

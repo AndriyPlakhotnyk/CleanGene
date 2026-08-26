@@ -12,7 +12,7 @@ from .task_store import build_isolate_task_store
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
 from .ux import clean_gene_banner, submitted, spinner, waiting
-from .workers import cleanup_trimmed_fastqs, compress_completed_outputs, dispatch, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, run_resume_maintenance
+from .workers import cleanup_trimmed_fastqs, compress_completed_outputs, dispatch, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, needs_kraken, run_resume_maintenance
 
 def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
     cfg=dict(cfg)
@@ -121,6 +121,8 @@ def estimate(args) -> int:
     print(json.dumps({"isolates":n,"groups":ng,"compressed_read_bytes":total,"slurm_preprocess_tasks":n,"slurm_panaroo_tasks":ng,"slurm_validation_tasks":n,"slurm_reduce_tasks":ng},indent=2)); return 0
 
 def local(run: Path) -> None:
+    cfg,rows={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")},read_tsv(run/"provenance"/"manifest.tsv")
+    if needs_kraken(rows,cfg): dispatch("kraken_db_setup",run,None)
     ni=len((run/"state"/"isolate_tasks.tsv").read_text().splitlines())-1
     for i in range(ni): dispatch("preprocess",run,i)
     dispatch("resolve_groups",run,None)

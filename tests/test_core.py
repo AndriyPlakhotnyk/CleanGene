@@ -395,7 +395,7 @@ class CleanGeneCoreTests(unittest.TestCase):
 
     def test_preprocess_threads_kraken_and_suppresses_per_read_output(self):
         with tempfile.TemporaryDirectory() as d:
-            run_dir=Path(d)/"run"; db=Path(d)/"db"; db.mkdir(); (db/"hash.k2d").write_text("db")
+            run_dir=Path(d)/"run"; db=Path(d)/"db"; db.mkdir(); (db/"hash.k2d").write_text("db"); (db/"opts.k2d").write_text("opts"); (db/"taxo.k2d").write_text("taxo")
             r1=Path(d)/"r1.fq"; r2=Path(d)/"r2.fq"; r1.write_text("@r\nA\n+\n!\n"); r2.write_text("@r\nT\n+\n!\n")
             cfg={"TAXONOMY_MODE":"kraken2","KRAKEN2_DB":str(db),"KRAKEN2_DB_ACCESS":"direct","KRAKEN2_KEEP_CLASSIFICATIONS":"false","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"true","READ_TRIMMING_MODE":"off","CPUS":"8"}
             rows=[["i1","g","manifest_organism","Species",str(r1),str(r2),"/prebuilt"]]
@@ -413,7 +413,7 @@ class CleanGeneCoreTests(unittest.TestCase):
 
     def test_kraken_database_stages_once_in_node_cache(self):
         with tempfile.TemporaryDirectory() as d:
-            source=Path(d)/"source"; cache=Path(d)/"cache"; source.mkdir(); (source/"hash.k2d").write_text("hash"); (source/"opts.k2d").write_text("opts")
+            source=Path(d)/"source"; cache=Path(d)/"cache"; source.mkdir(); (source/"hash.k2d").write_text("hash"); (source/"opts.k2d").write_text("opts"); (source/"taxo.k2d").write_text("taxo")
             cfg={"KRAKEN2_DB_ACCESS":"copy","KRAKEN2_NODE_CACHE_DIR":str(cache),"KRAKEN2_NODE_CACHE_MIN_FREE_GB":"0"}
             first,mmap1=kraken_db_for_worker(str(source),cfg); second,mmap2=kraken_db_for_worker(str(source),cfg)
             self.assertEqual(first,second); self.assertTrue(mmap1 and mmap2); self.assertTrue((Path(first)/".cleangene-ready").is_file())
