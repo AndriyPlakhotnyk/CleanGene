@@ -7,6 +7,7 @@ from typing import Callable, Sequence
 
 from .config import truthy
 from .runtime import cleangene_project_root
+from .tools import ToolResolutionError, resolve_checkm2_executable
 
 EXPECTED_CHECKM2_DB_NAME = "uniref100.KO.1.dmnd"
 
@@ -137,8 +138,11 @@ def resolve_checkm2_db(
             return CheckM2DbResolution(existing, "shared_existing")
         if logger:
             logger(f"CheckM2 database not found; preparing shared database | path={root}")
-        executable = cfg.get("CHECKM2_EXECUTABLE", "").strip() or "checkm2"
-        runner([executable, "database", "--download", "--path", str(root), "--no_write_json_db"])
+        try:
+            executable = resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE", ""))
+        except ToolResolutionError as error:
+            raise CheckM2DbError(f"CheckM2 database download cannot start: {error}") from error
+        runner([str(executable), "database", "--download", "--path", str(root), "--no_write_json_db"])
         downloaded = find_managed_checkm2_db(root)
         if not downloaded:
             raise CheckM2DbError(f"CheckM2 download completed but {EXPECTED_CHECKM2_DB_NAME} was not found under {root}")

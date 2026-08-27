@@ -151,9 +151,9 @@ class IsolateQCTests(unittest.TestCase):
             root=Path(d); manifest=root/"manifest.tsv"; manifest.write_text("isolate_id\tgroup_id\tR1\tR2\ni\tg\tr1\tr2\n")
             config=root/"required.env"; config.write_text("ASSEMBLER=off\nTAXONOMY_MODE=off\nCHECKM2_MODE=required\nCHECKM2_DB=\n")
             args=type("Args",(),{"manifest":manifest,"config":config})()
-            with patch("cleangene.cli.command_exists",return_value=True),contextlib.redirect_stdout(StringIO()): self.assertEqual(check(args),0)
+            with patch("cleangene.cli.command_exists",return_value=True),patch("cleangene.cli.resolve_checkm2_executable",return_value=root/"checkm2"),contextlib.redirect_stdout(StringIO()): self.assertEqual(check(args),0)
             database=root/"uniref100.KO.1.dmnd"; database.write_text("db"); config.write_text(f"ASSEMBLER=off\nTAXONOMY_MODE=off\nCHECKM2_MODE=required\nCHECKM2_DB={database}\n")
-            with patch("cleangene.cli.command_exists",return_value=True),contextlib.redirect_stdout(StringIO()): self.assertEqual(check(args),0)
+            with patch("cleangene.cli.command_exists",return_value=True),patch("cleangene.cli.resolve_checkm2_executable",return_value=root/"checkm2"),contextlib.redirect_stdout(StringIO()): self.assertEqual(check(args),0)
             config.write_text("ASSEMBLER=off\nTAXONOMY_MODE=off\nCHECKM2_MODE=off\nCHECKM2_DB=\n")
             with patch("cleangene.cli.command_exists",return_value=False),contextlib.redirect_stdout(StringIO()): self.assertEqual(check(args),0)
 

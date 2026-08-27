@@ -46,8 +46,15 @@ class RuntimeResolutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             python = _write_executable(Path(d) / "envs" / "cleangene" / "bin" / "python")
             with patch("cleangene.tools.shutil.which", return_value=None):
-                with self.assertRaisesRegex(ToolResolutionError, "mamba env create --file environment.checkm2.yml"):
+                with self.assertRaisesRegex(ToolResolutionError, "bash scripts/install_or_update.sh --recreate"):
                     resolve_checkm2_executable(python_executable=python)
+
+    def test_explicit_checkm2_override_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            explicit = _write_executable(Path(d) / "custom" / "checkm2")
+            fallback = _write_executable(Path(d) / "bin" / "checkm2")
+            with patch("cleangene.tools.shutil.which", return_value=str(fallback)):
+                self.assertEqual(resolve_checkm2_executable(str(explicit)), explicit.resolve())
 
     def test_explicit_invalid_executable_fails_without_fallback(self):
         with tempfile.TemporaryDirectory() as d:
@@ -65,6 +72,25 @@ class RuntimeResolutionTests(unittest.TestCase):
                     with contextlib.redirect_stdout(StringIO()):
                         main(["run", "--manifest", str(manifest), "--analysis-root", str(root), "--run-id", "r", "--dry-run"])
             submit.assert_not_called()
+
+    def test_doctor_reports_automatic_missing_checkm2_database(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            exe = _write_executable(root / "bin" / "checkm2")
+            config = root / "arc.local.env"
+            config.write_text(
+                f"CHECKM2_EXECUTABLE={exe}\n"
+                f"CHECKM2_DATABASE_ROOT={root / 'checkm2'}\n"
+                "CHECKM2_AUTO_DOWNLOAD=true\n"
+                "TAXONOMY_MODE=off\n"
+            )
+            output = StringIO()
+            environment = {**os.environ, "CONDA_DEFAULT_ENV":"cleangene", "CONDA_PREFIX":str(root / "envs" / "cleangene")}
+            with patch.dict(os.environ, environment, clear=True), patch("cleangene.cli.sys.executable", str(root / "envs" / "cleangene" / "bin" / "python")), patch("cleangene.cli.command_exists", return_value=True), contextlib.redirect_stdout(output):
+                result = main(["doctor", "--config", str(config)])
+            self.assertEqual(result, 0, output.getvalue())
+            self.assertIn("CheckM2 executable: OK", output.getvalue())
+            self.assertIn("CheckM2 database: not present; will be created by checkm2_db_setup", output.getvalue())
 
     def test_config_from_other_checkout_fails_without_external_database_root(self):
         active = cleangene_project_root()
@@ -104,6 +130,29 @@ class RepositoryPrivacyTests(unittest.TestCase):
         forbidden = tuple(f"/{name}/" for name in ("home", "work", "scratch"))
         for value in forbidden:
             self.assertNotIn(value, text)
+
+    def test_arc_config_has_unique_keys_and_unchanged_qc_thresholds(self):
+        root = cleangene_project_root()
+        lines = (root / "config" / "cleangene.arc.env").read_text().splitlines()
+        keys = [line.split("=", 1)[0].strip() for line in lines if line.strip() and not line.lstrip().startswith("#") and "=" in line]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertNotIn("CHECKM2_BATCH_SIZE", keys)
+        self.assertNotIn("CHECKM2_MAX_INFLIGHT", keys)
+        expected = {
+            "QC_MAX_CONTIGS_PASS":"300", "QC_MAX_CONTIGS_FAIL":"1000",
+            "QC_MIN_N50_PASS":"25000", "QC_MIN_N50_FAIL":"5000",
+            "QC_MIN_COVERAGE_PASS":"20", "QC_MIN_COVERAGE_FAIL":"10",
+            "QC_MIN_READ_LENGTH_PASS":"120", "QC_MIN_READ_LENGTH_FAIL":"",
+            "QC_MIN_MEAN_BASE_QUALITY_PASS":"30", "QC_MIN_MEAN_BASE_QUALITY_FAIL":"",
+            "QC_MIN_COMPLETENESS_PASS":"90", "QC_MIN_COMPLETENESS_FAIL":"80",
+            "QC_MAX_CHECKM2_CONTAMINATION_PASS":"5", "QC_MAX_CHECKM2_CONTAMINATION_FAIL":"10",
+            "QC_MAX_KRAKEN_CONTAMINATION_FAIL":"5", "QC_PROFILE_FILE":"",
+        }
+        from cleangene.config import read_env
+        from cleangene.cli import _doctor_config_errors
+        cfg = read_env(root / "config" / "cleangene.arc.env")
+        self.assertEqual({key:cfg[key] for key in expected}, expected)
+        self.assertEqual(_doctor_config_errors(cfg), [])
 
     def test_tracked_text_files_do_not_contain_obvious_private_paths(self):
         root = cleangene_project_root()

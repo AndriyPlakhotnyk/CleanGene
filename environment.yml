@@ -16,5 +16,4 @@ dependencies:
   - matplotlib
   - scipy
   - mafft
-  - pip: 
-    - .
+  - pip

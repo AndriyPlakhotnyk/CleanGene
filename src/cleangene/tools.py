@@ -63,10 +63,8 @@ def resolve_checkm2_executable(configured: str = "", python_executable: str | Pa
     except ToolResolutionError as error:
         raise ToolResolutionError(
             f"{error}\n"
-            "Create the CheckM2 companion environment from this checkout with:\n"
-            "  mamba env create --file environment.checkm2.yml\n"
-            "Existing environments can be repaired with:\n"
-            "  mamba env update --name cleangene-checkm2 --file environment.checkm2.yml --prune"
+            "Repair the complete CleanGene installation from its checkout with:\n"
+            "  bash scripts/install_or_update.sh --recreate"
         ) from error
 
 

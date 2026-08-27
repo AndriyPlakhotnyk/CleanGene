@@ -85,6 +85,7 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
     input_dir=out/"input"; result_dir=out/"results"; input_dir.mkdir(parents=True,exist_ok=True); result_dir.mkdir(parents=True,exist_ok=True)
     suffix=".fna.gz" if assembly.suffix==".gz" else ".fna"; link=input_dir/f"{safe_name(isolate)}{suffix}"
     _replace_symlink(link,assembly.resolve())
+    started=time.monotonic(); status="failed"
     try:
         executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_checkm2_executable())
         run([executable,"predict","--threads",cfg.get("CPUS","4"),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr")
@@ -95,9 +96,15 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
         observed=(rows[0].get("Name") or rows[0].get("name") or rows[0].get("Bin Id") or rows[0].get("bin_id") or "").strip()
         if observed and observed!=safe_name(isolate):
             raise ValueError(f"CheckM2 report row '{observed}' does not match expected isolate {safe_name(isolate)}")
+        status="complete"
         return parse_checkm2_report(report)
     except (subprocess.CalledProcessError,ValueError,OSError) as error:
         raise SystemExit(f"Preprocessing infrastructure failure: CheckM2 could not evaluate isolate {isolate}: {error}")
+    finally:
+        try:
+            (logs/"checkm2.timing.tsv").write_text(f"isolate_id\tstatus\telapsed_seconds\n{isolate}\t{status}\t{time.monotonic()-started:.3f}\n")
+        except OSError:
+            pass
 
 def needs_checkm2(rows: list[dict[str,str]], cfg: dict[str,str]) -> bool:
     if checkm2_mode(cfg)!="required": return False

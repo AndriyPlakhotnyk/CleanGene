@@ -50,6 +50,7 @@ class CheckM2DatabaseTests(unittest.TestCase):
             marker = load_json(run / "state" / "checkm2_db_setup.done.json")
             self.assertEqual(resolved["CHECKM2_DB"], str(db.resolve()))
             self.assertEqual(resolved["CHECKM2_EXECUTABLE"], str(exe.resolve()))
+            self.assertEqual(resolved["CHECKM2_VERSION"], "CheckM2 version 1.1.0")
             self.assertEqual(marker["source"], "shared_existing")
 
     def test_missing_db_auto_downloads_once(self):
@@ -64,6 +65,8 @@ class CheckM2DatabaseTests(unittest.TestCase):
 
             result = resolve_checkm2_db(cfg, allow_download=True, runner=runner)
             self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], str(exe.resolve()))
+            self.assertIn("--no_write_json_db", calls[0])
             self.assertEqual(result.source, "auto_download")
             validate_checkm2_db(result.path)
 

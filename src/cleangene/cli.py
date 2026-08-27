@@ -1,9 +1,10 @@
 from __future__ import annotations
 import argparse, json, os, shutil, subprocess, sys
+import re
 from datetime import datetime
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, read_env, truthy
-from .checkm2 import CheckM2DbError, resolve_checkm2_db
+from .checkm2 import CheckM2DbError, CheckM2DbNotReady, checkm2_database_root, resolve_checkm2_db
 from .completion import reconcile_preprocess_outputs
 from .defaults import DEFAULTS, SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
@@ -109,10 +110,12 @@ def check(args) -> int:
     needs_kraken=cfg["TAXONOMY_MODE"] not in {"off","auto"} or any(r.get("grouping_source")=="kraken_pending" for r in rows)
     if needs_kraken: required.append("kraken2")
     mode=checkm2_mode(cfg)
-    if mode=="required": required.append("checkm2")
     trim_mode="off" if assembler in {"spades","off"} or truthy(cfg.get("SKIP_TRIM","false")) else cfg.get("READ_TRIMMING_MODE","auto")
     if trim_mode=="always": required.append("fastp")
     missing=[x for x in required if not command_exists(x)]
+    if mode=="required":
+        try: resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE",""))
+        except ToolResolutionError: missing.append("checkm2")
     checkm2_db=Path(cfg.get("CHECKM2_DB","")).expanduser() if cfg.get("CHECKM2_DB","").strip() else None
     if mode=="required" and checkm2_db and not checkm2_db.is_file(): missing.append("CHECKM2_DB")
     print(f"manifest: {len(rows)} isolates / {len(groups(rows))} groups")
@@ -135,35 +138,102 @@ def preflight_runtime(run: Path, cfg: dict[str,str]) -> dict[str,str]:
     atomic_json(run/"provenance"/"resolved_config.json",updated)
     return updated
 
+def _destination_is_writable(path: Path) -> bool:
+    candidate=path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate=candidate.parent
+    return candidate.is_dir() and os.access(candidate,os.W_OK)
+
+def _doctor_config_errors(cfg: dict[str,str]) -> list[str]:
+    errors=[]
+    try: assembler_mode(cfg)
+    except SystemExit as error: errors.append(str(error))
+    try: checkm2_mode(cfg)
+    except SystemExit as error: errors.append(str(error))
+    enums={
+        "TAXONOMY_MODE":{"auto","identify","contamination","kraken2","off"},
+        "READ_TRIMMING_MODE":{"off","auto","always"},
+        "KRAKEN2_DB_ACCESS":{"auto","copy","mmap","direct"},
+    }
+    for key,allowed in enums.items():
+        value=cfg.get(key,"").strip().lower()
+        if value not in allowed: errors.append(f"{key} must be one of {', '.join(sorted(allowed))}; got {value!r}")
+    positive=("CPUS","SLURM_CPUS","SLURM_ARRAY_CHUNK_SIZE","SLURM_MAX_OUTSTANDING_CHUNKS","SLURM_USER_JOB_LIMIT","SLURM_CONTROLLER_CPUS","KRAKEN2_DB_CPUS","CHECKM2_CPUS","VALIDATION_CPUS")
+    nonnegative=("SLURM_MAX_PARALLEL","SLURM_PREPROCESS_MAX_INFLIGHT","SLURM_VALIDATION_MAX_INFLIGHT","SLURM_GROUP_MAX_INFLIGHT","SLURM_JOB_HEADROOM","SLURM_USER_CPU_LIMIT","SLURM_CPU_HEADROOM","SLURM_POLL_SECONDS")
+    for key in positive+nonnegative:
+        try: value=int(cfg.get(key,""))
+        except ValueError: errors.append(f"{key} must be an integer; got {cfg.get(key,'')!r}"); continue
+        if key in positive and value<=0: errors.append(f"{key} must be greater than zero; got {value}")
+        if key in nonnegative and value<0: errors.append(f"{key} must be zero or greater; got {value}")
+    for key,value in cfg.items():
+        if key.endswith("_MEM") and value and not re.fullmatch(r"[1-9][0-9]*(?:\.[0-9]+)?[KMGT]",value,re.IGNORECASE):
+            errors.append(f"{key} must be a positive Slurm memory value such as 32G; got {value!r}")
+        if key.endswith("_TIME") and value and not re.fullmatch(r"(?:[0-9]+-)?[0-9]+:[0-5][0-9]:[0-5][0-9]",value):
+            errors.append(f"{key} must use Slurm D-HH:MM:SS or HH:MM:SS format; got {value!r}")
+    try:
+        if int(cfg["SLURM_JOB_HEADROOM"])>=int(cfg["SLURM_USER_JOB_LIMIT"]): errors.append("SLURM_JOB_HEADROOM must be smaller than SLURM_USER_JOB_LIMIT")
+    except (KeyError,ValueError): pass
+    return errors
+
 def doctor(args) -> int:
     cfg=apply_cli_overrides(read_env(args.config),args)
     assert_config_matches_runtime(args.config,cfg)
     print_runtime_identity(args.config)
-    rows=load_manifest(args.manifest) if args.manifest else []
-    print("configuration: READY")
-    for tool in ("spades.py" if assembler_mode(cfg)=="spades" else "shovill","prokka","panaroo","bwa","samtools","bcftools","minimap2"):
-        print(f"{tool}: {'READY' if command_exists(tool) else 'ERROR'}")
-    if checkm2_mode(cfg)=="required":
+    failures=0
+    prefix_value=os.environ.get("CONDA_PREFIX","")
+    prefix=Path(prefix_value).expanduser().resolve() if prefix_value else None
+    env_name=os.environ.get("CONDA_DEFAULT_ENV","") or (prefix.name if prefix else "")
+    python=Path(sys.executable).resolve()
+    if env_name=="cleangene" and prefix is not None and prefix in python.parents: print("CleanGene Python environment: OK")
+    else:
+        failures+=1; print(f"CleanGene Python environment: ERROR expected cleangene Python under its active Conda prefix, found environment={env_name or '<unknown>'} python={python}. Fix: conda activate cleangene")
+    config_errors=_doctor_config_errors(cfg)
+    if config_errors:
+        failures+=len(config_errors)
+        for error in config_errors: print(f"Configuration: ERROR {error}")
+        target=args.config or Path("config/cleangene.arc.local.env")
+        print(f"Configuration fix: edit {target}, then run mamba run -n cleangene cleangene doctor --config {target}")
+    else: print("Configuration: OK")
+    for tool in ("shovill","spades.py","prokka","panaroo","bwa","samtools","bcftools","minimap2","fastp","kraken2"):
+        if command_exists(tool): print(f"Primary tool {tool}: OK")
+        else:
+            failures+=1; print(f"Primary tool {tool}: ERROR missing. Fix: bash scripts/install_or_update.sh --recreate")
+    if cfg.get("CHECKM2_MODE","required").strip().lower()=="required":
         try:
             executable=resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE",""))
-            print(f"checkm2: READY path={executable} version={executable_version(executable,'CheckM2')}")
+            version=executable_version(executable,"CheckM2")
+            print(f"CheckM2 executable: OK path={executable} version={version}")
         except ToolResolutionError as error:
-            print(f"checkm2: ERROR {error}")
-    if rows and needs_kraken(rows,cfg):
-        try:
-            from .kraken import resolve_kraken2_db
-            resolution=resolve_kraken2_db(cfg,allow_download=False)
-            print(f"kraken_db: READY path={resolution.path}")
-        except Exception as error:
-            print(f"kraken_db: WILL_AUTO_DOWNLOAD {error}" if truthy(cfg.get("KRAKEN2_AUTO_DOWNLOAD","true")) else f"kraken_db: ERROR {error}")
-    if rows and needs_checkm2(rows,cfg):
+            failures+=1; print(f"CheckM2 executable: ERROR {error}")
         try:
             resolution=resolve_checkm2_db(cfg,allow_download=False)
-            print(f"checkm2_db: READY path={resolution.path}")
+            print(f"CheckM2 database: OK path={resolution.path}")
+        except CheckM2DbNotReady:
+            root=checkm2_database_root(cfg)
+            if not truthy(cfg.get("CHECKM2_AUTO_DOWNLOAD","true")):
+                failures+=1; print(f"CheckM2 database: ERROR not present and CHECKM2_AUTO_DOWNLOAD=false. Fix: set CHECKM2_AUTO_DOWNLOAD=true in {args.config or 'the config'}")
+            elif _destination_is_writable(root):
+                print(f"CheckM2 database: not present; will be created by checkm2_db_setup | root={root}")
+            else:
+                failures+=1; print(f"CheckM2 database: ERROR managed root is not writable: {root}. Fix: set CLEANGENE_DATABASE_ROOT in {args.config or 'the config'} to a writable shared directory")
         except CheckM2DbError as error:
-            print(f"checkm2_db: WILL_AUTO_DOWNLOAD {error}" if truthy(cfg.get("CHECKM2_AUTO_DOWNLOAD","true")) else f"checkm2_db: ERROR {error}")
-    print(f"slurm: {'READY' if command_exists('sbatch') else 'ERROR'}")
-    return 0
+            failures+=1; print(f"CheckM2 database: ERROR {error}")
+    if cfg.get("TAXONOMY_MODE","auto")!="off":
+        try:
+            from .kraken import Kraken2DbNotReady, managed_kraken2_db_path, resolve_kraken2_db
+            resolution=resolve_kraken2_db(cfg,allow_download=False)
+            print(f"Kraken2 configuration: OK database={resolution.path}")
+        except Kraken2DbNotReady as error:
+            _,_,root=managed_kraken2_db_path(cfg)
+            if truthy(cfg.get("KRAKEN2_AUTO_DOWNLOAD","true")) and _destination_is_writable(root): print(f"Kraken2 configuration: OK managed database will be created by kraken_db_setup | root={root}")
+            else:
+                failures+=1; print(f"Kraken2 configuration: ERROR {error}. Fix: set CLEANGENE_DATABASE_ROOT in {args.config or 'the config'} to a writable shared directory")
+        except Exception as error:
+            failures+=1; print(f"Kraken2 configuration: ERROR {error}")
+    if command_exists("sbatch"): print("Slurm sbatch: OK")
+    else:
+        failures+=1; print("Slurm sbatch: ERROR not found. Fix: run setup and CleanGene from an ARC login node with Slurm commands available")
+    return 0 if failures==0 else 2
 
 def estimate(args) -> int:
     rows=load_manifest(args.manifest); total=sum(Path(r[k]).stat().st_size for r in rows for k in (("raw_bam",) if r.get("raw_bam") else ("R1","R2"))); ng=len(groups(rows)); n=len(rows)

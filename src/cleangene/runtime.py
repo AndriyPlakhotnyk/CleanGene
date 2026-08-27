@@ -62,8 +62,10 @@ def assert_config_matches_runtime(config: Path | None, cfg: dict[str, str]) -> N
         "CleanGene checkout mismatch:\n"
         f"  executable is loading CleanGene from: {active}\n"
         f"  --config belongs to: {config_root}\n"
-        "Reinstall the intended checkout with:\n"
-        f"  python -m pip install -e {config_root} --no-deps"
+        "Install or update the intended checkout with:\n"
+        f"  cd {config_root}\n"
+        "  bash scripts/install_or_update.sh\n"
+        "  conda activate cleangene"
     )
 
 
