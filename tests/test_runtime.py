@@ -11,7 +11,7 @@ from cleangene.checkm2 import checkm2_database_root
 from cleangene.cli import main
 from cleangene.kraken import managed_kraken2_db_path
 from cleangene.runtime import assert_config_matches_runtime, cleangene_project_root
-from cleangene.tools import ToolResolutionError, resolve_executable
+from cleangene.tools import ToolResolutionError, resolve_checkm2_executable, resolve_executable
 
 
 def _write_executable(path: Path) -> Path:
@@ -34,6 +34,21 @@ class RuntimeResolutionTests(unittest.TestCase):
             with patch("cleangene.tools.shutil.which", return_value=None):
                 self.assertEqual(resolve_executable("checkm2", python_executable=python), exe.resolve())
 
+    def test_resolve_checkm2_from_companion_environment(self):
+        with tempfile.TemporaryDirectory() as d:
+            envs = Path(d) / "envs"
+            python = _write_executable(envs / "cleangene" / "bin" / "python")
+            exe = _write_executable(envs / "cleangene-checkm2" / "bin" / "checkm2")
+            with patch("cleangene.tools.shutil.which", return_value=None):
+                self.assertEqual(resolve_checkm2_executable(python_executable=python), exe.resolve())
+
+    def test_missing_checkm2_names_companion_environment_repair(self):
+        with tempfile.TemporaryDirectory() as d:
+            python = _write_executable(Path(d) / "envs" / "cleangene" / "bin" / "python")
+            with patch("cleangene.tools.shutil.which", return_value=None):
+                with self.assertRaisesRegex(ToolResolutionError, "mamba env create --file environment.checkm2.yml"):
+                    resolve_checkm2_executable(python_executable=python)
+
     def test_explicit_invalid_executable_fails_without_fallback(self):
         with tempfile.TemporaryDirectory() as d:
             fallback = _write_executable(Path(d) / "bin" / "checkm2")
@@ -45,7 +60,7 @@ class RuntimeResolutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d); manifest = root / "manifest.tsv"
             manifest.write_text("isolate_id\tgroup_id\tR1\tR2\ni1\tg\t/r1.fastq.gz\t/r2.fastq.gz\n")
-            with patch("cleangene.cli.resolve_executable", side_effect=ToolResolutionError("missing checkm2")), patch("cleangene.cli.slurm") as submit:
+            with patch("cleangene.cli.resolve_checkm2_executable", side_effect=ToolResolutionError("missing checkm2")), patch("cleangene.cli.slurm") as submit:
                 with self.assertRaisesRegex(SystemExit, "before controller submission"):
                     with contextlib.redirect_stdout(StringIO()):
                         main(["run", "--manifest", str(manifest), "--analysis-root", str(root), "--run-id", "r", "--dry-run"])

@@ -11,7 +11,7 @@ from .qc import ensure_qc_provenance, prepare_qc_provenance, resolve_threshold_r
 from .runtime import assert_config_matches_runtime, print_runtime_identity
 from .slurm import sbatch_cmd, submit, user_queue_snapshot
 from .task_store import build_isolate_task_store
-from .tools import ToolResolutionError, executable_version, resolve_executable
+from .tools import ToolResolutionError, executable_version, resolve_checkm2_executable
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
 from .ux import clean_gene_banner, submitted, spinner, waiting
@@ -127,7 +127,7 @@ def preflight_runtime(run: Path, cfg: dict[str,str]) -> dict[str,str]:
     if not needs_checkm2(rows,cfg):
         return cfg
     try:
-        executable=resolve_executable("checkm2",cfg.get("CHECKM2_EXECUTABLE",""))
+        executable=resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE",""))
         version=executable_version(executable,"CheckM2")
     except ToolResolutionError as error:
         raise SystemExit("CheckM2 is missing from the CleanGene runtime environment before controller submission:\n" + str(error))
@@ -145,7 +145,7 @@ def doctor(args) -> int:
         print(f"{tool}: {'READY' if command_exists(tool) else 'ERROR'}")
     if checkm2_mode(cfg)=="required":
         try:
-            executable=resolve_executable("checkm2",cfg.get("CHECKM2_EXECUTABLE",""))
+            executable=resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE",""))
             print(f"checkm2: READY path={executable} version={executable_version(executable,'CheckM2')}")
         except ToolResolutionError as error:
             print(f"checkm2: ERROR {error}")

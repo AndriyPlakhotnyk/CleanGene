@@ -1,0 +1,21 @@
+name: cleangene-checkm2
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - scikit-learn=1.6.1
+  - numpy
+  - diamond=2.1.11
+  - tensorflow=2.17=cpu*
+  - lightgbm
+  - pandas
+  - scipy
+  - prodigal=2.6.3
+  - setuptools
+  - requests
+  - packaging
+  - tqdm
+  - pip
+  - pip:
+      - CheckM2 @ https://github.com/chklovski/CheckM2/archive/777bd767d93ac65decaf42a46d43ecc1bf7c41a3.tar.gz

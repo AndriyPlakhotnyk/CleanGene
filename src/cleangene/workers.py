@@ -16,7 +16,7 @@ from .plotting import plot_presence_absence
 from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .task_store import build_isolate_task_store, load_isolate_task, migrate_isolate_task_store, task_store_ready
-from .tools import executable_version, resolve_executable, ToolResolutionError
+from .tools import executable_version, resolve_checkm2_executable, ToolResolutionError
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 from .ux import completed, log_line, waiting
 
@@ -86,7 +86,7 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
     suffix=".fna.gz" if assembly.suffix==".gz" else ".fna"; link=input_dir/f"{safe_name(isolate)}{suffix}"
     _replace_symlink(link,assembly.resolve())
     try:
-        executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_executable("checkm2"))
+        executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_checkm2_executable())
         run([executable,"predict","--threads",cfg.get("CPUS","4"),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr")
         report=result_dir/"quality_report.tsv"
         rows=read_tsv(report) if report.is_file() and report.stat().st_size>0 else []
@@ -154,7 +154,7 @@ def _prepare_existing_checkm2_db(run_dir: Path, cfg: dict[str,str], rows: list[d
         touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"})
         return True
     try:
-        executable=resolve_executable("checkm2",cfg.get("CHECKM2_EXECUTABLE",""))
+        executable=resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE",""))
         cfg=dict(cfg); cfg["CHECKM2_EXECUTABLE"]=str(executable)
         if not cfg.get("CHECKM2_VERSION","").strip(): cfg["CHECKM2_VERSION"]=executable_version(executable,"CheckM2")
     except ToolResolutionError as error:
@@ -183,7 +183,7 @@ def checkm2_db_setup(run_dir: Path, index: int | None = None) -> None:
         touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"})
         return
     try:
-        executable=resolve_executable("checkm2",cfg.get("CHECKM2_EXECUTABLE",""))
+        executable=resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE",""))
         cfg=dict(cfg); cfg["CHECKM2_EXECUTABLE"]=str(executable)
         if not cfg.get("CHECKM2_VERSION","").strip(): cfg["CHECKM2_VERSION"]=executable_version(executable,"CheckM2")
     except ToolResolutionError as error:

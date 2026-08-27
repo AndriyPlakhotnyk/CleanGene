@@ -20,7 +20,12 @@ def _validate_executable(path: Path, name: str) -> Path:
     return resolved
 
 
-def resolve_executable(name: str, configured: str = "", python_executable: str | Path | None = None) -> Path:
+def resolve_executable(
+    name: str,
+    configured: str = "",
+    python_executable: str | Path | None = None,
+    companion_environments: tuple[str, ...] = (),
+) -> Path:
     if configured.strip():
         try:
             return _validate_executable(Path(configured), name)
@@ -33,6 +38,10 @@ def resolve_executable(name: str, configured: str = "", python_executable: str |
     sibling = python.parent / name
     if sibling.exists():
         return _validate_executable(sibling, name)
+    for environment in companion_environments:
+        companion = python.parent.parent.parent / environment / "bin" / name
+        if companion.exists():
+            return _validate_executable(companion, name)
     env_name = os.environ.get("CONDA_DEFAULT_ENV", "") or os.environ.get("VIRTUAL_ENV", "") or "<unknown>"
     raise ToolResolutionError(
         f"{name} executable could not be resolved from the CleanGene runtime environment.\n"
@@ -41,6 +50,24 @@ def resolve_executable(name: str, configured: str = "", python_executable: str |
         f"Install or update the CleanGene environment so `{name} --version` works, "
         f"or set {name.upper()}_EXECUTABLE to an exact executable path."
     )
+
+
+def resolve_checkm2_executable(configured: str = "", python_executable: str | Path | None = None) -> Path:
+    try:
+        return resolve_executable(
+            "checkm2",
+            configured,
+            python_executable,
+            companion_environments=("cleangene-checkm2",),
+        )
+    except ToolResolutionError as error:
+        raise ToolResolutionError(
+            f"{error}\n"
+            "Create the CheckM2 companion environment from this checkout with:\n"
+            "  mamba env create --file environment.checkm2.yml\n"
+            "Existing environments can be repaired with:\n"
+            "  mamba env update --name cleangene-checkm2 --file environment.checkm2.yml --prune"
+        ) from error
 
 
 def executable_version(executable: Path | str, label: str) -> str:

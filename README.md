@@ -4,8 +4,23 @@
 1. **Install Conda/Rocks**   
    ```bash
    mamba env create -f environment.yml
+   mamba env create -f environment.checkm2.yml
    conda activate cleangene
    pip install -e .
+   ```
+
+   CheckM2 uses a companion environment because its TensorFlow and DIAMOND
+   dependencies conflict with parts of the Prokka/Shovill toolchain. CleanGene
+   automatically discovers `cleangene-checkm2` beside the active `cleangene`
+   environment; users do not need to activate it or configure an executable
+   path. After pulling environment changes, update both environments with:
+
+   ```bash
+   mamba env update --name cleangene --file environment.yml --prune
+   mamba env update --name cleangene-checkm2 --file environment.checkm2.yml --prune
+   conda activate cleangene
+   pip install -e .
+   cleangene doctor --config config/cleangene.arc.local.env
    ```
 
 2. **Prepare configuration**  
