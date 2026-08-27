@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .config import truthy
+from .runtime import cleangene_project_root
 
 REQUIRED_KRAKEN2_DB_FILES = ("hash.k2d", "opts.k2d", "taxo.k2d")
 SUPPORTED_KRAKEN2_DATABASE_SIZES = ("standard-8", "standard-16", "standard")
@@ -70,14 +71,6 @@ def kraken2_db_is_valid(path: Path | str) -> bool:
         return False
 
 
-def cleangene_project_root() -> Path | None:
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        if (parent / "pyproject.toml").is_file() and (parent / "src" / "cleangene").is_dir():
-            return parent
-    return None
-
-
 def default_kraken2_database_root() -> Path:
     root = cleangene_project_root()
     if root is not None:
@@ -87,7 +80,12 @@ def default_kraken2_database_root() -> Path:
 
 def kraken2_database_root(cfg: dict[str, str]) -> Path:
     configured = cfg.get("KRAKEN2_DATABASE_ROOT", "").strip()
-    return (Path(configured).expanduser() if configured else default_kraken2_database_root()).resolve()
+    generic = cfg.get("CLEANGENE_DATABASE_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if generic:
+        return Path(generic).expanduser().resolve()
+    return default_kraken2_database_root()
 
 
 def managed_kraken2_db_path(cfg: dict[str, str]) -> tuple[Path, str, Path]:

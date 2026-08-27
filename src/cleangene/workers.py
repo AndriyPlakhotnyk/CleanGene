@@ -16,6 +16,7 @@ from .plotting import plot_presence_absence
 from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .task_store import build_isolate_task_store, load_isolate_task, migrate_isolate_task_store, task_store_ready
+from .tools import executable_version, resolve_executable, ToolResolutionError
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 from .ux import completed, log_line, waiting
 
@@ -85,7 +86,8 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
     suffix=".fna.gz" if assembly.suffix==".gz" else ".fna"; link=input_dir/f"{safe_name(isolate)}{suffix}"
     _replace_symlink(link,assembly.resolve())
     try:
-        run(["checkm2","predict","--threads",cfg.get("CPUS","4"),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr")
+        executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_executable("checkm2"))
+        run([executable,"predict","--threads",cfg.get("CPUS","4"),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr")
         report=result_dir/"quality_report.tsv"
         rows=read_tsv(report) if report.is_file() and report.stat().st_size>0 else []
         if len(rows)!=1:
@@ -130,12 +132,10 @@ def _write_resolved_checkm2_config(run_dir: Path, cfg: dict[str,str], resolution
     return updated
 
 def _run_checkm2_database_downloader(command: list[str], run_dir: Path) -> None:
-    if not command_exists("checkm2"):
-        raise CheckM2DbError("CheckM2 executable not found on PATH")
     run(command,stdout=run_dir/"logs"/"checkm2-db.stdout",stderr=run_dir/"logs"/"checkm2-db.stderr")
 
-def _checkm2_setup_marker(resolution, status: str = "complete") -> dict[str,object]:
-    return {"status":status,"CHECKM2_DB":str(resolution.path),"source":resolution.source}
+def _checkm2_setup_marker(resolution, cfg: dict[str,str], status: str = "complete") -> dict[str,object]:
+    return {"status":status,"CHECKM2_DB":str(resolution.path),"CHECKM2_EXECUTABLE":cfg.get("CHECKM2_EXECUTABLE",""),"CHECKM2_VERSION":cfg.get("CHECKM2_VERSION",""),"source":resolution.source}
 
 def _checkm2_recovery_config(run_dir: Path, cfg: dict[str,str], error: CheckM2DbError) -> dict[str,str] | None:
     recorded=cfg.get("CHECKM2_DB","").strip()
@@ -153,8 +153,12 @@ def _prepare_existing_checkm2_db(run_dir: Path, cfg: dict[str,str], rows: list[d
     if not needs_checkm2(rows,cfg):
         touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"})
         return True
-    if not command_exists("checkm2"):
-        raise SystemExit("CheckM2 database setup failed: checkm2 executable not found on PATH")
+    try:
+        executable=resolve_executable("checkm2",cfg.get("CHECKM2_EXECUTABLE",""))
+        cfg=dict(cfg); cfg["CHECKM2_EXECUTABLE"]=str(executable)
+        if not cfg.get("CHECKM2_VERSION","").strip(): cfg["CHECKM2_VERSION"]=executable_version(executable,"CheckM2")
+    except ToolResolutionError as error:
+        raise SystemExit("CheckM2 database setup failed: " + str(error))
     try:
         resolution=resolve_checkm2_db(cfg,allow_download=False,logger=lambda message: _controller_log(message,ok=True))
     except CheckM2DbNotReady:
@@ -170,7 +174,7 @@ def _prepare_existing_checkm2_db(run_dir: Path, cfg: dict[str,str], rows: list[d
         except CheckM2DbError as recovered_error:
             raise SystemExit(str(recovered_error))
     _write_resolved_checkm2_config(run_dir,cfg,resolution)
-    touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution))
+    touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution,cfg))
     return True
 
 def checkm2_db_setup(run_dir: Path, index: int | None = None) -> None:
@@ -178,6 +182,12 @@ def checkm2_db_setup(run_dir: Path, index: int | None = None) -> None:
     if not needs_checkm2(rows,cfg):
         touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"})
         return
+    try:
+        executable=resolve_executable("checkm2",cfg.get("CHECKM2_EXECUTABLE",""))
+        cfg=dict(cfg); cfg["CHECKM2_EXECUTABLE"]=str(executable)
+        if not cfg.get("CHECKM2_VERSION","").strip(): cfg["CHECKM2_VERSION"]=executable_version(executable,"CheckM2")
+    except ToolResolutionError as error:
+        raise SystemExit("CheckM2 database setup failed: " + str(error))
     try:
         resolution=resolve_checkm2_db(
             cfg,
@@ -199,7 +209,7 @@ def checkm2_db_setup(run_dir: Path, index: int | None = None) -> None:
         except CheckM2DbError as recovered_error:
             raise SystemExit(str(recovered_error))
     _write_resolved_checkm2_config(run_dir,cfg,resolution)
-    touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution))
+    touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution,cfg))
 
 def _kraken2_recovery_config(run_dir: Path, cfg: dict[str,str], error: Kraken2DbError) -> dict[str,str] | None:
     recorded=cfg.get("KRAKEN2_DB","").strip()
@@ -580,7 +590,6 @@ def preprocess(run_dir: Path, index: int) -> None:
             try: completeness,check_contamination=parse_checkm2_report(Path(supplied_checkm2).expanduser())
             except (ValueError,OSError) as error: errors.append(("checkm2_report_invalid",f"Supplied CheckM2 report could not be parsed: {error}"))
         elif mode=="required" and assembly:
-            if not command_exists("checkm2"): raise SystemExit("Preprocessing infrastructure failure: CheckM2 executable was not available")
             completeness,check_contamination=_run_checkm2(Path(assembly),work_out/"checkm2",logs,cfg,iso)
         pre=assessment(expected=expected,top=top,contamination=contam,reads=read_qc,metrics=metrics,
             completeness=completeness,checkm2_contamination=check_contamination,internal=internal_pangenome,

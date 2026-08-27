@@ -3,12 +3,15 @@ import argparse, json, os, shutil, subprocess, sys
 from datetime import datetime
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, read_env, truthy
+from .checkm2 import CheckM2DbError, resolve_checkm2_db
 from .completion import reconcile_preprocess_outputs
 from .defaults import DEFAULTS, SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
 from .qc import ensure_qc_provenance, prepare_qc_provenance, resolve_threshold_rows
+from .runtime import assert_config_matches_runtime, print_runtime_identity
 from .slurm import sbatch_cmd, submit, user_queue_snapshot
 from .task_store import build_isolate_task_store
+from .tools import ToolResolutionError, executable_version, resolve_executable
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
 from .ux import clean_gene_banner, submitted, spinner, waiting
@@ -75,6 +78,8 @@ def refresh_resume_config(run: Path, config: Path | None) -> dict[str,str]:
     updated=read_env(config)
     if current.get("KRAKEN2_DB") and not updated.get("KRAKEN2_DB"): updated["KRAKEN2_DB"]=current["KRAKEN2_DB"]
     if current.get("CHECKM2_DB") and not updated.get("CHECKM2_DB"): updated["CHECKM2_DB"]=current["CHECKM2_DB"]
+    if current.get("CHECKM2_EXECUTABLE") and not updated.get("CHECKM2_EXECUTABLE"): updated["CHECKM2_EXECUTABLE"]=current["CHECKM2_EXECUTABLE"]
+    if current.get("CHECKM2_VERSION") and not updated.get("CHECKM2_VERSION"): updated["CHECKM2_VERSION"]=current["CHECKM2_VERSION"]
     if current.get("QC_PROFILE_FILE"): updated["QC_PROFILE_FILE"]=current["QC_PROFILE_FILE"]
     backup=run/"provenance"/"resolved_config.pre_resume.json"
     if not backup.is_file(): shutil.copy2(run/"provenance"/"resolved_config.json",backup)
@@ -117,6 +122,49 @@ def check(args) -> int:
     if needs_kraken and not cfg.get("KRAKEN2_DB"): print("warning: KRAKEN2_DB is not configured; run will use KRAKEN2_AUTO_DOWNLOAD if enabled")
     return 0 if not missing else 2
 
+def preflight_runtime(run: Path, cfg: dict[str,str]) -> dict[str,str]:
+    rows=read_tsv(run/"provenance"/"manifest.tsv")
+    if not needs_checkm2(rows,cfg):
+        return cfg
+    try:
+        executable=resolve_executable("checkm2",cfg.get("CHECKM2_EXECUTABLE",""))
+        version=executable_version(executable,"CheckM2")
+    except ToolResolutionError as error:
+        raise SystemExit("CheckM2 is missing from the CleanGene runtime environment before controller submission:\n" + str(error))
+    updated={**cfg,"CHECKM2_EXECUTABLE":str(executable),"CHECKM2_VERSION":version}
+    atomic_json(run/"provenance"/"resolved_config.json",updated)
+    return updated
+
+def doctor(args) -> int:
+    cfg=apply_cli_overrides(read_env(args.config),args)
+    assert_config_matches_runtime(args.config,cfg)
+    print_runtime_identity(args.config)
+    rows=load_manifest(args.manifest) if args.manifest else []
+    print("configuration: READY")
+    for tool in ("spades.py" if assembler_mode(cfg)=="spades" else "shovill","prokka","panaroo","bwa","samtools","bcftools","minimap2"):
+        print(f"{tool}: {'READY' if command_exists(tool) else 'ERROR'}")
+    if checkm2_mode(cfg)=="required":
+        try:
+            executable=resolve_executable("checkm2",cfg.get("CHECKM2_EXECUTABLE",""))
+            print(f"checkm2: READY path={executable} version={executable_version(executable,'CheckM2')}")
+        except ToolResolutionError as error:
+            print(f"checkm2: ERROR {error}")
+    if rows and needs_kraken(rows,cfg):
+        try:
+            from .kraken import resolve_kraken2_db
+            resolution=resolve_kraken2_db(cfg,allow_download=False)
+            print(f"kraken_db: READY path={resolution.path}")
+        except Exception as error:
+            print(f"kraken_db: WILL_AUTO_DOWNLOAD {error}" if truthy(cfg.get("KRAKEN2_AUTO_DOWNLOAD","true")) else f"kraken_db: ERROR {error}")
+    if rows and needs_checkm2(rows,cfg):
+        try:
+            resolution=resolve_checkm2_db(cfg,allow_download=False)
+            print(f"checkm2_db: READY path={resolution.path}")
+        except CheckM2DbError as error:
+            print(f"checkm2_db: WILL_AUTO_DOWNLOAD {error}" if truthy(cfg.get("CHECKM2_AUTO_DOWNLOAD","true")) else f"checkm2_db: ERROR {error}")
+    print(f"slurm: {'READY' if command_exists('sbatch') else 'ERROR'}")
+    return 0
+
 def estimate(args) -> int:
     rows=load_manifest(args.manifest); total=sum(Path(r[k]).stat().st_size for r in rows for k in (("raw_bam",) if r.get("raw_bam") else ("R1","R2"))); ng=len(groups(rows)); n=len(rows)
     print(json.dumps({"isolates":n,"groups":ng,"compressed_read_bytes":total,"slurm_preprocess_tasks":n,"slurm_panaroo_tasks":ng,"slurm_validation_tasks":n,"slurm_reduce_tasks":ng},indent=2)); return 0
@@ -151,7 +199,7 @@ def shlex_quote(x:str)->str:
 def run_command(args) -> int:
     print(clean_gene_banner())
     print(submitted("Welcome to CleanGene, You Grace."))
-    cfg=apply_cli_overrides(read_env(args.config),args); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
+    cfg=apply_cli_overrides(read_env(args.config),args); assert_config_matches_runtime(args.config,cfg); print_runtime_identity(args.config); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
         run=load_existing(root,args.resume); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
         cfg=ensure_qc_provenance(run,read_tsv(run/"provenance"/"manifest.tsv"),cfg); atomic_json(run/"provenance"/"resolved_config.json",cfg)
@@ -162,6 +210,7 @@ def run_command(args) -> int:
     with spinner("Getting ready to submit"):
         if not args.resume: run=make_run(args.manifest,root,cfg,run_id)
         else: print(waiting("step=resume: submitting controller; legacy checks will run inside the controller job"),flush=True)
+        cfg=preflight_runtime(run,{**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")})
         if args.profile=="local":
             if args.resume: run_resume_maintenance(run,cfg)
             local(run)
@@ -179,8 +228,10 @@ def resume_command(args) -> int:
         run=latest_run(root) if args.latest else load_existing(root,args.run)
     validate_run_dir(run)
     cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
+    assert_config_matches_runtime(args.config,cfg); print_runtime_identity(args.config)
     cfg=ensure_qc_provenance(run,read_tsv(run/"provenance"/"manifest.tsv"),cfg); atomic_json(run/"provenance"/"resolved_config.json",cfg)
     if args.skip_trim or args.skip_shovill or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
+    cfg=preflight_runtime(run,{**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")})
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
         print(waiting("step=resume: submitting controller; legacy checks will run inside the controller job"),flush=True)
@@ -251,6 +302,7 @@ def main(argv=None) -> int:
     p=argparse.ArgumentParser(prog="cleangene"); sub=p.add_subparsers(dest="cmd",required=True)
     c=sub.add_parser("check"); c.add_argument("--manifest",type=Path,required=True); c.add_argument("--config",type=Path); c.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); c.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); c.add_argument("--assembler",choices=("shovill","spades","off")); c.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); c.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); c.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); c.set_defaults(func=check)
     e=sub.add_parser("estimate"); e.add_argument("--manifest",type=Path,required=True); e.set_defaults(func=estimate)
+    d=sub.add_parser("doctor"); d.add_argument("--config",type=Path); d.add_argument("--manifest",type=Path); d.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); d.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); d.add_argument("--assembler",choices=("shovill","spades","off")); d.set_defaults(func=doctor)
     r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); r.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); r.add_argument("--assembler",choices=("shovill","spades","off")); r.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); r.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); r.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); r.set_defaults(func=run_command)
     rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--config",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); rs.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); rs.add_argument("--assembler",choices=("shovill","spades","off")); rs.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); rs.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); rs.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); rs.set_defaults(func=resume_command)
     cl=sub.add_parser("cleanup",help="replace retained trimmed FASTQs with links to original FASTQ inputs"); cl.add_argument("--run-dir",type=Path,required=True); cl.add_argument("--dry-run",action="store_true"); cl.set_defaults(func=cleanup_command)

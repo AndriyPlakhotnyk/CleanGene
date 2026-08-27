@@ -9,11 +9,21 @@
    ```
 
 2. **Prepare configuration**  
-   Copy the example and fill your paths.
+   Copy the example and fill your paths. Keep machine-specific values in an
+   ignored local config when possible, especially accounts, private database
+   roots, and exact executable paths.
 
    ```bash
    cp config/cleangene.example.env config/cleangene.env
    vi config/cleangene.env
+   ```
+
+   For ARC or another shared cluster config, prefer:
+
+   ```bash
+   cp config/cleangene.arc.env config/cleangene.arc.local.env
+   vi config/cleangene.arc.local.env
+   cleangene doctor --config config/cleangene.arc.local.env
    ```
 
 3. **Create a manifest**  
@@ -97,14 +107,15 @@
    `standard_8`, `standard_16`, `full`, and `full-standard` normalize to those
    canonical names.
 
-   Set `KRAKEN2_DATABASE_ROOT=/shared/databases/CleanGene` on HPC systems that
-   keep large databases on a dedicated shared filesystem. CleanGene will manage
-   selected databases below that parent, for example
-   `/shared/databases/CleanGene/kraken2_standard-8`. `KRAKEN2_DB` remains an
-   exact database-directory override for intentionally using a custom Kraken2
+   Set `CLEANGENE_DATABASE_ROOT=/path/to/shared/data/CleanGene` on HPC systems
+   that keep large databases on a dedicated shared filesystem. CleanGene will
+   manage selected Kraken2 databases below that parent, for example
+   `/path/to/shared/data/CleanGene/kraken2_standard-8`. `KRAKEN2_DATABASE_ROOT`
+   can override only the Kraken2 parent, and `KRAKEN2_DB` remains an exact
+   database-directory override for intentionally using a custom Kraken2
    database. If CleanGene is installed in a layout where the source/project root
    cannot be identified, the automatic root falls back to
-   `~/.cache/cleangene/databases`; set `KRAKEN2_DATABASE_ROOT` to make the
+   `~/.cache/cleangene/databases`; set `CLEANGENE_DATABASE_ROOT` to make the
    shared location explicit.
 
 8. **FASTQ QC only / skip trimming**
@@ -180,7 +191,10 @@
        --resume <run-id>
    ```
 
-   `cleangene resume --run-dir /path/to/run --config config/cleangene.arc.env` refreshes execution settings for an existing run while retaining completed task markers and the resolved Kraken2 database path.
+   `cleangene resume --run-dir /path/to/run --config config/cleangene.arc.env`
+   refreshes execution settings for an existing run while retaining completed
+   task markers, resolved database paths, and the resolved CheckM2 executable
+   when present.
 
    For a storage-saving resume after all orphaned SLURM tasks have stopped, use:
 
@@ -343,9 +357,19 @@
    `<CleanGene>/databases/checkm2/` directory, reuses
    `CheckM2_database/uniref100.KO.1.dmnd` when present, and otherwise runs the
    installed CheckM2 database downloader once under a shared lock. Later runs
-   reuse the same resolved database path. Set `CHECKM2_DATABASE_ROOT` to place
-   the managed database on a dedicated shared filesystem, or set `CHECKM2_DB`
-   only when intentionally using an exact custom `.dmnd` file.
+   reuse the same resolved database path. Set `CLEANGENE_DATABASE_ROOT` to place
+   all managed databases on a dedicated shared filesystem; CheckM2 will use its
+   `checkm2/` subdirectory. `CHECKM2_DATABASE_ROOT` can override only the
+   CheckM2 parent, and `CHECKM2_DB` should be set only when intentionally using
+   an exact custom `.dmnd` file.
+
+   CleanGene resolves the CheckM2 executable at submission time, before the
+   SLURM controller is started. Resolution honors `CHECKM2_EXECUTABLE`, then
+   `PATH`, then an executable beside the active Python interpreter. The resolved
+   path and version are written to run provenance and reused on resume. Run
+   `cleangene doctor --config config/cleangene.arc.local.env` after editing
+   local settings to verify the active checkout, executable, database roots, and
+   scheduler access.
 
    Setting `CHECKM2_MODE=off` is allowed, but always produces `WARNING` with a
    Note that completeness and contamination were not evaluated. Do not turn it

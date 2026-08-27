@@ -101,14 +101,15 @@ class CleanGeneUtilsTests(unittest.TestCase):
     def test_core_run_prints_submission_messages(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); manifest=root/"manifest.tsv"; manifest.write_text("isolate_id\torganism\tR1\tR2\ni1\tSpecies one\t/r1.fastq.gz\t/r2.fastq.gz\n")
+            config=root/"off.env"; config.write_text("CHECKM2_MODE=off\n")
             stdout=StringIO()
-            with contextlib.redirect_stdout(stdout): main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","messages","--dry-run"])
+            with contextlib.redirect_stdout(stdout): main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","messages","--dry-run","--config",str(config)])
             text=stdout.getvalue(); self.assertTrue(text.startswith("+")); self.assertIn("Cleanse thy pangenome, my liege!",text); self.assertIn(f"Run directory: {root/'runs'/'messages'}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Run submitted. Please find logs in",text); self.assertIn("Welcome to CleanGene, You Grace.",text); self.assertLess(text.index("Cleanse thy pangenome, my liege!"),text.index("Welcome to CleanGene, You Grace.")); self.assertLess(text.index("Welcome to CleanGene, You Grace."),text.index("Run directory:"))
 
     def test_resume_submits_without_login_side_legacy_scans(self):
         with tempfile.TemporaryDirectory() as d:
             run=Path(d)/"runs"/"resume"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
-            atomic_json(run/"provenance"/"resolved_config.json",dict(DEFAULTS))
+            cfg=dict(DEFAULTS); cfg["CHECKM2_MODE"]="off"; atomic_json(run/"provenance"/"resolved_config.json",cfg)
             write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","organism"],[["i1","Species one","Species one"]])
             write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["Species one","i1"]])
             stdout=StringIO()

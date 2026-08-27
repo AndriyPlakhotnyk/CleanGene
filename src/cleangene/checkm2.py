@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .config import truthy
-from .kraken import cleangene_project_root
+from .runtime import cleangene_project_root
 
 EXPECTED_CHECKM2_DB_NAME = "uniref100.KO.1.dmnd"
 
@@ -53,7 +53,12 @@ def default_checkm2_database_root() -> Path:
 
 def checkm2_database_root(cfg: dict[str, str]) -> Path:
     configured = cfg.get("CHECKM2_DATABASE_ROOT", "").strip()
-    return (Path(configured).expanduser() if configured else default_checkm2_database_root()).resolve()
+    generic = cfg.get("CLEANGENE_DATABASE_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if generic:
+        return (Path(generic).expanduser() / "checkm2").resolve()
+    return default_checkm2_database_root()
 
 
 def find_managed_checkm2_db(root: Path) -> Path | None:
@@ -132,7 +137,8 @@ def resolve_checkm2_db(
             return CheckM2DbResolution(existing, "shared_existing")
         if logger:
             logger(f"CheckM2 database not found; preparing shared database | path={root}")
-        runner(["checkm2", "database", "--download", "--path", str(root)])
+        executable = cfg.get("CHECKM2_EXECUTABLE", "").strip() or "checkm2"
+        runner([executable, "database", "--download", "--path", str(root), "--no_write_json_db"])
         downloaded = find_managed_checkm2_db(root)
         if not downloaded:
             raise CheckM2DbError(f"CheckM2 download completed but {EXPECTED_CHECKM2_DB_NAME} was not found under {root}")

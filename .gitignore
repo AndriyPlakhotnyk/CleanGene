@@ -38,6 +38,9 @@ runs/
 *.manifest.csv
 *.xlsx
 config/cleangene.env
+config/*.local.env
+config/*.private.env
+databases/
 results/
 test_data/
 .cleangene_ai_handoff.md
