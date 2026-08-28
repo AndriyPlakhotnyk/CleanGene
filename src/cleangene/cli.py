@@ -119,7 +119,7 @@ def check(args) -> int:
     checkm2_db=Path(cfg.get("CHECKM2_DB","")).expanduser() if cfg.get("CHECKM2_DB","").strip() else None
     if mode=="required" and checkm2_db and not checkm2_db.is_file(): missing.append("CHECKM2_DB")
     print(f"manifest: {len(rows)} isolates / {len(groups(rows))} groups")
-    print(f"inputs: {sum(1 for r in rows if r.get('raw_bam'))} raw BAM / {sum(1 for r in rows if r.get('R1') and r.get('R2'))} FASTQ-pair rows")
+    print(f"inputs: {sum(1 for r in rows if r.get('raw_bam'))} paired uBAM / {sum(1 for r in rows if r.get('R1') and r.get('R2'))} FASTQ-pair rows")
     print("tools: " + ("OK" if not missing else "missing " + ", ".join(missing)))
     if trim_mode=="auto" and not command_exists("fastp"): print("warning: fastp not found; adapter trimming check will be skipped")
     if needs_kraken and not cfg.get("KRAKEN2_DB"): print("warning: KRAKEN2_DB is not configured; run will use KRAKEN2_AUTO_DOWNLOAD if enabled")

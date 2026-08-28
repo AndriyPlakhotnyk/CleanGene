@@ -69,12 +69,19 @@ isolate_id  group_id  R1                    R2
 ERR001      sp00001   /data/r1.fastq.gz     /data/r2.fastq.gz
 ```
 
-Raw sequencing BAM containers are accepted instead of FASTQ pairs:
+One paired, unmapped sequencing BAM (uBAM) is accepted per sample instead of
+the two FASTQ files. The canonical column is `raw_bam`; `ubam`, `uBAM`,
+`unaligned_bam`, `BAM`, and `bam` are accepted aliases:
 
 ```text
 isolate_id  group_id  raw_bam
 ERR001      sp00001   /data/raw_reads.bam
 ```
+
+Each uBAM must contain both mates as unmapped records with balanced READ1 and
+READ2 flags. CleanGene validates it with `samtools flagstat`, name-collates it,
+and extracts complete pairs to run-local compressed FASTQs. Supplying both a
+uBAM and `R1`/`R2` for one sample is an error.
 
 Grouping behavior:
 

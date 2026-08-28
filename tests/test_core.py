@@ -14,6 +14,20 @@ from cleangene.cli import apply_cli_overrides, exclude_command, invalidate_legac
 from unittest.mock import patch
 import subprocess
 
+def _paired_ubam_flagstat(mapped: int = 0) -> dict[str,dict[str,int | float | None]]:
+    passed = {
+        "total":2, "primary":2, "secondary":0, "supplementary":0,
+        "duplicates":0, "primary duplicates":0, "mapped":mapped,
+        "mapped %":0.0, "primary mapped":mapped, "primary mapped %":0.0,
+        "paired in sequencing":2, "read1":1, "read2":1,
+        "properly paired":0, "properly paired %":None,
+        "with itself and mate mapped":0, "singletons":0, "singletons %":0.0,
+        "with mate mapped to a different chr":0,
+        "with mate mapped to a different chr (mapQ >= 5)":0,
+    }
+    failed = {key:(None if value is None else 0) for key,value in passed.items()}
+    return {"QC-passed reads":passed,"QC-failed reads":failed}
+
 class CleanGeneCoreTests(unittest.TestCase):
     def test_organism_results_index_links_complete_isolate_directories(self):
         with tempfile.TemporaryDirectory() as d:
@@ -184,6 +198,65 @@ class CleanGeneCoreTests(unittest.TestCase):
             rows=load_manifest(p)
             self.assertEqual(rows[0]["raw_bam"],"reads.bam")
             self.assertEqual(rows[0]["group_id"],"g1")
+
+    def test_manifest_accepts_ubam_alias_and_rejects_ambiguous_inputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); manifest=root/"manifest.tsv"
+            manifest.write_text("isolate_id\tgroup_id\tubam\niso1\tg1\treads.bam\n")
+            self.assertEqual(load_manifest(manifest)[0]["raw_bam"],"reads.bam")
+            manifest.write_text("isolate_id\tR1\tR2\tubam\niso1\tr1.fastq.gz\tr2.fastq.gz\treads.bam\n")
+            with self.assertRaisesRegex(SystemExit,"either paired R1/R2 FASTQs or one uBAM"):
+                load_manifest(manifest)
+            manifest.write_text("isolate_id\traw_bam\tBAM\niso1\tone.bam\ttwo.bam\n")
+            with self.assertRaisesRegex(SystemExit,"conflicting BAM input columns"):
+                load_manifest(manifest)
+
+    def test_preprocess_extracts_complete_pairs_from_single_ubam(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); ubam=root/"reads.bam"; ubam.write_bytes(b"test ubam")
+            manifest=root/"manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tubam\niso1\tg\t{ubam}\n")
+            cfg={"TAXONOMY_MODE":"off","ASSEMBLER":"off","CHECKM2_MODE":"off","READ_TRIMMING_MODE":"off","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false"}
+            run_dir=make_run(manifest,root,cfg,"r"); commands=[]
+
+            def fake_run(command,**kwargs):
+                commands.append(command)
+                if command[:2]==["samtools","flagstat"]:
+                    atomic_json(kwargs["stdout"],_paired_ubam_flagstat())
+                elif command[:2]==["samtools","collate"]:
+                    Path(command[command.index("-o")+1]).write_bytes(b"collated")
+                elif command[:2]==["samtools","fastq"]:
+                    for option,sequence in (("-1","A"),("-2","T")):
+                        with gzip.open(command[command.index(option)+1],"wt") as handle:
+                            handle.write(f"@pair\n{sequence}\n+\nI\n")
+                    for option in ("-0","-s"):
+                        with gzip.open(command[command.index(option)+1],"wt"):
+                            pass
+                else:
+                    raise AssertionError(f"Unexpected command: {command}")
+
+            with patch("cleangene.workers.run",side_effect=fake_run):
+                preprocess(run_dir,0)
+            sample=run_dir/"results"/"sample_data"/"iso1"; qc=read_tsv(sample/"qc.tsv")[0]
+            self.assertEqual([command[1] for command in commands],["flagstat","collate","fastq"])
+            self.assertEqual(qc["raw_bam"],str(ubam)); self.assertEqual(qc["read_preprocessing"],"paired_ubam_samtools_fastq")
+            self.assertTrue(Path(qc["R1"]).is_file()); self.assertTrue(Path(qc["R2"]).is_file())
+            self.assertFalse((sample/"reads"/"raw_name_collated.bam").exists())
+            self.assertFalse((sample/"reads"/"raw_singletons.fastq.gz").exists())
+            self.assertTrue((sample/"logs"/"samtools-flagstat.json").is_file())
+            self.assertTrue((run_dir/"state"/"preprocess"/"iso1.done.json").is_file())
+            self.assertEqual(read_tsv(run_dir/"provenance"/"manifest.tsv")[0]["raw_bam"],str(ubam))
+
+    def test_preprocess_rejects_mapped_bam_as_ubam(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); ubam=root/"mapped.bam"; ubam.write_bytes(b"mapped")
+            out=root/"out"; logs=root/"logs"; logs.mkdir()
+            row={"isolate_id":"iso1","raw_bam":str(ubam)}
+            def fake_run(command,**kwargs):
+                atomic_json(kwargs["stdout"],_paired_ubam_flagstat(mapped=2))
+            with patch("cleangene.workers.run",side_effect=fake_run) as tool_run:
+                with self.assertRaisesRegex(SystemExit,"not a valid paired unmapped BAM"):
+                    prepare_read_inputs(row,out,logs,{"ASSEMBLER":"off","CPUS":"2"})
+            tool_run.assert_called_once()
 
     def test_manifest_marks_missing_organism_for_kraken_grouping(self):
         with tempfile.TemporaryDirectory() as d:

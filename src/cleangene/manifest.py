@@ -4,7 +4,7 @@ from pathlib import Path
 from .util import write_tsv
 
 PANGENOME_COLUMNS = ("pangenome_dir", "panaroo_dir", "pangenome")
-BAM_COLUMNS = ("raw_bam", "BAM", "bam")
+BAM_COLUMNS = ("raw_bam", "ubam", "uBAM", "unaligned_bam", "BAM", "bam")
 ARTIFACT_COLUMNS = (
     "reads_processed", "read_processing_pipeline", "read_processing_version",
     "read_qc_tsv", "fastp_json", "kraken_report", "assembly", "gff",
@@ -46,9 +46,14 @@ def load_manifest(path: Path) -> list[dict[str, str]]:
         if isolate in seen:
             raise SystemExit(f"Duplicate isolate_id in manifest: {isolate}")
         seen.add(isolate)
-        bam = next((row.get(c, "") for c in BAM_COLUMNS if row.get(c, "")), "")
+        bam_values = {row[c] for c in BAM_COLUMNS if row.get(c, "")}
+        if len(bam_values) > 1:
+            raise SystemExit(f"Manifest row {line} provides conflicting BAM input columns")
+        bam = next(iter(bam_values), "")
         row["raw_bam"] = bam
         has_fastq = bool(row.get("R1") and row.get("R2"))
+        if bam and (row.get("R1") or row.get("R2")):
+            raise SystemExit(f"Manifest row {line} must provide either paired R1/R2 FASTQs or one uBAM, not both")
         has_reusable_artifact = any(row.get(column, "") for column in ("assembly", "gff", "protein_fasta", "checkm2_report", *PANGENOME_COLUMNS))
         if not has_fastq and not bam and not has_reusable_artifact:
             raise SystemExit(f"Manifest row {line} must provide R1/R2, raw_bam, or reusable artifacts")

@@ -426,6 +426,38 @@ def _write_provenance(path: Path, rows: list[dict[str,object]]) -> None:
     fields=["artifact","source","path","size_bytes","mtime","sha256","tool","version","parameters"]
     write_tsv(path,fields,rows)
 
+def _paired_ubam_read_count(path: Path, logs: Path, threads: str, isolate: str) -> int:
+    stats_path=logs/"samtools-flagstat.json"
+    try:
+        run(["samtools","flagstat","-@",threads,"-O","json",str(path)],stdout=stats_path,stderr=logs/"samtools-flagstat.stderr")
+        payload=load_json(stats_path)
+        sections=[payload[name] for name in ("QC-passed reads","QC-failed reads")]
+        count=lambda key: sum(int(section[key]) for section in sections)
+        total=count("total"); primary=count("primary"); mapped=count("mapped")
+        secondary=count("secondary"); supplementary=count("supplementary")
+        paired=count("paired in sequencing"); read1=count("read1"); read2=count("read2")
+    except (OSError,ValueError,TypeError,KeyError,subprocess.CalledProcessError) as error:
+        raise SystemExit(f"Input uBAM validation failed for isolate {isolate}: {error}") from error
+    problems=[]
+    if total<=0: problems.append("contains no reads")
+    if mapped: problems.append(f"contains {mapped} mapped records")
+    if secondary or supplementary: problems.append(f"contains {secondary} secondary and {supplementary} supplementary records")
+    if primary!=total: problems.append(f"has {primary} primary records but {total} total records")
+    if paired!=total: problems.append(f"has {paired} paired records but {total} total records")
+    if read1<=0 or read2<=0 or read1!=read2 or read1+read2!=paired:
+        problems.append(f"has unbalanced mate flags (read1={read1}, read2={read2}, paired={paired})")
+    if problems:
+        raise SystemExit(
+            f"Input BAM for isolate {isolate} is not a valid paired unmapped BAM (uBAM): "
+            + "; ".join(problems)
+        )
+    return read1
+
+def _fastq_has_records(path: Path) -> bool:
+    opener=gzip.open if path.suffix==".gz" else Path.open
+    with opener(path,"rb") as handle:
+        return bool(handle.read(1))
+
 def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str,str]) -> tuple[str,str,str,int,str]:
     r1=row.get("R1","").strip(); r2=row.get("R2","").strip(); mode=cfg.get("READ_TRIMMING_MODE","auto").strip().lower()
     decision=""
@@ -435,17 +467,26 @@ def prepare_read_inputs(row: dict[str,str], out: Path, logs: Path, cfg: dict[str
     raw_bam=row.get("raw_bam","").strip()
 
     if raw_bam:
-        if not Path(raw_bam).is_file():
+        bam_path=Path(raw_bam).expanduser()
+        if not bam_path.is_file():
             raise SystemExit(f"Input BAM not found for isolate {row.get('isolate_id','<unknown>')}: {raw_bam}")
-        reads=out/"reads"; reads.mkdir(exist_ok=True)
+        reads=out/"reads"; reads.mkdir(parents=True,exist_ok=True)
         r1=str(reads/"raw_R1.fastq.gz"); r2=str(reads/"raw_R2.fastq.gz")
         collated=reads/"raw_name_collated.bam"
-        other=reads/"raw_unpaired.fastq.gz"
+        ambiguous=reads/"raw_ambiguous.fastq.gz"; singletons=reads/"raw_singletons.fastq.gz"
         threads=str(max(1,int(cfg.get("CPUS","4"))-1))
-        run(["samtools","collate","-@",threads,"-o",str(collated),raw_bam],stdout=logs/"samtools-collate.stdout",stderr=logs/"samtools-collate.stderr")
-        run(["samtools","fastq","-@",threads,"-1",r1,"-2",r2,"-0",str(other),"-s",str(other),"-n",str(collated)],
+        isolate=row.get("isolate_id","<unknown>")
+        _paired_ubam_read_count(bam_path,logs,threads,isolate)
+        run(["samtools","collate","-@",threads,"-o",str(collated),str(bam_path)],stdout=logs/"samtools-collate.stdout",stderr=logs/"samtools-collate.stderr")
+        run(["samtools","fastq","-@",threads,"-1",r1,"-2",r2,"-0",str(ambiguous),"-s",str(singletons),"-n",str(collated)],
             stdout=logs/"samtools-fastq.stdout",stderr=logs/"samtools-fastq.stderr")
-        method="raw_bam_samtools_fastq"
+        collated.unlink(missing_ok=True)
+        if _fastq_has_records(ambiguous) or _fastq_has_records(singletons):
+            raise SystemExit(f"Input uBAM for isolate {isolate} contains records that cannot be emitted as complete read pairs")
+        ambiguous.unlink(); singletons.unlink()
+        if not _fastq_has_records(Path(r1)) or not _fastq_has_records(Path(r2)):
+            raise SystemExit(f"Input uBAM for isolate {isolate} produced no complete paired FASTQ reads")
+        method="paired_ubam_samtools_fastq"
 
     if not r1 or not r2:
         raise SystemExit(f"Missing R1/R2 read paths for isolate {row.get('isolate_id','<unknown>')}")

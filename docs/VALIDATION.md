@@ -36,7 +36,7 @@ Resume invalidates legacy metrics where covered genes were serialized as `identi
 ## Deliberate v0.1 boundaries
 
 - If `group_id` is omitted, CleanGene uses `organism` as the group label, falling back to `default`.
-- Input reads may be supplied as paired FASTQs (`R1`/`R2`) or as an unmapped/raw sequencing BAM (`raw_bam`, `BAM`, or `bam`). Raw BAM reads are extracted with `samtools fastq` before assembly, taxonomy, and BWA validation.
+- Input reads may be supplied as paired FASTQs (`R1`/`R2`) or as one paired unmapped sequencing BAM (`raw_bam`; aliases `ubam`, `uBAM`, `unaligned_bam`, `BAM`, and `bam`). CleanGene requires balanced unmapped READ1/READ2 records, name-collates the uBAM, and extracts complete pairs with `samtools fastq` before assembly, taxonomy, and BWA validation. A row cannot provide both input forms.
 - `READ_TRIMMING_MODE` controls adapter handling: `auto` runs `fastp --detect_adapter_for_pe` when available, `always` requires `fastp`, and `off` leaves reads unchanged.
 - Skani is not part of the CleanGene pipeline. If `group_id` is absent but `organism` is supplied, `organism` becomes the pangenome group. If both are absent, CleanGene runs Kraken2 and groups isolates by inferred top species.
 - With `TAXONOMY_MODE=auto`, Kraken2 runs only when needed for missing organism/group IDs. Use `TAXONOMY_MODE=kraken2` to force taxonomic QC for already grouped manifests.
