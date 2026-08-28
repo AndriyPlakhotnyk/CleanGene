@@ -11,7 +11,13 @@ from cleangene.checkm2 import checkm2_database_root
 from cleangene.cli import main
 from cleangene.kraken import managed_kraken2_db_path
 from cleangene.runtime import assert_config_matches_runtime, cleangene_project_root
-from cleangene.tools import ToolResolutionError, resolve_checkm2_executable, resolve_executable
+from cleangene.tools import (
+    CHECKM2_VERSION_TIMEOUT_SECONDS,
+    ToolResolutionError,
+    executable_version,
+    resolve_checkm2_executable,
+    resolve_executable,
+)
 
 
 def _write_executable(path: Path) -> Path:
@@ -22,6 +28,25 @@ def _write_executable(path: Path) -> Path:
 
 
 class RuntimeResolutionTests(unittest.TestCase):
+    def test_checkm2_version_probe_allows_slow_hpc_startup(self):
+        completed = subprocess.CompletedProcess(["checkm2", "--version"], 0, "1.1.0\n", "")
+        with patch("cleangene.tools.subprocess.run", return_value=completed) as run:
+            self.assertEqual(executable_version("checkm2", "CheckM2"), "1.1.0")
+        run.assert_called_once_with(
+            ["checkm2", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=CHECKM2_VERSION_TIMEOUT_SECONDS,
+        )
+
+    def test_checkm2_version_probe_reports_timeout(self):
+        with patch(
+            "cleangene.tools.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["checkm2", "--version"], CHECKM2_VERSION_TIMEOUT_SECONDS),
+        ):
+            with self.assertRaisesRegex(ToolResolutionError, "within 300 seconds"):
+                executable_version("checkm2", "CheckM2")
+
     def test_resolve_executable_from_path(self):
         with tempfile.TemporaryDirectory() as d:
             exe = _write_executable(Path(d) / "bin" / "checkm2")
@@ -91,6 +116,18 @@ class RuntimeResolutionTests(unittest.TestCase):
             self.assertEqual(result, 0, output.getvalue())
             self.assertIn("CheckM2 executable: OK", output.getvalue())
             self.assertIn("CheckM2 database: not present; will be created by checkm2_db_setup", output.getvalue())
+
+    def test_doctor_checkm2_failure_names_repair_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            config = root / "arc.local.env"
+            config.write_text("CHECKM2_MODE=required\nTAXONOMY_MODE=off\n")
+            output = StringIO()
+            environment = {**os.environ, "CONDA_DEFAULT_ENV":"cleangene", "CONDA_PREFIX":str(root / "envs" / "cleangene")}
+            with patch.dict(os.environ, environment, clear=True), patch("cleangene.cli.sys.executable", str(root / "envs" / "cleangene" / "bin" / "python")), patch("cleangene.cli.command_exists", return_value=True), patch("cleangene.cli.resolve_checkm2_executable", side_effect=ToolResolutionError("missing checkm2")), contextlib.redirect_stdout(output):
+                result = main(["doctor", "--config", str(config)])
+            self.assertEqual(result, 2)
+            self.assertIn("Fix: bash scripts/install_or_update.sh --recreate", output.getvalue())
 
     def test_config_from_other_checkout_fails_without_external_database_root(self):
         active = cleangene_project_root()

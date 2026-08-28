@@ -228,7 +228,9 @@ The CheckM2 executable is resolved before controller submission. Resolution
 honors an explicit `CHECKM2_EXECUTABLE`, then `PATH`, an executable beside the
 active Python, and finally the sibling `cleangene-checkm2` environment. The
 absolute executable and version are stored in `provenance/resolved_config.json`
-and used for `--version`, database download, and prediction.
+and used for `--version`, database download, and prediction. The version probe
+allows up to five minutes because the first TensorFlow import can be slow on an
+HPC login node.
 
 With normal settings, `checkm2_db_setup` reuses
 `CheckM2_database/uniref100.KO.1.dmnd` below the managed root or downloads it

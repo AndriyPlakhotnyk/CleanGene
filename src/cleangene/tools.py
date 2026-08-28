@@ -11,6 +11,9 @@ class ToolResolutionError(RuntimeError):
     pass
 
 
+CHECKM2_VERSION_TIMEOUT_SECONDS = 300
+
+
 def _validate_executable(path: Path, name: str) -> Path:
     resolved = path.expanduser().resolve()
     if not resolved.is_file():
@@ -68,10 +71,18 @@ def resolve_checkm2_executable(configured: str = "", python_executable: str | Pa
         ) from error
 
 
-def executable_version(executable: Path | str, label: str) -> str:
+def executable_version(
+    executable: Path | str,
+    label: str,
+    timeout_seconds: int = CHECKM2_VERSION_TIMEOUT_SECONDS,
+) -> str:
     command = [str(executable), "--version"]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        raise ToolResolutionError(
+            f"{label} executable did not complete `--version` within {timeout_seconds} seconds"
+        ) from error
     except (OSError, subprocess.SubprocessError) as error:
         raise ToolResolutionError(f"{label} executable could not run `--version`: {error}")
     if result.returncode:

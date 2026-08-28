@@ -204,7 +204,7 @@ def doctor(args) -> int:
             version=executable_version(executable,"CheckM2")
             print(f"CheckM2 executable: OK path={executable} version={version}")
         except ToolResolutionError as error:
-            failures+=1; print(f"CheckM2 executable: ERROR {error}")
+            failures+=1; print(f"CheckM2 executable: ERROR {error}. Fix: bash scripts/install_or_update.sh --recreate")
         try:
             resolution=resolve_checkm2_db(cfg,allow_download=False)
             print(f"CheckM2 database: OK path={resolution.path}")
