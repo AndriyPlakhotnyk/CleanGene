@@ -8,8 +8,10 @@ from typing import Callable, Sequence
 from .config import truthy
 from .runtime import cleangene_project_root
 from .tools import ToolResolutionError, resolve_checkm2_executable
+from .util import atomic_json, load_json
 
 EXPECTED_CHECKM2_DB_NAME = "uniref100.KO.1.dmnd"
+RUNTIME_VERIFICATION_MARKER = ".cleangene-runtime-verified.json"
 
 
 class CheckM2DbError(RuntimeError):
@@ -25,6 +27,59 @@ class CheckM2DbResolution:
     path: Path
     source: str
     explicit: bool = False
+
+
+def _file_signature(path: Path) -> dict[str, object]:
+    stat = path.stat()
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _checkm2_env_history(executable: Path) -> Path | None:
+    for parent in executable.parents:
+        if parent.name == "bin":
+            candidate = parent.parent / "conda-meta" / "history"
+            if candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
+def checkm2_runtime_signature(path: Path | str, executable: Path | str, version: str) -> dict[str, object]:
+    database = Path(path).expanduser().resolve()
+    resolved_executable = Path(executable).expanduser().resolve()
+    env_history = _checkm2_env_history(resolved_executable)
+    return {
+        "schema": 2,
+        "CHECKM2_DB": str(database),
+        "CHECKM2_DB_FILE": _file_signature(database),
+        "CHECKM2_EXECUTABLE": str(resolved_executable),
+        "CHECKM2_EXECUTABLE_FILE": _file_signature(resolved_executable),
+        "CHECKM2_CONDA_HISTORY_FILE": _file_signature(env_history) if env_history else None,
+        "CHECKM2_VERSION": version,
+    }
+
+
+def checkm2_runtime_marker(cfg: dict[str, str]) -> Path:
+    return checkm2_database_root(cfg) / RUNTIME_VERIFICATION_MARKER
+
+
+def checkm2_runtime_is_verified(cfg: dict[str, str], path: Path | str,
+                                executable: Path | str, version: str) -> bool:
+    marker = checkm2_runtime_marker(cfg)
+    if not marker.is_file():
+        return False
+    try:
+        recorded = load_json(marker)
+        expected = checkm2_runtime_signature(path, executable, version)
+    except (OSError, ValueError):
+        return False
+    return recorded.get("status") == "complete" and all(recorded.get(key) == value for key, value in expected.items())
+
+
+def record_checkm2_runtime_verified(cfg: dict[str, str], path: Path | str,
+                                    executable: Path | str, version: str) -> Path:
+    marker = checkm2_runtime_marker(cfg)
+    atomic_json(marker, {"status": "complete", **checkm2_runtime_signature(path, executable, version)})
+    return marker
 
 
 def validate_checkm2_db(path: Path | str) -> None:

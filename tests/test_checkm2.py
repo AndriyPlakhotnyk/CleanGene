@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, checkm2_database_root, resolve_checkm2_db, validate_checkm2_db
+from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, checkm2_database_root, checkm2_runtime_marker, resolve_checkm2_db, validate_checkm2_db
 from cleangene.cli import make_run
 from cleangene.util import atomic_json, load_json, read_tsv, write_tsv
 from cleangene.workers import checkm2_db_setup, preprocess, slurm_controller
@@ -52,6 +52,27 @@ class CheckM2DatabaseTests(unittest.TestCase):
             self.assertEqual(resolved["CHECKM2_EXECUTABLE"], str(exe.resolve()))
             self.assertEqual(resolved["CHECKM2_VERSION"], "CheckM2 version 1.1.0")
             self.assertEqual(marker["source"], "shared_existing")
+            self.assertTrue(marker["runtime_verified"])
+            self.assertTrue(checkm2_runtime_marker(cfg).is_file())
+
+    def test_runtime_smoke_test_failure_stops_before_preprocess(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); exe=_write_executable(root/"bin"/"checkm2"); run=root/"run"
+            cfg={"CHECKM2_MODE":"required","CHECKM2_DATABASE_ROOT":str(root/"checkm2"),"CHECKM2_AUTO_DOWNLOAD":"true","CHECKM2_EXECUTABLE":str(exe)}
+            db=checkm2_database_root(cfg)/"CheckM2_database"/EXPECTED_CHECKM2_DB_NAME; _write_db(db)
+            atomic_json(run/"provenance"/"resolved_config.json",cfg)
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2"],[["i1","g","r1","r2"]])
+
+            def fail_testrun(command, **kwargs):
+                kwargs["stderr"].parent.mkdir(parents=True,exist_ok=True)
+                kwargs["stderr"].write_text("database checksum is incompatible\n")
+                raise __import__("subprocess").CalledProcessError(1,command)
+
+            with patch("cleangene.workers.run",side_effect=fail_testrun):
+                with self.assertRaisesRegex(SystemExit,"database checksum is incompatible"):
+                    checkm2_db_setup(run)
+            self.assertFalse((run/"state"/"checkm2_db_setup.done.json").exists())
+            self.assertFalse(checkm2_runtime_marker(cfg).exists())
 
     def test_missing_db_auto_downloads_once(self):
         with tempfile.TemporaryDirectory() as d:
@@ -138,11 +159,15 @@ class CheckM2PreprocessTests(unittest.TestCase):
                     (out / f"{prefix}.gff").write_text("##gff-version 3\n")
                     (out / f"{prefix}.gbk").write_text("gbk\n")
 
-            with patch("cleangene.workers.command_exists", return_value=True), patch("cleangene.workers.run", side_effect=fake_run):
+            with patch("cleangene.workers.command_exists", return_value=True), patch("cleangene.workers.run", side_effect=fake_run) as runner:
                 preprocess(run, 0)
             self.assertFalse(any(c[0] == "fastp" for c in commands))
             self.assertFalse(any(c[0] == "shovill" for c in commands))
             self.assertIn(str(exe.resolve()), [c[0] for c in commands])
+            checkm2_call=next(call for call in runner.call_args_list if Path(call.args[0][0]).name=="checkm2")
+            self.assertEqual(checkm2_call.args[0][checkm2_call.args[0].index("--threads")+1],"1")
+            self.assertEqual(checkm2_call.kwargs["env"]["TF_NUM_INTEROP_THREADS"],"1")
+            self.assertEqual(checkm2_call.kwargs["env"]["OPENBLAS_NUM_THREADS"],"1")
             spades = next(c for c in commands if c[0] == "spades.py")
             self.assertIn("--only-assembler", spades)
             prokka = next(c for c in commands if c[0] == "prokka")
@@ -170,12 +195,13 @@ class CheckM2PreprocessTests(unittest.TestCase):
                 if command[0] == "shovill":
                     out = Path(command[command.index("--outdir") + 1]); out.mkdir(parents=True, exist_ok=True); (out / "contigs.fa").write_text(">c\n" + "A"*120 + "\n")
                 elif Path(command[0]).name == "checkm2":
-                    raise SystemExit("Preprocessing infrastructure failure: CheckM2 crashed")
+                    kwargs["stderr"].write_text("double free or corruption in CheckM2 metadata worker\n")
+                    raise __import__("subprocess").CalledProcessError(134,command)
                 elif command[0] == "prokka":
                     raise AssertionError("Prokka should not run after CheckM2 infrastructure failure")
 
             with patch("cleangene.workers.command_exists", return_value=True), patch("cleangene.workers.run", side_effect=fake_run):
-                with self.assertRaisesRegex(SystemExit, "CheckM2 crashed"):
+                with self.assertRaisesRegex(SystemExit, "double free or corruption"):
                     preprocess(run, 0)
             sample = run / "results" / "sample_data" / "iso1"
             self.assertFalse((sample / "qc.tsv").exists())

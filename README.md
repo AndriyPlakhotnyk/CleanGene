@@ -243,13 +243,20 @@ With normal settings, `checkm2_db_setup` reuses
 `CheckM2_database/uniref100.KO.1.dmnd` below the managed root or downloads it
 once under an inter-process lock. Download uses the resolved companion
 executable with `--no_write_json_db`; prediction always supplies
-`--database_path` and `--remove-intermediates`. An invalid explicit
+`--database_path` and `--remove-intermediates`. Before any preprocess arrays
+start, the setup job runs CheckM2's bundled `testrun` once for each executable,
+version, and database combination. Successful verification is recorded beside
+the managed database and reused by later runs. An invalid explicit
 `CHECKM2_DB` fails closed.
 
 `CHECKM2_CPUS`, `CHECKM2_MEM`, and `CHECKM2_TIME` size database setup.
-Per-isolate prediction runs inside preprocess and uses `CPUS`. A supplied
-`checkm2_report` remains reusable. `CHECKM2_MODE=off` is supported but produces
-a QC warning because completeness and contamination were not evaluated.
+Per-isolate prediction runs inside preprocess. `CHECKM2_PREDICT_CPUS` defaults
+to one because CleanGene already parallelizes samples, and
+`CHECKM2_MAX_INFLIGHT` bounds concurrent CheckM2 processes across a run. BLAS
+and TensorFlow helper pools are also held to one thread to avoid multiplying
+the Slurm allocation. A supplied `checkm2_report` remains reusable.
+`CHECKM2_MODE=off` is supported but produces a QC warning because completeness
+and contamination were not evaluated.
 
 ### Managed Kraken2 databases
 

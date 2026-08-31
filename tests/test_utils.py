@@ -104,7 +104,7 @@ class CleanGeneUtilsTests(unittest.TestCase):
             config=root/"off.env"; config.write_text("CHECKM2_MODE=off\n")
             stdout=StringIO()
             with contextlib.redirect_stdout(stdout): main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","messages","--dry-run","--config",str(config)])
-            text=stdout.getvalue(); self.assertTrue(text.startswith("+")); self.assertIn("Cleanse thy pangenome, my liege!",text); self.assertIn(f"Run directory: {root/'runs'/'messages'}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Run submitted. Please find logs in",text); self.assertIn("Welcome to CleanGene, You Grace.",text); self.assertLess(text.index("Cleanse thy pangenome, my liege!"),text.index("Welcome to CleanGene, You Grace.")); self.assertLess(text.index("Welcome to CleanGene, You Grace."),text.index("Run directory:"))
+            text=stdout.getvalue(); self.assertTrue(text.startswith("+")); self.assertIn("Cleanse thy pangenome, my liege!",text); self.assertIn(f"Run directory: {root/'runs'/'messages'}",text); self.assertIn("Getting ready to submit",text); self.assertIn("Run submitted. Please find logs in",text); self.assertIn("Welcome to CleanGene, Your Grace.",text); self.assertLess(text.index("Cleanse thy pangenome, my liege!"),text.index("Welcome to CleanGene, Your Grace.")); self.assertLess(text.index("Welcome to CleanGene, Your Grace."),text.index("Run directory:"))
 
     def test_resume_submits_without_login_side_legacy_scans(self):
         with tempfile.TemporaryDirectory() as d:
@@ -115,6 +115,6 @@ class CleanGeneUtilsTests(unittest.TestCase):
             stdout=StringIO()
             with patch("cleangene.cli.slurm",return_value="123") as submit_job, patch("cleangene.cli.invalidate_legacy_identity_metrics",side_effect=AssertionError("slow identity scan ran")), patch("cleangene.cli.invalidate_legacy_isolate_qc",side_effect=AssertionError("slow QC scan ran")), contextlib.redirect_stdout(stdout):
                 self.assertEqual(main(["resume","--run-dir",str(run)]),0)
-            self.assertEqual(submit_job.call_count,1); text=stdout.getvalue(); self.assertTrue(text.startswith("+")); self.assertIn("Cleanse thy pangenome, my liege!",text); self.assertIn("legacy checks will run inside the controller job",text); self.assertIn("Run submitted. Please find logs in",text); self.assertIn("Welcome to CleanGene, You Grace.",text); self.assertLess(text.index("Welcome to CleanGene, You Grace."),text.index("Run directory:"))
+            self.assertEqual(submit_job.call_count,1); text=stdout.getvalue(); self.assertTrue(text.startswith("+")); self.assertIn("Cleanse thy pangenome, my liege!",text); self.assertIn("legacy checks will run inside the controller job",text); self.assertIn("Run submitted. Please find logs in",text); self.assertIn("Welcome to CleanGene, Your Grace.",text); self.assertLess(text.index("Welcome to CleanGene, Your Grace."),text.index("Run directory:"))
 
 if __name__=="__main__": unittest.main()

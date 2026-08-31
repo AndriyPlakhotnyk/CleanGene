@@ -42,10 +42,11 @@ def atomic_json(path: Path, data: object) -> None:
 def load_json(path: Path):
     with path.open() as handle: return json.load(handle)
 
-def run(cmd: Sequence[str], *, stdout: Path | None = None, stderr: Path | None = None, cwd: Path | None = None) -> None:
+def run(cmd: Sequence[str], *, stdout: Path | None = None, stderr: Path | None = None,
+        cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     out = stdout.open("w") if stdout else None
     err = stderr.open("w") if stderr else None
-    try: subprocess.run(list(cmd), check=True, stdout=out, stderr=err, cwd=cwd)
+    try: subprocess.run(list(cmd), check=True, stdout=out, stderr=err, cwd=cwd, env=env)
     finally:
         if out: out.close()
         if err: err.close()

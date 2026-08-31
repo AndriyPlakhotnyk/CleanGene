@@ -158,7 +158,7 @@ def _doctor_config_errors(cfg: dict[str,str]) -> list[str]:
     for key,allowed in enums.items():
         value=cfg.get(key,"").strip().lower()
         if value not in allowed: errors.append(f"{key} must be one of {', '.join(sorted(allowed))}; got {value!r}")
-    positive=("CPUS","SLURM_CPUS","SLURM_ARRAY_CHUNK_SIZE","SLURM_MAX_OUTSTANDING_CHUNKS","SLURM_USER_JOB_LIMIT","SLURM_CONTROLLER_CPUS","KRAKEN2_DB_CPUS","CHECKM2_CPUS","VALIDATION_CPUS")
+    positive=("CPUS","SLURM_CPUS","SLURM_ARRAY_CHUNK_SIZE","SLURM_MAX_OUTSTANDING_CHUNKS","SLURM_USER_JOB_LIMIT","SLURM_CONTROLLER_CPUS","KRAKEN2_DB_CPUS","CHECKM2_CPUS","CHECKM2_PREDICT_CPUS","CHECKM2_MAX_INFLIGHT","VALIDATION_CPUS")
     nonnegative=("SLURM_MAX_PARALLEL","SLURM_PREPROCESS_MAX_INFLIGHT","SLURM_VALIDATION_MAX_INFLIGHT","SLURM_GROUP_MAX_INFLIGHT","SLURM_JOB_HEADROOM","SLURM_USER_CPU_LIMIT","SLURM_CPU_HEADROOM","SLURM_POLL_SECONDS")
     for key in positive+nonnegative:
         try: value=int(cfg.get(key,""))
@@ -268,7 +268,7 @@ def shlex_quote(x:str)->str:
 
 def run_command(args) -> int:
     print(clean_gene_banner())
-    print(submitted("Welcome to CleanGene, You Grace."))
+    print(submitted("Welcome to CleanGene, Your Grace."))
     cfg=apply_cli_overrides(read_env(args.config),args); assert_config_matches_runtime(args.config,cfg); print_runtime_identity(args.config); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
         run=load_existing(root,args.resume); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
@@ -291,7 +291,7 @@ def run_command(args) -> int:
 
 def resume_command(args) -> int:
     print(clean_gene_banner())
-    print(submitted("Welcome to CleanGene, You Grace."))
+    print(submitted("Welcome to CleanGene, Your Grace."))
     if args.run_dir: run=args.run_dir.expanduser().resolve()
     else:
         root=(args.analysis_root or Path.cwd()).expanduser().resolve()

@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, truthy
-from .checkm2 import CheckM2DbError, CheckM2DbNotReady, resolve_checkm2_db, validate_checkm2_db
+from .checkm2 import CheckM2DbError, CheckM2DbNotReady, checkm2_runtime_is_verified, checkm2_runtime_marker, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
 from .completion import find_isolate_qc_candidates, reconcile_preprocess_outputs, validate_preprocess_completion
 from .defaults import DEFAULTS
 from .evidence import validate_isolate, validation_decision_logic_rows
@@ -79,6 +79,55 @@ def parse_kraken_report(path: Path, expected: str) -> tuple[str,float,float]:
     contamination=sum(pct for name,pct in species if " ".join(name.casefold().split())!=reference)
     return top[0], contamination, max(0.0,100.0-unclassified)
 
+def _log_tail(path: Path, lines: int = 40, limit: int = 8000) -> str:
+    try:
+        text="\n".join(path.read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return ""
+    return text[-limit:].strip()
+
+def _checkm2_environment() -> dict[str,str]:
+    env=os.environ.copy()
+    for key in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS",
+                "TF_NUM_INTRAOP_THREADS","TF_NUM_INTEROP_THREADS"):
+        env[key]="1"
+    return env
+
+def _checkm2_threads(cfg: dict[str,str]) -> str:
+    requested=max(1,int(cfg.get("CHECKM2_PREDICT_CPUS","1")))
+    allocated=max(1,int(os.environ.get("SLURM_CPUS_PER_TASK",cfg.get("CPUS","1"))))
+    return str(min(requested,allocated))
+
+def _run_root_for_sample_logs(logs: Path) -> Path:
+    for parent in logs.resolve().parents:
+        if parent.name=="results": return parent.parent
+    raise OSError(f"Could not resolve the CleanGene run root from sample log directory: {logs}")
+
+@contextmanager
+def _checkm2_prediction_slot(logs: Path, cfg: dict[str,str], isolate: str):
+    slots=max(1,int(cfg.get("CHECKM2_MAX_INFLIGHT","8")))
+    lock_dir=_run_root_for_sample_logs(logs)/"state"/"checkm2_predict_slots"
+    lock_dir.mkdir(parents=True,exist_ok=True)
+    announced=False
+    while True:
+        for index in range(slots):
+            handle=(lock_dir/f"slot-{index}.lock").open("a+")
+            try:
+                fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                continue
+            try:
+                yield index
+            finally:
+                fcntl.flock(handle,fcntl.LOCK_UN)
+                handle.close()
+            return
+        if not announced:
+            _controller_log(f"CheckM2 concurrency limit reached; isolate {isolate} is waiting for a prediction slot")
+            announced=True
+        time.sleep(5)
+
 def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isolate: str) -> tuple[float,float]:
     try: validate_checkm2_db(cfg.get("CHECKM2_DB",""))
     except CheckM2DbError as error: raise SystemExit(f"Preprocessing infrastructure failure: CheckM2 database is not ready: {error}")
@@ -88,7 +137,8 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
     started=time.monotonic(); status="failed"
     try:
         executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_checkm2_executable())
-        run([executable,"predict","--threads",cfg.get("CPUS","4"),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr")
+        with _checkm2_prediction_slot(logs,cfg,isolate):
+            run([executable,"predict","--threads",_checkm2_threads(cfg),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr",env=_checkm2_environment())
         report=result_dir/"quality_report.tsv"
         rows=read_tsv(report) if report.is_file() and report.stat().st_size>0 else []
         if len(rows)!=1:
@@ -99,7 +149,9 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
         status="complete"
         return parse_checkm2_report(report)
     except (subprocess.CalledProcessError,ValueError,OSError) as error:
-        raise SystemExit(f"Preprocessing infrastructure failure: CheckM2 could not evaluate isolate {isolate}: {error}")
+        stderr=_log_tail(logs/"checkm2.stderr")
+        detail=f"\nCheckM2 stderr (last lines):\n{stderr}" if stderr else ""
+        raise SystemExit(f"Preprocessing infrastructure failure: CheckM2 could not evaluate isolate {isolate}: {error}{detail}")
     finally:
         try:
             (logs/"checkm2.timing.tsv").write_text(f"isolate_id\tstatus\telapsed_seconds\n{isolate}\t{status}\t{time.monotonic()-started:.3f}\n")
@@ -141,8 +193,39 @@ def _write_resolved_checkm2_config(run_dir: Path, cfg: dict[str,str], resolution
 def _run_checkm2_database_downloader(command: list[str], run_dir: Path) -> None:
     run(command,stdout=run_dir/"logs"/"checkm2-db.stdout",stderr=run_dir/"logs"/"checkm2-db.stderr")
 
+def _verify_checkm2_runtime(run_dir: Path, cfg: dict[str,str], resolution) -> None:
+    executable=cfg["CHECKM2_EXECUTABLE"]
+    version=cfg["CHECKM2_VERSION"]
+    if checkm2_runtime_is_verified(cfg,resolution.path,executable,version):
+        _controller_log(f"CheckM2 runtime: reusing successful shared verification | path={resolution.path}",ok=True)
+        return
+    marker=checkm2_runtime_marker(cfg)
+    marker.parent.mkdir(parents=True,exist_ok=True)
+    lock_path=marker.with_name(marker.name+".lock")
+    stdout=run_dir/"logs"/"checkm2-runtime.stdout"; stderr=run_dir/"logs"/"checkm2-runtime.stderr"
+    stdout.parent.mkdir(parents=True,exist_ok=True)
+    with lock_path.open("a+") as lock:
+        _controller_log(f"CheckM2 runtime: waiting for shared verification lock | path={lock_path}")
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        if checkm2_runtime_is_verified(cfg,resolution.path,executable,version):
+            _controller_log(f"CheckM2 runtime: reusing successful shared verification | path={resolution.path}",ok=True)
+            return
+        _controller_log(f"CheckM2 runtime: running one-time database and model smoke test | path={resolution.path}")
+        try:
+            run([executable,"testrun","--threads","1","--database_path",str(resolution.path)],stdout=stdout,stderr=stderr,env=_checkm2_environment())
+            marker=record_checkm2_runtime_verified(cfg,resolution.path,executable,version)
+        except (subprocess.CalledProcessError,OSError,ValueError) as error:
+            detail=_log_tail(stderr,lines=80)
+            suffix=f"\nCheckM2 stderr (last lines):\n{detail}" if detail else ""
+            raise SystemExit(
+                "CheckM2 runtime verification failed before preprocess submission. "
+                f"The executable, bundled models, and database could not complete `checkm2 testrun`: {error}{suffix}\n"
+                f"Full logs: {stdout} and {stderr}"
+            )
+    _controller_log(f"CheckM2 runtime: smoke test passed | marker={marker}",ok=True)
+
 def _checkm2_setup_marker(resolution, cfg: dict[str,str], status: str = "complete") -> dict[str,object]:
-    return {"status":status,"CHECKM2_DB":str(resolution.path),"CHECKM2_EXECUTABLE":cfg.get("CHECKM2_EXECUTABLE",""),"CHECKM2_VERSION":cfg.get("CHECKM2_VERSION",""),"source":resolution.source}
+    return {"status":status,"runtime_verified":status=="complete","CHECKM2_DB":str(resolution.path),"CHECKM2_EXECUTABLE":cfg.get("CHECKM2_EXECUTABLE",""),"CHECKM2_VERSION":cfg.get("CHECKM2_VERSION",""),"source":resolution.source}
 
 def _checkm2_recovery_config(run_dir: Path, cfg: dict[str,str], error: CheckM2DbError) -> dict[str,str] | None:
     recorded=cfg.get("CHECKM2_DB","").strip()
@@ -180,6 +263,9 @@ def _prepare_existing_checkm2_db(run_dir: Path, cfg: dict[str,str], rows: list[d
             return False
         except CheckM2DbError as recovered_error:
             raise SystemExit(str(recovered_error))
+    if not checkm2_runtime_is_verified(cfg,resolution.path,cfg["CHECKM2_EXECUTABLE"],cfg["CHECKM2_VERSION"]):
+        _controller_log("CheckM2 database exists but this executable/database combination has not passed its runtime smoke test")
+        return False
     _write_resolved_checkm2_config(run_dir,cfg,resolution)
     touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution,cfg))
     return True
@@ -215,6 +301,7 @@ def checkm2_db_setup(run_dir: Path, index: int | None = None) -> None:
             )
         except CheckM2DbError as recovered_error:
             raise SystemExit(str(recovered_error))
+    _verify_checkm2_runtime(run_dir,cfg,resolution)
     _write_resolved_checkm2_config(run_dir,cfg,resolution)
     touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution,cfg))
 
@@ -1013,6 +1100,21 @@ class _ActiveBatch:
     seen: bool=False
     missing_polls: int=0
 
+def _failed_stage_log_excerpt(run_dir: Path, stage: str, job_id: str) -> str:
+    directory=_stage_log_pattern(run_dir,stage).parent
+    candidates=[]
+    for path in directory.glob(f"{stage}.{job_id}_*.log"):
+        tail=_log_tail(path,lines=60,limit=6000)
+        if not tail: continue
+        lowered=tail.lower()
+        score=sum(token in lowered for token in ("traceback","error","failed","failure","killed","oom"))
+        candidates.append((score,path,tail))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item:(-item[0],str(item[1])))
+    _,path,tail=candidates[0]
+    return f"Failed task log excerpt ({path}):\n{tail}"
+
 class _RollingScheduler:
     def __init__(self,run_dir: Path,cfg: dict[str,str]):
         self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}
@@ -1041,7 +1143,13 @@ class _RollingScheduler:
             batch.missing_polls += 1
             if batch.missing_polls<2: continue
             details=f"job_id={jid} stage={batch.stage} index={batch.array} log={_stage_log_pattern(self.run_dir,batch.stage)}"
-            assert_jobs_succeeded([jid],details)
+            try:
+                assert_jobs_succeeded([jid],details)
+            except RuntimeError as error:
+                excerpt=_failed_stage_log_excerpt(self.run_dir,batch.stage,jid)
+                message=str(error)
+                if excerpt: message += "\n" + excerpt
+                raise RuntimeError(message) from error
             missing=[i for i in batch.indices if not _index_done(self.run_dir,batch.stage,i)]
             if missing and batch.stage=="preprocess":
                 isolate_rows=read_tsv(self.run_dir/"state"/"isolate_tasks.tsv")

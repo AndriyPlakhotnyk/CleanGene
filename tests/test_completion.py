@@ -210,6 +210,20 @@ class CompletionReconciliationTests(unittest.TestCase):
                 scheduler.refresh()
             self.assertTrue((run / "state" / "preprocess" / "BI_0000.done.json").is_file())
 
+    def test_failed_array_reports_a_real_task_log_excerpt(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, _ = self.make_run(Path(d))
+            log=run/"logs"/"slurm"/"preprocess"/"preprocess.123_0.log"
+            log.parent.mkdir(parents=True)
+            log.write_text("worker startup\nCheckM2 stderr: incompatible database checksum\n")
+            scheduler=_RollingScheduler(run,DEFAULTS)
+            scheduler.active["123"]=_ActiveBatch("123","preprocess",[0],"0",seen=True,missing_polls=1)
+            with patch("cleangene.workers.user_queue_snapshot",return_value={"total":0,"jobs":{},"entries":[]}), \
+                 patch("cleangene.workers.assert_jobs_succeeded",side_effect=RuntimeError("SLURM job failure detected: 124|FAILED")):
+                with self.assertRaisesRegex(RuntimeError,"incompatible database checksum") as raised:
+                    scheduler.refresh()
+            self.assertIn(str(log),str(raised.exception))
+
     def test_cpu_limit_caps_preprocess_submissions_without_affecting_default(self):
         with tempfile.TemporaryDirectory() as d:
             run, rows = self.make_run(Path(d), n=4, cfg={"SLURM_USER_CPU_LIMIT": "16", "SLURM_CPU_HEADROOM": "0"})
