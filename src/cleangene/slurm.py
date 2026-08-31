@@ -69,6 +69,25 @@ def user_queue_snapshot(user: str | None = None) -> dict[str,object]:
         total += 1
     return {"total":total,"jobs":jobs,"entries":entries}
 
+def active_cleangene_jobs_for_run(run_dir: Path, user: str | None = None) -> list[dict[str,object]]:
+    run_arg=str(run_dir.expanduser().resolve())
+    try:
+        snapshot=user_queue_snapshot(user)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    matches=[]
+    for entry in snapshot.get("entries",[]):
+        command=str(entry.get("command",""))
+        name=str(entry.get("name",""))
+        if run_arg in command and name.startswith("cg-"):
+            matches.append(entry)
+    return matches
+
+def cancel_jobs(job_ids: list[str]) -> None:
+    unique=sorted({jid for jid in job_ids if jid and jid!="DRYRUN"})
+    if unique:
+        subprocess.run(["scancel", *unique], check=True)
+
 def available_slots(limit: int, headroom: int, current: int) -> int:
     return max(0, limit - headroom - current)
 

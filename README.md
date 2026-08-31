@@ -243,11 +243,15 @@ With normal settings, `checkm2_db_setup` reuses
 `CheckM2_database/uniref100.KO.1.dmnd` below the managed root or downloads it
 once under an inter-process lock. Download uses the resolved companion
 executable with `--no_write_json_db`; prediction always supplies
-`--database_path` and `--remove-intermediates`. Before any preprocess arrays
+`--database_path` and the cleanup option supported by the installed CheckM2
+`predict --help` output. CleanGene prefers the pinned CheckM2 spelling
+`--remove_intermediates`. Before any preprocess arrays
 start, the setup job runs CheckM2's bundled `testrun` once for each executable,
-version, and database combination. Successful verification is recorded beside
-the managed database and reused by later runs. An invalid explicit
-`CHECKM2_DB` fails closed.
+version, command schema, predict CLI capability, and database combination, then
+runs a real one-genome production-form `predict` smoke test against a bundled
+CheckM2 test genome. Successful verification is recorded beside the managed
+database and reused by later runs. An invalid explicit `CHECKM2_DB` fails
+closed.
 
 `CHECKM2_CPUS`, `CHECKM2_MEM`, and `CHECKM2_TIME` size database setup.
 Per-isolate prediction runs inside preprocess. `CHECKM2_PREDICT_CPUS` defaults
@@ -257,6 +261,22 @@ and TensorFlow helper pools are also held to one thread to avoid multiplying
 the Slurm allocation. A supplied `checkm2_report` remains reusable.
 `CHECKM2_MODE=off` is supported but produces a QC warning because completeness
 and contamination were not evaluated.
+
+The `cleangene-checkm2` environment is an internal companion environment managed
+by `scripts/install_or_update.sh`. Normal users should update from the checkout
+with:
+
+```bash
+git pull
+bash scripts/install_or_update.sh
+conda activate cleangene
+```
+
+After updating code during an interrupted ARC run, resume with the normal
+`cleangene resume --run-dir ... --config ...` command. CleanGene refreshes
+`provenance/runtime.json`, refuses to submit if old CleanGene jobs still point
+at the same run directory, preserves completed preprocess outputs, and reruns
+only incomplete preprocess tasks.
 
 ### Managed Kraken2 databases
 

@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, truthy
-from .checkm2 import CheckM2DbError, CheckM2DbNotReady, checkm2_runtime_is_verified, checkm2_runtime_marker, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
+from .checkm2 import CheckM2DbError, CheckM2DbNotReady, bundled_test_genome, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, checkm2_runtime_is_verified, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
 from .completion import find_isolate_qc_candidates, reconcile_preprocess_outputs, validate_preprocess_completion
 from .defaults import DEFAULTS
 from .evidence import validate_isolate, validation_decision_logic_rows
@@ -19,6 +19,7 @@ from .task_store import build_isolate_task_store, load_isolate_task, migrate_iso
 from .tools import executable_version, resolve_checkm2_executable, ToolResolutionError
 from .util import command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
 from .ux import completed, log_line, waiting
+from .runtime import verify_worker_runtime
 
 STAGE_DESCRIPTIONS = (
     ("kraken_db_setup", "prepare the shared Kraken2 database when required"),
@@ -132,26 +133,41 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
     try: validate_checkm2_db(cfg.get("CHECKM2_DB",""))
     except CheckM2DbError as error: raise SystemExit(f"Preprocessing infrastructure failure: CheckM2 database is not ready: {error}")
     input_dir=out/"input"; result_dir=out/"results"; input_dir.mkdir(parents=True,exist_ok=True); result_dir.mkdir(parents=True,exist_ok=True)
-    suffix=".fna.gz" if assembly.suffix==".gz" else ".fna"; link=input_dir/f"{safe_name(isolate)}{suffix}"
-    _replace_symlink(link,assembly.resolve())
+    link=checkm2_named_input_link(assembly,input_dir,isolate)
     started=time.monotonic(); status="failed"
+    command=[]; executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_checkm2_executable()); threads=_checkm2_threads(cfg)
     try:
-        executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_checkm2_executable())
+        capabilities=checkm2_predict_capabilities(executable)
+        command=checkm2_predict_command(executable,link,result_dir,cfg["CHECKM2_DB"],threads,capabilities)
         with _checkm2_prediction_slot(logs,cfg,isolate):
-            run([executable,"predict","--threads",_checkm2_threads(cfg),"--input",str(input_dir),"--output-directory",str(result_dir),"--database_path",cfg["CHECKM2_DB"],"--remove-intermediates","--force"],stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr",env=_checkm2_environment())
+            run(command,stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr",env=_checkm2_environment())
         report=result_dir/"quality_report.tsv"
-        rows=read_tsv(report) if report.is_file() and report.stat().st_size>0 else []
-        if len(rows)!=1:
-            raise ValueError(f"CheckM2 report must contain exactly one genome row for {isolate}: {report}")
-        observed=(rows[0].get("Name") or rows[0].get("name") or rows[0].get("Bin Id") or rows[0].get("bin_id") or "").strip()
-        if observed and observed!=safe_name(isolate):
-            raise ValueError(f"CheckM2 report row '{observed}' does not match expected isolate {safe_name(isolate)}")
+        parse_checkm2_quality_report(report,isolate)
         status="complete"
-        return parse_checkm2_report(report)
+        return parse_checkm2_quality_report(report,isolate)
     except (subprocess.CalledProcessError,ValueError,OSError) as error:
+        stdout=_log_tail(logs/"checkm2.stdout")
         stderr=_log_tail(logs/"checkm2.stderr")
-        detail=f"\nCheckM2 stderr (last lines):\n{stderr}" if stderr else ""
-        raise SystemExit(f"Preprocessing infrastructure failure: CheckM2 could not evaluate isolate {isolate}: {error}{detail}")
+        checkm2_log=_log_tail(result_dir/"checkm2.log")
+        rendered=" ".join(shlex_quote(part) for part in command) if command else "<command was not built>"
+        detail=[
+            f"isolate={isolate}",
+            f"exit_status={getattr(error,'returncode','n/a')}",
+            f"command={rendered}",
+            f"checkm2_executable={executable}",
+            f"checkm2_version={cfg.get('CHECKM2_VERSION','unknown')}",
+            f"database={cfg.get('CHECKM2_DB','')}",
+            f"input_assembly={link}",
+            f"threads={threads}",
+            f"stdout_log={logs/'checkm2.stdout'}",
+            f"stderr_log={logs/'checkm2.stderr'}",
+            f"checkm2_log={result_dir/'checkm2.log'}",
+        ]
+        if stdout: detail.append("CheckM2 stdout tail:\n"+stdout)
+        if stderr: detail.append("CheckM2 stderr tail:\n"+stderr)
+        if checkm2_log: detail.append("CheckM2 log tail:\n"+checkm2_log)
+        raise SystemExit("Preprocessing infrastructure failure: CheckM2 could not evaluate isolate "
+                         f"{isolate}: {error}\n" + "\n".join(detail))
     finally:
         try:
             (logs/"checkm2.timing.tsv").write_text(f"isolate_id\tstatus\telapsed_seconds\n{isolate}\t{status}\t{time.monotonic()-started:.3f}\n")
@@ -211,16 +227,28 @@ def _verify_checkm2_runtime(run_dir: Path, cfg: dict[str,str], resolution) -> No
             _controller_log(f"CheckM2 runtime: reusing successful shared verification | path={resolution.path}",ok=True)
             return
         _controller_log(f"CheckM2 runtime: running one-time database and model smoke test | path={resolution.path}")
+        smoke_dir=run_dir/"logs"/"checkm2-production-smoke"
+        smoke_input_dir=smoke_dir/"input"; smoke_result_dir=smoke_dir/"results"
         try:
-            run([executable,"testrun","--threads","1","--database_path",str(resolution.path)],stdout=stdout,stderr=stderr,env=_checkm2_environment())
+            capabilities=checkm2_predict_capabilities(executable)
+            run(checkm2_testrun_command(executable,resolution.path,1),stdout=stdout,stderr=stderr,env=_checkm2_environment())
+            genome=bundled_test_genome(executable)
+            smoke_input=checkm2_named_input_link(genome,smoke_input_dir,"cleangene_checkm2_smoke")
+            smoke_cmd=checkm2_predict_command(executable,smoke_input,smoke_result_dir,resolution.path,1,capabilities)
+            run(smoke_cmd,stdout=run_dir/"logs"/"checkm2-production-smoke.stdout",stderr=run_dir/"logs"/"checkm2-production-smoke.stderr",env=_checkm2_environment())
+            parse_checkm2_quality_report(smoke_result_dir/"quality_report.tsv","cleangene_checkm2_smoke")
             marker=record_checkm2_runtime_verified(cfg,resolution.path,executable,version)
         except (subprocess.CalledProcessError,OSError,ValueError) as error:
-            detail=_log_tail(stderr,lines=80)
+            detail="\n".join(part for part in (
+                _log_tail(stderr,lines=80),
+                _log_tail(run_dir/"logs"/"checkm2-production-smoke.stderr",lines=80),
+                _log_tail(smoke_result_dir/"checkm2.log",lines=80),
+            ) if part)
             suffix=f"\nCheckM2 stderr (last lines):\n{detail}" if detail else ""
             raise SystemExit(
                 "CheckM2 runtime verification failed before preprocess submission. "
-                f"The executable, bundled models, and database could not complete `checkm2 testrun`: {error}{suffix}\n"
-                f"Full logs: {stdout} and {stderr}"
+                f"The executable, bundled models, database, and production predict CLI could not complete: {error}{suffix}\n"
+                f"Full logs: {stdout}, {stderr}, {run_dir/'logs'/'checkm2-production-smoke.stdout'}, and {run_dir/'logs'/'checkm2-production-smoke.stderr'}"
             )
     _controller_log(f"CheckM2 runtime: smoke test passed | marker={marker}",ok=True)
 
@@ -1448,6 +1476,7 @@ def summarize(run_dir: Path) -> None:
     touch_done(run_dir/"state"/"summary.done.json",payload)
 
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
+    verify_worker_runtime(run_dir)
     if stage=="slurm_controller": slurm_controller(run_dir,index)
     elif stage=="kraken_db_setup": kraken_db_setup(run_dir,index)
     elif stage=="checkm2_db_setup": checkm2_db_setup(run_dir,index)

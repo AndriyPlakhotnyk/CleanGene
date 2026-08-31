@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, checkm2_database_root, checkm2_runtime_marker, resolve_checkm2_db, validate_checkm2_db
+from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, CHECKM2_COMMAND_SCHEMA_VERSION, bundled_test_genome, checkm2_database_root, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, checkm2_runtime_marker, parse_checkm2_quality_report, resolve_checkm2_db, validate_checkm2_db
+from cleangene.defaults import DEFAULTS
+from cleangene.tools import ToolResolutionError, resolve_checkm2_executable
 from cleangene.cli import make_run
 from cleangene.util import atomic_json, load_json, read_tsv, write_tsv
 from cleangene.workers import checkm2_db_setup, preprocess, slurm_controller
@@ -17,7 +19,24 @@ def _write_db(path: Path) -> None:
 
 def _write_executable(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/usr/bin/env sh\nprintf 'CheckM2 version 1.1.0\\n'\n")
+    path.write_text("""#!/usr/bin/env python3
+import pathlib, sys
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("CheckM2 version 1.1.0")
+elif args[:2] == ["predict", "--help"] or args == ["predict", "-h"]:
+    print("--input --output-directory --database_path --threads --remove_intermediates --force")
+elif args and args[0] == "testrun":
+    sys.exit(0)
+elif args and args[0] == "predict":
+    out = pathlib.Path(args[args.index("--output-directory") + 1])
+    input_path = pathlib.Path(args[args.index("--input") + 1])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "quality_report.tsv").write_text(f"Name\\tCompleteness\\tContamination\\n{input_path.name.split('.')[0]}\\t99\\t1\\n")
+else:
+    print("unsupported", args, file=sys.stderr)
+    sys.exit(2)
+""")
     path.chmod(0o755)
     return path
 
@@ -45,7 +64,8 @@ class CheckM2DatabaseTests(unittest.TestCase):
             db = checkm2_database_root(cfg) / "CheckM2_database" / EXPECTED_CHECKM2_DB_NAME; _write_db(db)
             atomic_json(run / "provenance" / "resolved_config.json", cfg)
             write_tsv(run / "provenance" / "manifest.tsv", ["isolate_id", "group_id", "R1", "R2"], [["i1", "g", "r1", "r2"]])
-            checkm2_db_setup(run)
+            with patch("cleangene.workers.bundled_test_genome", return_value=db):
+                checkm2_db_setup(run)
             resolved = load_json(run / "provenance" / "resolved_config.json")
             marker = load_json(run / "state" / "checkm2_db_setup.done.json")
             self.assertEqual(resolved["CHECKM2_DB"], str(db.resolve()))
@@ -54,6 +74,25 @@ class CheckM2DatabaseTests(unittest.TestCase):
             self.assertEqual(marker["source"], "shared_existing")
             self.assertTrue(marker["runtime_verified"])
             self.assertTrue(checkm2_runtime_marker(cfg).is_file())
+
+    def test_pinned_cli_uses_underscore_cleanup_option(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe=_write_executable(Path(d)/"bin"/"checkm2")
+            caps=checkm2_predict_capabilities(exe)
+            command=checkm2_predict_command(exe,Path(d)/"i.fna",Path(d)/"out",Path(d)/EXPECTED_CHECKM2_DB_NAME,1,caps)
+            self.assertIn("--remove_intermediates",command)
+            self.assertNotIn("--remove-intermediates",command)
+
+    def test_runtime_marker_invalidates_when_schema_changes(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe=_write_executable(Path(d)/"bin"/"checkm2")
+            cfg={"CHECKM2_DATABASE_ROOT":str(Path(d)/"checkm2"),"CHECKM2_EXECUTABLE":str(exe)}
+            db=checkm2_database_root(cfg)/"CheckM2_database"/EXPECTED_CHECKM2_DB_NAME; _write_db(db)
+            from cleangene.checkm2 import record_checkm2_runtime_verified, checkm2_runtime_is_verified
+            record_checkm2_runtime_verified(cfg,db,exe,"CheckM2 version 1.1.0")
+            marker=checkm2_runtime_marker(cfg)
+            data=load_json(marker); data["schema"]=CHECKM2_COMMAND_SCHEMA_VERSION-1; atomic_json(marker,data)
+            self.assertFalse(checkm2_runtime_is_verified(cfg,db,exe,"CheckM2 version 1.1.0"))
 
     def test_runtime_smoke_test_failure_stops_before_preprocess(self):
         with tempfile.TemporaryDirectory() as d:
@@ -161,18 +200,21 @@ class CheckM2PreprocessTests(unittest.TestCase):
 
             with patch("cleangene.workers.command_exists", return_value=True), patch("cleangene.workers.run", side_effect=fake_run) as runner:
                 preprocess(run, 0)
+            sample = run / "results" / "sample_data" / "iso1"
             self.assertFalse(any(c[0] == "fastp" for c in commands))
             self.assertFalse(any(c[0] == "shovill" for c in commands))
             self.assertIn(str(exe.resolve()), [c[0] for c in commands])
             checkm2_call=next(call for call in runner.call_args_list if Path(call.args[0][0]).name=="checkm2")
             self.assertEqual(checkm2_call.args[0][checkm2_call.args[0].index("--threads")+1],"1")
+            self.assertEqual(checkm2_call.args[0][checkm2_call.args[0].index("--input")+1],str(sample/"checkm2"/"input"/"iso1.fasta"))
+            self.assertIn("--remove_intermediates",checkm2_call.args[0])
+            self.assertNotIn("--remove-intermediates",checkm2_call.args[0])
             self.assertEqual(checkm2_call.kwargs["env"]["TF_NUM_INTEROP_THREADS"],"1")
             self.assertEqual(checkm2_call.kwargs["env"]["OPENBLAS_NUM_THREADS"],"1")
             spades = next(c for c in commands if c[0] == "spades.py")
             self.assertIn("--only-assembler", spades)
             prokka = next(c for c in commands if c[0] == "prokka")
             self.assertEqual(Path(prokka[-1]).name, "contigs.fasta")
-            sample = run / "results" / "sample_data" / "iso1"
             qc = read_tsv(sample / "qc.tsv")[0]
             self.assertEqual(qc["PASS/FAIL"], "PASS")
             self.assertEqual(Path(qc["assembly"]), sample / "assembly" / "contigs.fasta")
@@ -195,17 +237,72 @@ class CheckM2PreprocessTests(unittest.TestCase):
                 if command[0] == "shovill":
                     out = Path(command[command.index("--outdir") + 1]); out.mkdir(parents=True, exist_ok=True); (out / "contigs.fa").write_text(">c\n" + "A"*120 + "\n")
                 elif Path(command[0]).name == "checkm2":
+                    out = Path(command[command.index("--output-directory") + 1]); out.mkdir(parents=True, exist_ok=True)
+                    kwargs["stdout"].write_text("predict started\n")
                     kwargs["stderr"].write_text("double free or corruption in CheckM2 metadata worker\n")
+                    (out / "checkm2.log").write_text("internal CheckM2 worker crashed\n")
                     raise __import__("subprocess").CalledProcessError(134,command)
                 elif command[0] == "prokka":
                     raise AssertionError("Prokka should not run after CheckM2 infrastructure failure")
 
             with patch("cleangene.workers.command_exists", return_value=True), patch("cleangene.workers.run", side_effect=fake_run):
-                with self.assertRaisesRegex(SystemExit, "double free or corruption"):
+                with self.assertRaisesRegex(SystemExit, "double free or corruption") as raised:
                     preprocess(run, 0)
+            message=str(raised.exception)
+            self.assertIn("predict started",message)
+            self.assertIn("internal CheckM2 worker crashed",message)
+            self.assertIn("command=",message)
+            self.assertIn("exit_status=134",message)
             sample = run / "results" / "sample_data" / "iso1"
             self.assertFalse((sample / "qc.tsv").exists())
             self.assertFalse((run / "state" / "preprocess" / "iso1.done.json").exists())
+
+    def test_checkm2_accepts_compressed_assembly_input_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); assembly=root/"contigs.fasta.gz"; db=root/EXPECTED_CHECKM2_DB_NAME; exe=_write_executable(root/"bin"/"checkm2")
+            assembly.write_text("not really gzip but CheckM2 is mocked\n"); _write_db(db)
+            from cleangene.workers import _run_checkm2
+            commands=[]
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                out=Path(command[command.index("--output-directory")+1]); out.mkdir(parents=True,exist_ok=True)
+                write_tsv(out/"quality_report.tsv",["Name","Completeness","Contamination"],[["iso1",99,1]])
+            _run_root=root/"run"; logs=_run_root/"results"/"sample_data"/"iso1"/"logs"; logs.mkdir(parents=True)
+            cfg={"CHECKM2_EXECUTABLE":str(exe),"CHECKM2_DB":str(db),"CHECKM2_VERSION":"CheckM2 version 1.1.0","CHECKM2_PREDICT_CPUS":"1","CHECKM2_MAX_INFLIGHT":"8"}
+            with patch("cleangene.workers.run",side_effect=fake_run):
+                self.assertEqual(_run_checkm2(assembly,_run_root/"results"/"sample_data"/"iso1"/"checkm2",logs,cfg,"iso1"),(99.0,1.0))
+            self.assertTrue(( _run_root/"results"/"sample_data"/"iso1"/"checkm2"/"input"/"iso1.fasta.gz").is_symlink())
+
+    def test_source_does_not_use_unsupported_hyphenated_cleanup_flag(self):
+        root=Path(__file__).resolve().parents[1]
+        offenders=[]
+        for path in (root/"src").rglob("*.py"):
+            if "--remove-intermediates" in path.read_text():
+                offenders.append(str(path))
+        self.assertEqual(offenders,[])
+
+
+class RealCheckM2IntegrationTests(unittest.TestCase):
+    def test_real_production_predict_smoke_when_companion_runtime_is_available(self):
+        try:
+            exe=resolve_checkm2_executable("")
+            resolution=resolve_checkm2_db(DEFAULTS,allow_download=False)
+            genome=bundled_test_genome(exe)
+        except (ToolResolutionError, CheckM2DbError, CheckM2DbNotReady) as error:
+            self.skipTest(f"real CheckM2 runtime/database unavailable: {error}")
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            input_path=checkm2_named_input_link(genome,root/"input","cleangene_checkm2_smoke")
+            out=root/"predict"
+            command=checkm2_predict_command(exe,input_path,out,resolution.path,1,checkm2_predict_capabilities(exe))
+            env=__import__("os").environ.copy()
+            for key in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS","TF_NUM_INTRAOP_THREADS","TF_NUM_INTEROP_THREADS"):
+                env[key]="1"
+            completed=__import__("subprocess").run(command,capture_output=True,text=True,env=env,timeout=600)
+            self.assertEqual(completed.returncode,0,completed.stderr[-2000:])
+            completeness,contamination=parse_checkm2_quality_report(out/"quality_report.tsv","cleangene_checkm2_smoke")
+            self.assertGreaterEqual(completeness,0)
+            self.assertLessEqual(contamination,100)
 
 
 if __name__ == "__main__":

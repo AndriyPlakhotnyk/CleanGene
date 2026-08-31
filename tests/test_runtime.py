@@ -10,7 +10,7 @@ from unittest.mock import patch
 from cleangene.checkm2 import checkm2_database_root
 from cleangene.cli import main
 from cleangene.kraken import managed_kraken2_db_path
-from cleangene.runtime import assert_config_matches_runtime, cleangene_project_root
+from cleangene.runtime import assert_config_matches_runtime, cleangene_project_root, record_runtime_provenance, verify_worker_runtime
 from cleangene.tools import (
     CHECKM2_VERSION_TIMEOUT_SECONDS,
     ToolResolutionError,
@@ -22,12 +22,22 @@ from cleangene.tools import (
 
 def _write_executable(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/usr/bin/env sh\nprintf 'tool version 1.0\\n'\n")
+    path.write_text("#!/usr/bin/env sh\nif [ \"$1 $2\" = 'predict --help' ]; then printf '%s\\n' '--input --output-directory --database_path --threads --remove_intermediates --force'; else printf 'tool version 1.0\\n'; fi\n")
     path.chmod(0o755)
     return path
 
 
 class RuntimeResolutionTests(unittest.TestCase):
+    def test_worker_runtime_mismatch_is_detected(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; (run/"provenance").mkdir(parents=True)
+            record_runtime_provenance(run,{})
+            data=__import__("cleangene.util",fromlist=["load_json"]).load_json(run/"provenance"/"runtime.json")
+            data["workers_py_sha256"]="old-worker"
+            __import__("cleangene.util",fromlist=["atomic_json"]).atomic_json(run/"provenance"/"runtime.json",data)
+            with self.assertRaisesRegex(SystemExit,"CleanGene runtime mismatch"):
+                verify_worker_runtime(run)
+
     def test_checkm2_version_probe_allows_slow_hpc_startup(self):
         completed = subprocess.CompletedProcess(["checkm2", "--version"], 0, "1.1.0\n", "")
         with patch("cleangene.tools.subprocess.run", return_value=completed) as run:
@@ -114,7 +124,7 @@ class RuntimeResolutionTests(unittest.TestCase):
             with patch.dict(os.environ, environment, clear=True), patch("cleangene.cli.sys.executable", str(root / "envs" / "cleangene" / "bin" / "python")), patch("cleangene.cli.command_exists", return_value=True), contextlib.redirect_stdout(output):
                 result = main(["doctor", "--config", str(config)])
             self.assertEqual(result, 0, output.getvalue())
-            self.assertIn("CheckM2 executable: OK", output.getvalue())
+            self.assertIn("CheckM2 executable: READY", output.getvalue())
             self.assertIn("CheckM2 database: not present; will be created by checkm2_db_setup", output.getvalue())
 
     def test_doctor_checkm2_failure_names_repair_command(self):
@@ -174,7 +184,8 @@ class RepositoryPrivacyTests(unittest.TestCase):
         keys = [line.split("=", 1)[0].strip() for line in lines if line.strip() and not line.lstrip().startswith("#") and "=" in line]
         self.assertEqual(len(keys), len(set(keys)))
         self.assertNotIn("CHECKM2_BATCH_SIZE", keys)
-        self.assertNotIn("CHECKM2_MAX_INFLIGHT", keys)
+        self.assertIn("CHECKM2_PREDICT_CPUS", keys)
+        self.assertIn("CHECKM2_MAX_INFLIGHT", keys)
         expected = {
             "QC_MAX_CONTIGS_PASS":"300", "QC_MAX_CONTIGS_FAIL":"1000",
             "QC_MIN_N50_PASS":"25000", "QC_MIN_N50_FAIL":"5000",

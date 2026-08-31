@@ -6,7 +6,7 @@ from cleangene.manifest import groups, load_manifest
 from cleangene.evidence import classify_gene_evidence, fixed_coordinate_identity
 from cleangene.fasta import assembly_metrics
 from cleangene.pangenome import normalize_panaroo, present, select_rows
-from cleangene.slurm import array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
+from cleangene.slurm import active_cleangene_jobs_for_run, array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
 from cleangene.task_store import build_isolate_task_store, load_isolate_task, migrate_isolate_task_store
 from cleangene.util import atomic_json, read_tsv, write_tsv
 from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, preprocess, reduce_group, slurm_controller, task_row
@@ -529,6 +529,16 @@ class CleanGeneCoreTests(unittest.TestCase):
         self.assertEqual(snapshot["jobs"]["123"]["PENDING"],1)
         self.assertEqual(snapshot["entries"][0]["task_id"],"7")
         self.assertEqual(snapshot["entries"][0]["cpus"],8)
+
+    def test_active_cleangene_jobs_for_run_matches_exact_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"
+            snapshot={"total":2,"jobs":{},"entries":[
+                {"job_id":"123","task_id":"0","state":"RUNNING","name":"cg-controller","command":f"python -m cleangene _worker --run-dir {run.resolve()}"},
+                {"job_id":"999","task_id":"0","state":"RUNNING","name":"cg-controller","command":"python -m cleangene _worker --run-dir /elsewhere"},
+            ]}
+            with patch("cleangene.slurm.user_queue_snapshot",return_value=snapshot):
+                self.assertEqual([j["job_id"] for j in active_cleangene_jobs_for_run(run)],["123"])
 
     def test_resumed_controller_adopts_live_run_arrays(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0","SLURM_MAX_PARALLEL":"100","SLURM_ARRAY_CHUNK_SIZE":"500","SLURM_MAX_OUTSTANDING_CHUNKS":"8","SLURM_ACCOUNT":"","SLURM_PARTITION":""}
