@@ -37,4 +37,5 @@ tests/test_install.py
 tests/test_kraken.py
 tests/test_qc.py
 tests/test_runtime.py
+tests/test_scaling.py
 tests/test_utils.py

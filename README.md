@@ -60,6 +60,28 @@ Leave `CHECKM2_EXECUTABLE`, `CHECKM2_DB`, `CHECKM2_DATABASE_ROOT`, and
 filesystem outside the checkout. Keep account names, private paths, and other
 site-specific values out of the tracked template.
 
+## Execution model
+
+`cleangene run` is intentionally a thin launcher:
+
+```text
+cleangene run
+    -> fast local submission
+    -> SLURM cg-controller
+    -> one global preflight
+    -> database setup/verification
+    -> daughter arrays
+```
+
+The interactive launcher parses config syntax and manifest structure, creates
+the run directory, records launcher timing, submits the controller, and returns
+to your shell. Expensive software checks, CheckM2 startup, database validation,
+input-file metadata checks, QC profile resolution, and indexed task-store
+construction happen once inside the controller before daughter arrays are
+submitted. Daughter tasks then load only their indexed isolate or group record
+plus run-level config, with minimal per-task input checks. This keeps submission
+fast for cohorts up to tens of thousands of isolates.
+
 ## Manifest
 
 A minimal paired-FASTQ manifest is tab separated:

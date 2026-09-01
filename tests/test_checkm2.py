@@ -162,9 +162,10 @@ class CheckM2DatabaseTests(unittest.TestCase):
     def test_setup_failure_stops_controller_before_preprocess(self):
         with tempfile.TemporaryDirectory() as d:
             run = Path(d) / "run"; (run / "provenance").mkdir(parents=True); (run / "state").mkdir()
+            r1=Path(d)/"r1"; r2=Path(d)/"r2"; r1.write_text("@r\nA\n+\nI\n"); r2.write_text("@r\nA\n+\nI\n")
             cfg = {"CHECKM2_MODE": "required", "CHECKM2_EXECUTABLE": str(Path(d)/"missing"/"checkm2"), "CHECKM2_AUTO_DOWNLOAD": "false", "TAXONOMY_MODE": "off", "SLURM_USER_JOB_LIMIT": "2000", "SLURM_JOB_HEADROOM": "10", "SLURM_POLL_SECONDS": "0", "SLURM_MAX_PARALLEL": "100", "SLURM_ARRAY_CHUNK_SIZE": "500", "SLURM_ACCOUNT": "", "SLURM_PARTITION": "", "CHECKM2_CPUS": "1", "CHECKM2_MEM": "1G", "CHECKM2_TIME": "1:00:00"}
             atomic_json(run / "provenance" / "resolved_config.json", cfg)
-            write_tsv(run / "provenance" / "manifest.tsv", ["isolate_id", "group_id", "R1", "R2"], [["i1", "g", "r1", "r2"]])
+            write_tsv(run / "provenance" / "manifest.tsv", ["isolate_id", "group_id", "R1", "R2"], [["i1", "g", str(r1), str(r2)]])
             write_tsv(run / "state" / "isolate_tasks.tsv", ["group_id", "isolate_id"], [["g", "i1"]])
             write_tsv(run / "state" / "group_tasks.tsv", ["group_id", "n_isolates", "group_size_class"], [["g", 1, "small"]])
             with patch("cleangene.workers._run_single_job") as single:

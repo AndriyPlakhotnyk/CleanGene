@@ -98,15 +98,14 @@ class RuntimeResolutionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ToolResolutionError, "Explicit checkm2 executable is invalid"):
                     resolve_executable("checkm2", str(Path(d) / "missing" / "checkm2"))
 
-    def test_missing_checkm2_fails_before_controller_submission(self):
+    def test_launcher_does_not_resolve_checkm2_before_controller_submission(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d); manifest = root / "manifest.tsv"
             manifest.write_text("isolate_id\tgroup_id\tR1\tR2\ni1\tg\t/r1.fastq.gz\t/r2.fastq.gz\n")
             with patch("cleangene.cli.resolve_checkm2_executable", side_effect=ToolResolutionError("missing checkm2")), patch("cleangene.cli.slurm") as submit:
-                with self.assertRaisesRegex(SystemExit, "before controller submission"):
-                    with contextlib.redirect_stdout(StringIO()):
-                        main(["run", "--manifest", str(manifest), "--analysis-root", str(root), "--run-id", "r", "--dry-run"])
-            submit.assert_not_called()
+                with contextlib.redirect_stdout(StringIO()):
+                    self.assertEqual(main(["run", "--manifest", str(manifest), "--analysis-root", str(root), "--run-id", "r", "--dry-run"]),0)
+            submit.assert_called_once()
 
     def test_doctor_reports_automatic_missing_checkm2_database(self):
         with tempfile.TemporaryDirectory() as d:

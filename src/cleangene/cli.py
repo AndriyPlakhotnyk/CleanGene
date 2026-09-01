@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, os, shutil, subprocess, sys, tempfile
+import argparse, json, os, shutil, subprocess, sys, tempfile, time
 import re
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +8,7 @@ from .checkm2 import CheckM2DbError, CheckM2DbNotReady, bundled_test_genome, che
 from .completion import reconcile_preprocess_outputs
 from .defaults import DEFAULTS, SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
-from .qc import ensure_qc_provenance, prepare_qc_provenance, resolve_threshold_rows
+from .qc import ensure_qc_provenance, resolve_threshold_rows
 from .runtime import assert_config_matches_runtime, print_runtime_identity, record_runtime_provenance
 from .slurm import active_cleangene_jobs_for_run, cancel_jobs, sbatch_cmd, submit, user_queue_snapshot
 from .task_store import build_isolate_task_store
@@ -16,13 +16,29 @@ from .tools import ToolResolutionError, executable_version, resolve_checkm2_exec
 from .util import atomic_json, command_exists, load_json, read_tsv, safe_name, sha256, write_tsv
 from .utils_cli import add_utils_parser
 from .ux import clean_gene_banner, submitted, spinner, waiting
-from .workers import cleanup_trimmed_fastqs, compress_completed_outputs, dispatch, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, needs_checkm2, needs_kraken, run_resume_maintenance
+from .workers import cleanup_trimmed_fastqs, compress_completed_outputs, dispatch, global_preflight, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, needs_checkm2, needs_kraken, run_resume_maintenance
 
 def _checkm2_limited_env() -> dict[str,str]:
     env=os.environ.copy()
     for key in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS","TF_NUM_INTRAOP_THREADS","TF_NUM_INTEROP_THREADS"):
         env[key]="1"
     return env
+
+class LauncherTiming:
+    def __init__(self):
+        self.run: Path | None = None
+        self.rows: list[list[str]] = []
+        self.started = time.monotonic()
+    def set_run(self, run: Path) -> None:
+        self.run = run
+    def timed(self, phase: str, func):
+        started = time.monotonic()
+        try: return func()
+        finally: self.rows.append([phase, f"{time.monotonic() - started:.6f}"])
+    def write(self) -> None:
+        if not self.run: return
+        self.rows.append(["total", f"{time.monotonic() - self.started:.6f}"])
+        write_tsv(self.run/"logs"/"launcher_timing.tsv",["phase","seconds"],self.rows)
 
 def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
     cfg=dict(cfg)
@@ -62,7 +78,7 @@ def validate_fastq_inputs(rows: list[dict[str,str]]) -> None:
 def make_run(manifest: Path, analysis_root: Path, cfg: dict[str,str], run_id: str | None) -> Path:
     rid=run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=analysis_root/"runs"/rid
     (run/"provenance").mkdir(parents=True,exist_ok=True); (run/"state").mkdir(exist_ok=True); (run/"logs"/"slurm").mkdir(parents=True,exist_ok=True)
-    rows=load_manifest(manifest); validate_fastq_inputs(rows); cfg=prepare_qc_provenance(run,rows,cfg); write_resolved(run/"provenance"/"manifest.tsv",rows); build_isolate_task_store(run,rows); atomic_json(run/"provenance"/"resolved_config.json",cfg); atomic_json(run/"provenance"/"inputs.json",{"manifest":str(manifest.resolve()),"manifest_sha256":sha256(manifest),"created":datetime.now().isoformat()})
+    rows=load_manifest(manifest); validate_fastq_inputs(rows); write_resolved(run/"provenance"/"manifest.tsv",rows); atomic_json(run/"provenance"/"resolved_config.json",cfg); atomic_json(run/"provenance"/"inputs.json",{"manifest":str(manifest.resolve()),"manifest_sha256":sha256(manifest),"created":datetime.now().isoformat()})
     write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in rows))
     counts={}
     for r in rows: counts[r["group_id"]]=counts.get(r["group_id"],0)+1
@@ -164,7 +180,7 @@ def _doctor_config_errors(cfg: dict[str,str]) -> list[str]:
     for key,allowed in enums.items():
         value=cfg.get(key,"").strip().lower()
         if value not in allowed: errors.append(f"{key} must be one of {', '.join(sorted(allowed))}; got {value!r}")
-    positive=("CPUS","SLURM_CPUS","SLURM_ARRAY_CHUNK_SIZE","SLURM_MAX_OUTSTANDING_CHUNKS","SLURM_USER_JOB_LIMIT","SLURM_CONTROLLER_CPUS","KRAKEN2_DB_CPUS","CHECKM2_CPUS","CHECKM2_PREDICT_CPUS","CHECKM2_MAX_INFLIGHT","VALIDATION_CPUS")
+    positive=("CPUS","SLURM_CPUS","SLURM_ARRAY_CHUNK_SIZE","SLURM_MAX_OUTSTANDING_CHUNKS","SLURM_USER_JOB_LIMIT","SLURM_CONTROLLER_CPUS","KRAKEN2_DB_CPUS","CHECKM2_CPUS","CHECKM2_PREDICT_CPUS","CHECKM2_MAX_INFLIGHT","PREFLIGHT_FILE_CHECK_WORKERS","VALIDATION_CPUS")
     nonnegative=("SLURM_MAX_PARALLEL","SLURM_PREPROCESS_MAX_INFLIGHT","SLURM_VALIDATION_MAX_INFLIGHT","SLURM_GROUP_MAX_INFLIGHT","SLURM_JOB_HEADROOM","SLURM_USER_CPU_LIMIT","SLURM_CPU_HEADROOM","SLURM_POLL_SECONDS")
     for key in positive+nonnegative:
         try: value=int(cfg.get(key,""))
@@ -323,32 +339,38 @@ def shlex_quote(x:str)->str:
     import shlex; return shlex.quote(x)
 
 def run_command(args) -> int:
+    timing=LauncherTiming()
     print(clean_gene_banner())
     print(submitted("Welcome to CleanGene, Your Grace."))
-    cfg=apply_cli_overrides(read_env(args.config),args); assert_config_matches_runtime(args.config,cfg); print_runtime_identity(args.config); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
+    cfg=timing.timed("parse_config",lambda: apply_cli_overrides(read_env(args.config),args)); assert_config_matches_runtime(args.config,cfg); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
-        run=load_existing(root,args.resume); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
-        cfg=ensure_qc_provenance(run,read_tsv(run/"provenance"/"manifest.tsv"),cfg); atomic_json(run/"provenance"/"resolved_config.json",cfg)
+        run=load_existing(root,args.resume); timing.set_run(run); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
         if args.skip_trim or args.skip_shovill or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
     else:
         run_id=args.run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=root/"runs"/run_id
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
-        if not args.resume: run=make_run(args.manifest,root,cfg,run_id)
+        if not args.resume:
+            run=timing.timed("create_run",lambda: make_run(args.manifest,root,cfg,run_id)); timing.set_run(run)
         else: print(waiting("step=resume: submitting controller; legacy checks will run inside the controller job"),flush=True)
-        cfg=preflight_runtime(run,{**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")})
+        cfg={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")}
         record_runtime_provenance(run,cfg)
         if args.profile=="local":
+            global_preflight(run)
             if args.resume: run_resume_maintenance(run,cfg)
             local(run)
         else:
             if args.resume: _guard_resume_active_jobs(run,cancel_active=getattr(args,"cancel_active",False))
-            slurm(run,cfg,args.dry_run)
+            controller_job_id=timing.timed("submit_controller",lambda: slurm(run,cfg,args.dry_run))
+    timing.write()
     if args.profile=="slurm":
-        print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
+        print(submitted(f"CleanGene run created: {run.name}"))
+        print(submitted(f"Controller submitted: {controller_job_id}"))
+        print(submitted(f"Run directory: {run}"))
     return 0
 
 def resume_command(args) -> int:
+    timing=LauncherTiming()
     print(clean_gene_banner())
     print(submitted("Welcome to CleanGene, Your Grace."))
     if args.run_dir: run=args.run_dir.expanduser().resolve()
@@ -356,18 +378,21 @@ def resume_command(args) -> int:
         root=(args.analysis_root or Path.cwd()).expanduser().resolve()
         run=latest_run(root) if args.latest else load_existing(root,args.run)
     validate_run_dir(run)
+    timing.set_run(run)
     cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
-    assert_config_matches_runtime(args.config,cfg); print_runtime_identity(args.config)
-    cfg=ensure_qc_provenance(run,read_tsv(run/"provenance"/"manifest.tsv"),cfg); atomic_json(run/"provenance"/"resolved_config.json",cfg)
+    assert_config_matches_runtime(args.config,cfg)
     if args.skip_trim or args.skip_shovill or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
-    cfg=preflight_runtime(run,{**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")})
+    cfg={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")}
     record_runtime_provenance(run,cfg)
     print(f"Run directory: {run}")
     with spinner("Getting ready to submit"):
         print(waiting("step=resume: submitting controller; legacy checks will run inside the controller job"),flush=True)
         _guard_resume_active_jobs(run,cancel_active=getattr(args,"cancel_active",False))
-        slurm(run,cfg,args.dry_run)
-    print(submitted(f"Run submitted. Please find logs in {run/'logs'/'slurm'}"))
+        controller_job_id=timing.timed("submit_controller",lambda: slurm(run,cfg,args.dry_run))
+    timing.write()
+    print(submitted(f"CleanGene run created: {run.name}"))
+    print(submitted(f"Controller submitted: {controller_job_id}"))
+    print(submitted(f"Run directory: {run}"))
     return 0
 
 def cleanup_command(args) -> int:

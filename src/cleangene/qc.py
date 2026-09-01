@@ -92,20 +92,20 @@ def _profile_rows(path: Path | None) -> list[dict[str,str]]:
 
 def resolve_threshold_rows(rows: list[dict[str,str]], cfg: dict[str,str], profile_path: Path | None = None) -> list[dict[str,object]]:
     profiles=_profile_rows(profile_path)
+    profiles_by_organism={normalize_organism(p["scope_value"]):p for p in profiles if p["scope_type"]=="organism"}
+    profiles_by_group={p["scope_value"].strip():p for p in profiles if p["scope_type"]=="group_id"}
     global_values={key:str(cfg.get(ENV_KEYS[key],THRESHOLD_DEFAULTS[key])).strip() for key in THRESHOLD_COLUMNS}
     validate_thresholds(global_values,"global")
     result=[]
     for row in rows:
         values=dict(global_values); sources=[]
         organism=normalize_organism(row.get("organism","")); group=row.get("group_id","").strip()
-        organism_matches=[p for p in profiles if p["scope_type"]=="organism" and normalize_organism(p["scope_value"])==organism and organism]
-        group_matches=[p for p in profiles if p["scope_type"]=="group_id" and p["scope_value"].strip()==group and group]
-        for matches,source in ((organism_matches,f"organism:{row.get('organism','')}") ,(group_matches,f"group_id:{group}")):
-            if len(matches)>1: raise SystemExit(f"Duplicate matching QC profiles for isolate {row['isolate_id']}: {source}")
-            if matches:
+        for match,source in ((profiles_by_organism.get(organism) if organism else None,f"organism:{row.get('organism','')}"),
+                             (profiles_by_group.get(group) if group else None,f"group_id:{group}")):
+            if match:
                 changed=False
                 for key in THRESHOLD_COLUMNS:
-                    if matches[0].get(key,"").strip(): values[key]=matches[0][key].strip(); changed=True
+                    if match.get(key,"").strip(): values[key]=match[key].strip(); changed=True
                 if changed: sources.append(source)
         manifest_changed=False
         for key in THRESHOLD_COLUMNS:
