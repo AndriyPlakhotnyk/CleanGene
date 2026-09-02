@@ -1,4 +1,4 @@
-import gzip, os, tempfile, unittest
+import gzip, json, os, tempfile, unittest
 from pathlib import Path
 from io import StringIO
 import contextlib
@@ -9,7 +9,7 @@ from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import active_cleangene_jobs_for_run, array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
 from cleangene.task_store import build_isolate_task_store, load_isolate_task, migrate_isolate_task_store
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, prepare_validation, preprocess, reduce_group, slurm_controller, task_row
 from cleangene.cli import apply_cli_overrides, exclude_command, invalidate_legacy_identity_metrics, local, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
@@ -636,6 +636,30 @@ class CleanGeneCoreTests(unittest.TestCase):
                 write_tsv(qc,["isolate_id","group_id","excluded","assembly","gff","R1","R2"],[{"isolate_id":iso,"group_id":old,"excluded":0,"assembly":"","gff":"","R1":"r1","R2":"r2"}])
             panaroo(run,0)
             self.assertTrue((run/"results"/"groups"/"Streptococcus_gallolyticus"/"logs").is_dir())
+
+    def test_panaroo_failure_marks_group_failed_and_validation_skips(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; group="Streptococcus gallolyticus"; safe="Streptococcus_gallolyticus"
+            (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
+            atomic_json(run/"provenance"/"resolved_config.json",{"PANAROO_CPUS":"1","PANAROO_CLEAN_MODE":"strict"})
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2"],[["iso1",group,"r1","r2"],["iso2",group,"r1","r2"]])
+            write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[[group,2,"small"]])
+            for iso in ("iso1","iso2"):
+                gff=run/"results"/"sample_data"/iso/"annotation"/f"{iso}.gff"; gff.parent.mkdir(parents=True); gff.write_text("##gff-version 3\n")
+                write_tsv(run/"results"/"sample_data"/iso/"qc.tsv",["isolate_id","group_id","excluded","assembly","gff","R1","R2"],[[iso,group,0,"asm.fa",gff,"r1","r2"]])
+            def fail_panaroo(command,stdout=None,stderr=None,**kwargs):
+                Path(stderr).write_text("panaroo internal failure\n")
+                raise subprocess.CalledProcessError(1,command)
+            with patch("cleangene.workers.run",side_effect=fail_panaroo), contextlib.redirect_stderr(StringIO()):
+                panaroo(run,0)
+            marker=read_tsv(run/"state"/"group_tasks.tsv")
+            self.assertEqual(marker[0]["group_id"],group)
+            status=json.loads((run/"state"/"panaroo"/f"{safe}.done.json").read_text())
+            self.assertEqual(status["status"],"failed")
+            self.assertIn("panaroo internal failure",status["stderr_tail"])
+            prepare_validation(run,0)
+            prepared=json.loads((run/"state"/"prepare_validation"/f"{safe}.done.json").read_text())
+            self.assertEqual(prepared["reason"],"panaroo_failed")
 
     def test_resume_skips_completed_preprocess_and_resolve(self):
         with tempfile.TemporaryDirectory() as d:

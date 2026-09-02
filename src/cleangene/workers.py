@@ -1640,7 +1640,18 @@ def panaroo(run_dir: Path, index: int) -> None:
     gffs=[r["gff"] for r in retained if r.get("gff")]
     if len(gffs)<2: touch_done(done,{"status":"skipped","reason":"fewer_than_two_gffs"}); return
     threads=os.environ.get("SLURM_CPUS_PER_TASK",cfg.get("PANAROO_CPUS",cfg.get("CPUS","4")))
-    run(["panaroo","-i",*gffs,"-o",str(out),"--clean-mode",cfg["PANAROO_CLEAN_MODE"],"-t",threads],stdout=logs/"panaroo.stdout",stderr=logs/"panaroo.stderr")
+    stdout=logs/"panaroo.stdout"; stderr=logs/"panaroo.stderr"
+    try:
+        run(["panaroo","-i",*gffs,"-o",str(out),"--clean-mode",cfg["PANAROO_CLEAN_MODE"],"-t",threads],stdout=stdout,stderr=stderr)
+    except subprocess.CalledProcessError as error:
+        stderr_tail=_log_tail(stderr,lines=80)
+        stdout_tail=_log_tail(stdout,lines=40)
+        reason=f"panaroo_failed_exit_{error.returncode}"
+        print(f"Panaroo failed for group {group}: {reason}",file=sys.stderr,flush=True)
+        if stderr_tail: print("Panaroo stderr tail:\n"+stderr_tail,file=sys.stderr,flush=True)
+        if stdout_tail: print("Panaroo stdout tail:\n"+stdout_tail,file=sys.stderr,flush=True)
+        touch_done(done,{"status":"failed","reason":reason,"returncode":error.returncode,"stdout":str(stdout),"stderr":str(stderr),"stderr_tail":stderr_tail[-4000:],"stdout_tail":stdout_tail[-2000:]})
+        return
     isolates=[r["isolate_id"] for r in retained]; rows=normalize_panaroo(out/"gene_presence_absence.csv",isolates); calls=root/"02_pangenome"/"initial_calls"; calls.mkdir(parents=True,exist_ok=True); write_binary(calls/"gene_presence_absence.binary.tsv",rows,isolates)
     touch_done(done,{"n_isolates":len(isolates),"n_genes":len(rows)})
 
@@ -1651,7 +1662,12 @@ def prepare_validation(run_dir: Path, index: int) -> None:
     retained=retained_rows(run_dir,group)
     if len(retained)<2: touch_done(done,{"status":"skipped"}); return
     isolates=[r["isolate_id"] for r in retained]; initial=root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv"; panaroo_dir=prepared_pangenome_dir(run_dir,group,root)
-    if not initial.is_file(): touch_done(done,{"status":"skipped","reason":"missing_initial_pangenome"}); return
+    if not initial.is_file():
+        panaroo_marker=run_dir/"state"/"panaroo"/f"{safe_name(group)}.done.json"
+        status=load_json(panaroo_marker).get("status","") if panaroo_marker.is_file() else ""
+        reason="panaroo_failed" if status=="failed" else "missing_initial_pangenome"
+        touch_done(done,{"status":"skipped","reason":reason})
+        return
     rows=[]
     with initial.open(newline="") as h:
         for r in csv.DictReader(h,delimiter="\t"): rows.append({"Gene":r["Gene"],**{i:int(r[i]) for i in isolates}})
