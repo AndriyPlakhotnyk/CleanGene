@@ -137,7 +137,9 @@ def global_preflight(run_dir: Path) -> dict[str,object]:
         if kraken_status=="not_required":
             _timed(timings,"kraken_requirement",lambda: touch_done(run_dir/"state"/"kraken_db_setup.done.json",{"status":"not_required"}))
         if checkm2_status=="not_required":
-            _timed(timings,"checkm2_requirement",lambda: touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"}))
+            disabled=truthy(cfg.get("CHECKM2_DISABLED_BY_USER","false")) or checkm2_mode(cfg)=="off"
+            if disabled: _controller_log("CheckM2: disabled by user; setup and prediction skipped",ok=True)
+            _timed(timings,"checkm2_requirement",lambda: touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required","reason":"user_disabled" if disabled else "not_required"}))
         payload={"status":"PASS",**input_summary,"runtime":"PASS","CheckM2 setup":checkm2_status,"Kraken2 setup":kraken_status,"QC profiles":"PASS"}
         payload["total_seconds"]=time.monotonic()-start
         atomic_json(marker,payload)
@@ -391,10 +393,13 @@ def _prepare_existing_checkm2_db(run_dir: Path, cfg: dict[str,str], rows: list[d
     touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution,cfg))
     return True
 
-def checkm2_db_setup(run_dir: Path, index: int | None = None) -> None:
+def _checkm2_db_setup_impl(run_dir: Path, index: int | None = None, *, force: bool = False, marker_name: str = "checkm2_db_setup.done.json") -> None:
     cfg,rows=context(run_dir)
+    original_mode=cfg.get("CHECKM2_MODE","")
+    if force:
+        cfg={**cfg,"CHECKM2_MODE":"required"}
     if not needs_checkm2(rows,cfg):
-        touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"})
+        touch_done(run_dir/"state"/marker_name,{"status":"not_required"})
         return
     try:
         executable=resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE",""))
@@ -424,7 +429,17 @@ def checkm2_db_setup(run_dir: Path, index: int | None = None) -> None:
             raise SystemExit(str(recovered_error))
     _verify_checkm2_runtime(run_dir,cfg,resolution)
     _write_resolved_checkm2_config(run_dir,cfg,resolution)
-    touch_done(run_dir/"state"/"checkm2_db_setup.done.json",_checkm2_setup_marker(resolution,cfg))
+    if force and original_mode:
+        persisted=load_json(run_dir/"provenance"/"resolved_config.json")
+        persisted["CHECKM2_MODE"]=original_mode
+        atomic_json(run_dir/"provenance"/"resolved_config.json",persisted)
+    touch_done(run_dir/"state"/marker_name,_checkm2_setup_marker(resolution,cfg))
+
+def checkm2_db_setup(run_dir: Path, index: int | None = None) -> None:
+    _checkm2_db_setup_impl(run_dir,index)
+
+def checkm2_posthoc_setup(run_dir: Path, index: int | None = None) -> None:
+    _checkm2_db_setup_impl(run_dir,index,force=True,marker_name="checkm2_posthoc_setup.done.json")
 
 def _kraken2_recovery_config(run_dir: Path, cfg: dict[str,str], error: Kraken2DbError) -> dict[str,str] | None:
     recorded=cfg.get("KRAKEN2_DB","").strip()
@@ -762,7 +777,39 @@ def preprocess(run_dir: Path, index: int) -> None:
     finished=False
     def finish(data: dict[str,object], payload: dict[str,object]) -> None:
         nonlocal finished
-        if scratch: _sync_tree(work_out,out)
+
+        # Manifest FASTQs that were not modified are symlinked in scratch.
+        # Do not let shutil.copytree() dereference them into full FASTQ copies.
+        relink_reads=[]
+        if scratch and "+symlinked" in str(data.get("read_preprocessing","")):
+            for key in ("R1","R2"):
+                value=str(data.get(key,""))
+                if not value:
+                    continue
+                source=Path(value)
+                if not source.is_symlink():
+                    raise SystemExit(
+                        f"Expected unmodified {key} for isolate {iso} to be a symlink, "
+                        f"but found a regular path: {source}"
+                    )
+                try:
+                    relative=source.relative_to(work_out)
+                except ValueError:
+                    raise SystemExit(
+                        f"Expected unmodified {key} for isolate {iso} inside preprocess output: {source}"
+                    )
+                target=source.resolve(strict=True)
+                relink_reads.append((relative,target))
+                source.unlink()
+
+        if scratch:
+            _sync_tree(work_out,out)
+
+        # Re-create retained read links directly against the immutable
+        # original FASTQs, never against node-local scratch.
+        for relative,target in relink_reads:
+            _replace_symlink(out/relative,target)
+
         for key in ("R1","R2","assembly","gff"):
             if data.get(key): data[key]=_shared_path(str(data[key]),work_out,out)
         if payload.get("gff"): payload["gff"]=_shared_path(str(payload["gff"]),work_out,out)
@@ -836,7 +883,7 @@ def preprocess(run_dir: Path, index: int) -> None:
                         run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
                     else:
                         if any(shov.iterdir()): shutil.rmtree(shov)
-                        run(["spades.py","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
+                        run(["spades.py","--isolate","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
                 except subprocess.CalledProcessError as error:
                     errors.append(("assembly_failed",f"{assembler} assembly failed with exit status {error.returncode}")); assembly=""
         if assembler=="off" and not assembly: warnings.append(("shovill_skipped","assembly and annotation were not evaluated because assembly mode is off"))
@@ -845,7 +892,7 @@ def preprocess(run_dir: Path, index: int) -> None:
         else: metrics=empty_metrics; assembly=""
         completeness=check_contamination=None
         supplied_checkm2=row.get("checkm2_report","").strip()
-        if supplied_checkm2:
+        if supplied_checkm2 and mode!="off":
             provenance.append(_artifact_provenance(supplied_checkm2,"checkm2_report"))
             try: completeness,check_contamination=parse_checkm2_report(Path(supplied_checkm2).expanduser())
             except (ValueError,OSError) as error: errors.append(("checkm2_report_invalid",f"Supplied CheckM2 report could not be parsed: {error}"))
@@ -1615,6 +1662,7 @@ def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
     if stage=="slurm_controller": slurm_controller(run_dir,index)
     elif stage=="kraken_db_setup": kraken_db_setup(run_dir,index)
     elif stage=="checkm2_db_setup": checkm2_db_setup(run_dir,index)
+    elif stage=="checkm2_posthoc_setup": checkm2_posthoc_setup(run_dir,index)
     elif stage=="preprocess": preprocess(run_dir,int(index))
     elif stage=="resolve_groups": resolve_groups(run_dir,index)
     elif stage=="orchestrate_downstream": orchestrate_downstream(run_dir,index)
