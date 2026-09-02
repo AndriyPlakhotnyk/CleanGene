@@ -73,8 +73,13 @@ def _write_indexed_jsonl(jsonl: Path, index: Path, records: Iterable[dict[str, o
     return count
 
 
-def build_group_task_store(run_dir: Path, rows: Iterable[dict[str, str]]) -> int:
+def build_group_task_store(
+    run_dir: Path,
+    rows: Iterable[dict[str, str]],
+    group_order: Iterable[str] | None = None,
+) -> int:
     groups: dict[str, dict[str, object]] = {}
+
     for index, row in enumerate(rows):
         group = row["group_id"]
         record = groups.setdefault(group, {
@@ -84,14 +89,37 @@ def build_group_task_store(run_dir: Path, rows: Iterable[dict[str, str]]) -> int
             "isolate_ids": [],
             "pangenome_dir": row.get("pangenome_dir", ""),
         })
+
         record["isolate_indices"].append(index)
         record["isolate_ids"].append(row["isolate_id"])
+
         if row.get("organism") and not record.get("organism"):
             record["organism"] = row["organism"]
+
         if row.get("pangenome_dir") and not record.get("pangenome_dir"):
             record["pangenome_dir"] = row["pangenome_dir"]
+
+    records = list(groups.values())
+
+    if group_order is not None:
+        order = list(group_order)
+
+        if len(order) != len(set(order)):
+            raise SystemExit("Duplicate group IDs in requested group task order")
+
+        unknown = [group for group in order if group not in groups]
+        missing = [group for group in groups if group not in set(order)]
+
+        if unknown or missing:
+            raise SystemExit(
+                "Group task ordering mismatch: "
+                f"unknown={unknown[:10]} missing={missing[:10]}"
+            )
+
+        records = [groups[group] for group in order]
+
     jsonl, index = group_store_paths(run_dir)
-    return _write_indexed_jsonl(jsonl, index, groups.values())
+    return _write_indexed_jsonl(jsonl, index, records)
 
 
 def task_store_ready(run_dir: Path) -> bool:

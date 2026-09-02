@@ -945,12 +945,36 @@ def retained_rows(run_dir: Path, group: str) -> list[dict[str,str]]:
     rows=[]
     if group_store_ready(run_dir) and task_store_ready(run_dir):
         group_rows=read_tsv(run_dir/"state"/"group_tasks.tsv")
-        group_index=next((i for i,row in enumerate(group_rows) if row["group_id"]==group),None)
+        group_index=next(
+            (i for i,row in enumerate(group_rows) if row["group_id"]==group),
+            None,
+        )
+
         if group_index is not None:
             record=load_group_task(run_dir,group_index)
-            rows=[{key:("" if value is None else str(value)) for key,value in load_isolate_task(run_dir,int(i)).items() if key not in {"qc_thresholds","qc_thresholds_resolved"}} for i in record.get("isolate_indices",[])]
+
+            # Never trust an index from group_tasks.tsv unless the indexed
+            # record identifies the same biological group.
+            if str(record.get("group_id","")) == group:
+                rows=[
+                    {
+                        key:("" if value is None else str(value))
+                        for key,value in load_isolate_task(
+                            run_dir,int(i)
+                        ).items()
+                        if key not in {
+                            "qc_thresholds",
+                            "qc_thresholds_resolved",
+                        }
+                    }
+                    for i in record.get("isolate_indices",[])
+                ]
+
+    # Backward-compatible recovery for runs created before group-task
+    # ordering was guaranteed.
     if not rows:
-        _, rows=context(run_dir)
+        _, manifest_rows=context(run_dir)
+        rows=[row for row in manifest_rows if row["group_id"]==group]
     for row in rows:
         if row["group_id"]!=group: continue
         if user_excluded(row): continue
@@ -1117,7 +1141,18 @@ def resolve_groups(run_dir: Path, index: int | None = None) -> None:
     ordered=sorted(counts, key=lambda g:(counts[g],g))
     write_resolved(run_dir/"provenance"/"manifest.tsv",resolved)
     build_isolate_task_store(run_dir,resolved)
-    build_group_task_store(run_dir,resolved)
+    build_group_task_store(run_dir,resolved,ordered)
+
+    # The indexed group task store and group_tasks.tsv must use exactly
+    # the same index -> group mapping. Downstream SLURM arrays depend on it.
+    for group_index, group in enumerate(ordered):
+        stored=load_group_task(run_dir,group_index)
+        if str(stored.get("group_id","")) != group:
+            raise SystemExit(
+                f"Group task index mismatch at index {group_index}: "
+                f"expected {group!r}, found {stored.get('group_id')!r}"
+            )
+
     write_tsv(run_dir/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],([r["group_id"],r["isolate_id"]] for r in resolved))
     write_tsv(run_dir/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],([g,counts[g],group_size_class(counts[g],cfg)] for g in ordered))
     organism_index=build_organism_results_index(run_dir)
