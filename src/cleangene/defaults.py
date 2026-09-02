@@ -31,6 +31,7 @@ SCIENTIFIC_DEFAULTS = {
     "PREPROCESS_SCRATCH_DIR": "",
     "CLEANUP_TRIMMED_FASTQ": "false",
     "CHECKM2_MODE": "required",
+    "CHECKM2_LOWMEM": "false",
     "CHECKM2_EXECUTABLE": "",
     "CHECKM2_DB": "",
     "CHECKM2_DATABASE_ROOT": "",

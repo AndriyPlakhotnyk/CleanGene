@@ -176,6 +176,7 @@ def _doctor_config_errors(cfg: dict[str,str]) -> list[str]:
         "TAXONOMY_MODE":{"auto","identify","contamination","kraken2","off"},
         "READ_TRIMMING_MODE":{"off","auto","always"},
         "KRAKEN2_DB_ACCESS":{"auto","copy","mmap","direct"},
+        "CHECKM2_LOWMEM":{"true","false","1","0","yes","no","on","off"},
     }
     for key,allowed in enums.items():
         value=cfg.get(key,"").strip().lower()
@@ -249,19 +250,25 @@ def doctor(args) -> int:
             if getattr(args,"deep_checkm2",False) and executable is not None:
                 with tempfile.TemporaryDirectory() as tmp:
                     tmpdir=Path(tmp); env=_checkm2_limited_env()
-                    testrun=subprocess.run(checkm2_testrun_command(executable,resolution.path,1),cwd=tmpdir,capture_output=True,text=True,env=env)
+                    if not os.environ.get("SLURM_JOB_ID") and command_exists("sbatch"):
+                        raise CheckM2DbError(
+                            "deep runtime verification must run inside a SLURM allocation. "
+                            f"Use: salloc --cpus-per-task={cfg['CHECKM2_CPUS']} --mem={cfg['CHECKM2_MEM']} --time={cfg['CHECKM2_TIME']} "
+                            f"mamba run -n cleangene cleangene doctor --config {args.config or 'config/cleangene.arc.local.env'} --deep-checkm2"
+                        )
+                    testrun=subprocess.run(checkm2_testrun_command(executable,resolution.path,1,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false"))),cwd=tmpdir,capture_output=True,text=True,env=env)
                     if testrun.returncode:
                         raise CheckM2DbError((testrun.stderr or testrun.stdout or "").strip() or f"testrun exited {testrun.returncode}")
                     print("CheckM2 testrun: READY")
                     genome=bundled_test_genome(executable)
                     input_path=checkm2_named_input_link(genome,tmpdir/"input","cleangene_checkm2_smoke")
                     out=tmpdir/"predict"
-                    command=checkm2_predict_command(executable,input_path,out,resolution.path,1,checkm2_predict_capabilities(executable))
+                    command=checkm2_predict_command(executable,input_path,out,resolution.path,1,checkm2_predict_capabilities(executable),lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false")))
                     predict=subprocess.run(command,cwd=tmpdir,capture_output=True,text=True,env=env)
                     if predict.returncode:
                         raise CheckM2DbError((predict.stderr or predict.stdout or "").strip() or f"predict exited {predict.returncode}")
                     parse_checkm2_quality_report(out/"quality_report.tsv","cleangene_checkm2_smoke")
-                    print("CheckM2 production predict smoke test: READY")
+                    print("CheckM2 deep runtime verification: READY")
         except CheckM2DbNotReady:
             root=checkm2_database_root(cfg)
             if not truthy(cfg.get("CHECKM2_AUTO_DOWNLOAD","true")):
@@ -271,7 +278,9 @@ def doctor(args) -> int:
             else:
                 failures+=1; print(f"CheckM2 database: ERROR managed root is not writable: {root}. Fix: set CLEANGENE_DATABASE_ROOT in {args.config or 'the config'} to a writable shared directory")
         except CheckM2DbError as error:
-            failures+=1; print(f"CheckM2 database: ERROR {error}")
+            failures+=1
+            label="CheckM2 deep runtime verification" if getattr(args,"deep_checkm2",False) else "CheckM2 database"
+            print(f"{label}: ERROR {error}")
     if cfg.get("TAXONOMY_MODE","auto")!="off":
         try:
             from .kraken import Kraken2DbNotReady, managed_kraken2_db_path, resolve_kraken2_db

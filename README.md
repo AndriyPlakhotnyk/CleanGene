@@ -69,18 +69,20 @@ cleangene run
     -> fast local submission
     -> SLURM cg-controller
     -> one global preflight
-    -> database setup/verification
+    -> cg-kraken_db_setup / cg-checkm2_db_setup when required
     -> daughter arrays
 ```
 
 The interactive launcher parses config syntax and manifest structure, creates
 the run directory, records launcher timing, submits the controller, and returns
-to your shell. Expensive software checks, CheckM2 startup, database validation,
-input-file metadata checks, QC profile resolution, and indexed task-store
-construction happen once inside the controller before daughter arrays are
-submitted. Daughter tasks then load only their indexed isolate or group record
-plus run-level config, with minimal per-task input checks. This keeps submission
-fast for cohorts up to tens of thousands of isolates.
+to your shell. The controller performs lightweight input-file metadata checks,
+QC profile resolution, and indexed task-store construction once before daughter
+arrays are submitted. CheckM2 runtime verification and Kraken2 database
+download/build work run in dedicated setup jobs, using the `CHECKM2_*` and
+`KRAKEN2_DB_*` resources rather than the controller allocation. Daughter tasks
+then load only their indexed isolate or group record plus run-level config, with
+minimal per-task input checks. This keeps submission fast for cohorts up to tens
+of thousands of isolates while keeping the controller at orchestration scale.
 
 ## Manifest
 
@@ -253,13 +255,14 @@ cleangene environment
                          └── shared managed CheckM2 DB
 ```
 
-The CheckM2 executable is resolved before controller submission. Resolution
+The CheckM2 executable is resolved inside the `cg-checkm2_db_setup` job, not on
+the login node and not inside the lightweight controller preflight. Resolution
 honors an explicit `CHECKM2_EXECUTABLE`, then `PATH`, an executable beside the
 active Python, and finally the sibling `cleangene-checkm2` environment. The
 absolute executable and version are stored in `provenance/resolved_config.json`
-and used for `--version`, database download, and prediction. The version probe
-allows up to five minutes because the first TensorFlow import can be slow on an
-HPC login node.
+and used for database download, setup smoke tests, and prediction. The version
+probe allows up to five minutes because the first TensorFlow import can be slow
+on HPC systems.
 
 With normal settings, `checkm2_db_setup` reuses
 `CheckM2_database/uniref100.KO.1.dmnd` below the managed root or downloads it
@@ -275,12 +278,18 @@ CheckM2 test genome. Successful verification is recorded beside the managed
 database and reused by later runs. An invalid explicit `CHECKM2_DB` fails
 closed.
 
-`CHECKM2_CPUS`, `CHECKM2_MEM`, and `CHECKM2_TIME` size database setup.
-Per-isolate prediction runs inside preprocess. `CHECKM2_PREDICT_CPUS` defaults
-to one because CleanGene already parallelizes samples, and
+`CHECKM2_CPUS`, `CHECKM2_MEM`, and `CHECKM2_TIME` size the dedicated
+`cg-checkm2_db_setup` job, including `testrun` and the production-form smoke
+test. `KRAKEN2_DB_CPUS`, `KRAKEN2_DB_MEM`, and `KRAKEN2_DB_TIME` size the
+dedicated `cg-kraken_db_setup` job. Per-isolate CheckM2 prediction runs inside
+preprocess and uses `CHECKM2_PREDICT_CPUS`, which defaults
+to one because CleanGene already parallelizes samples.
 `CHECKM2_MAX_INFLIGHT` bounds concurrent CheckM2 processes across a run. BLAS
 and TensorFlow helper pools are also held to one thread to avoid multiplying
-the Slurm allocation. A supplied `checkm2_report` remains reusable.
+the Slurm allocation. Set `CHECKM2_LOWMEM=true` explicitly on constrained-memory
+systems to add CheckM2's `--lowmem` option to setup smoke tests and per-isolate
+prediction; CleanGene does not silently retry in low-memory mode. A supplied
+`checkm2_report` remains reusable.
 `CHECKM2_MODE=off` is supported but produces a QC warning because completeness
 and contamination were not evaluated.
 

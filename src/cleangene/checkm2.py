@@ -14,7 +14,7 @@ from .util import atomic_json, load_json, read_tsv, safe_name
 
 EXPECTED_CHECKM2_DB_NAME = "uniref100.KO.1.dmnd"
 RUNTIME_VERIFICATION_MARKER = ".cleangene-runtime-verified.json"
-CHECKM2_COMMAND_SCHEMA_VERSION = 3
+CHECKM2_COMMAND_SCHEMA_VERSION = 4
 
 
 class CheckM2DbError(RuntimeError):
@@ -78,18 +78,26 @@ def checkm2_database_download_command(executable: Path | str, root: Path | str) 
     return [str(executable), "database", "--download", "--path", str(root), "--no_write_json_db"]
 
 
-def checkm2_testrun_command(executable: Path | str, database: Path | str, threads: int | str = 1) -> list[str]:
-    return [str(executable), "testrun", "--threads", str(max(1, int(threads))), "--database_path", str(database)]
+def checkm2_testrun_command(executable: Path | str, database: Path | str, threads: int | str = 1, *, lowmem: bool = False) -> list[str]:
+    command = [str(executable)]
+    if lowmem:
+        command.append("--lowmem")
+    command.extend(["testrun", "--threads", str(max(1, int(threads))), "--database_path", str(database)])
+    return command
 
 
 def checkm2_predict_command(executable: Path | str, input_path: Path | str, output_dir: Path | str,
                            database: Path | str, threads: int | str,
-                           capabilities: CheckM2PredictCapabilities) -> list[str]:
-    return [
-        str(executable), "predict", "--threads", str(max(1, int(threads))),
+                           capabilities: CheckM2PredictCapabilities, *, lowmem: bool = False) -> list[str]:
+    command = [str(executable)]
+    if lowmem:
+        command.append("--lowmem")
+    command.extend([
+        "predict", "--threads", str(max(1, int(threads))),
         "--input", str(input_path), "--output-directory", str(output_dir),
         "--database_path", str(database), capabilities.cleanup_option, "--force",
-    ]
+    ])
+    return command
 
 
 def checkm2_input_suffix(path: Path) -> str:
@@ -169,7 +177,7 @@ def _checkm2_env_history(executable: Path) -> Path | None:
     return None
 
 
-def checkm2_runtime_signature(path: Path | str, executable: Path | str, version: str) -> dict[str, object]:
+def checkm2_runtime_signature(cfg: dict[str, str], path: Path | str, executable: Path | str, version: str) -> dict[str, object]:
     database = Path(path).expanduser().resolve()
     resolved_executable = Path(executable).expanduser().resolve()
     env_history = _checkm2_env_history(resolved_executable)
@@ -182,6 +190,7 @@ def checkm2_runtime_signature(path: Path | str, executable: Path | str, version:
         "CHECKM2_EXECUTABLE_FILE": _file_signature(resolved_executable),
         "CHECKM2_CONDA_HISTORY_FILE": _file_signature(env_history) if env_history else None,
         "CHECKM2_VERSION": version,
+        "CHECKM2_LOWMEM": str(truthy(cfg.get("CHECKM2_LOWMEM", "false"))).lower(),
         "CHECKM2_PREDICT_CLEANUP_OPTION": capabilities.cleanup_option,
         "CHECKM2_PREDICT_HELP_SHA256": capabilities.help_sha256,
     }
@@ -198,7 +207,7 @@ def checkm2_runtime_is_verified(cfg: dict[str, str], path: Path | str,
         return False
     try:
         recorded = load_json(marker)
-        expected = checkm2_runtime_signature(path, executable, version)
+        expected = checkm2_runtime_signature(cfg, path, executable, version)
     except (OSError, ValueError):
         return False
     return recorded.get("status") == "complete" and all(recorded.get(key) == value for key, value in expected.items())
@@ -207,7 +216,7 @@ def checkm2_runtime_is_verified(cfg: dict[str, str], path: Path | str,
 def record_checkm2_runtime_verified(cfg: dict[str, str], path: Path | str,
                                     executable: Path | str, version: str) -> Path:
     marker = checkm2_runtime_marker(cfg)
-    atomic_json(marker, {"status": "complete", **checkm2_runtime_signature(path, executable, version)})
+    atomic_json(marker, {"status": "complete", **checkm2_runtime_signature(cfg, path, executable, version)})
     return marker
 
 

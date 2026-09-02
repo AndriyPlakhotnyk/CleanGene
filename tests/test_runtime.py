@@ -138,6 +138,31 @@ class RuntimeResolutionTests(unittest.TestCase):
             self.assertEqual(result, 2)
             self.assertIn("Fix: bash scripts/install_or_update.sh --recreate", output.getvalue())
 
+    def test_doctor_deep_checkm2_refuses_login_node_when_slurm_available(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            exe=_write_executable(root/"bin"/"checkm2")
+            db=root/"checkm2"/"CheckM2_database"/"uniref100.KO.1.dmnd"
+            db.parent.mkdir(parents=True); db.write_text("db\n")
+            config=root/"arc.local.env"
+            config.write_text(
+                f"CHECKM2_MODE=required\nCHECKM2_EXECUTABLE={exe}\nCHECKM2_DATABASE_ROOT={root/'checkm2'}\n"
+                "CHECKM2_CPUS=16\nCHECKM2_MEM=128G\nCHECKM2_TIME=24:00:00\nTAXONOMY_MODE=off\n"
+            )
+            output=StringIO()
+            environment={**os.environ,"CONDA_DEFAULT_ENV":"cleangene","CONDA_PREFIX":str(root/"envs"/"cleangene")}
+            environment.pop("SLURM_JOB_ID",None)
+            with patch.dict(os.environ,environment,clear=True), \
+                 patch("cleangene.cli.sys.executable",str(root/"envs"/"cleangene"/"bin"/"python")), \
+                 patch("cleangene.cli.command_exists",return_value=True), \
+                 contextlib.redirect_stdout(output):
+                result=main(["doctor","--config",str(config),"--deep-checkm2"])
+            text=output.getvalue()
+            self.assertEqual(result,2)
+            self.assertIn("CheckM2 database: READY",text)
+            self.assertIn("CheckM2 deep runtime verification: ERROR",text)
+            self.assertIn("salloc --cpus-per-task=16 --mem=128G --time=24:00:00",text)
+
     def test_config_from_other_checkout_fails_without_external_database_root(self):
         active = cleangene_project_root()
         self.assertIsNotNone(active)

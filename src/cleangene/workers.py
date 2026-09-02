@@ -132,17 +132,13 @@ def global_preflight(run_dir: Path) -> dict[str,object]:
         cfg=_timed(timings,"qc_profiles",lambda: ensure_qc_provenance(run_dir,rows,cfg))
         _timed(timings,"task_store",lambda: (build_isolate_task_store(run_dir,rows), build_group_task_store(run_dir,rows)))
         atomic_json(run_dir/"provenance"/"resolved_config.json",cfg)
-        if needs_kraken(rows,cfg):
-            _timed(timings,"kraken",lambda: kraken_db_setup(run_dir,None))
-            cfg,rows=context(run_dir)
-        else:
-            _timed(timings,"kraken",lambda: touch_done(run_dir/"state"/"kraken_db_setup.done.json",{"status":"not_required"}))
-        if needs_checkm2(rows,cfg):
-            _timed(timings,"checkm2",lambda: checkm2_db_setup(run_dir,None))
-            cfg,rows=context(run_dir)
-        else:
-            _timed(timings,"checkm2",lambda: touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"}))
-        payload={"status":"PASS",**input_summary,"runtime":"PASS","CheckM2":"PASS" if needs_checkm2(rows,cfg) else "not_required","Kraken2":"PASS" if needs_kraken(rows,cfg) else "not_required","QC profiles":"PASS"}
+        kraken_status="required" if needs_kraken(rows,cfg) else "not_required"
+        checkm2_status="required" if needs_checkm2(rows,cfg) else "not_required"
+        if kraken_status=="not_required":
+            _timed(timings,"kraken_requirement",lambda: touch_done(run_dir/"state"/"kraken_db_setup.done.json",{"status":"not_required"}))
+        if checkm2_status=="not_required":
+            _timed(timings,"checkm2_requirement",lambda: touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required"}))
+        payload={"status":"PASS",**input_summary,"runtime":"PASS","CheckM2 setup":checkm2_status,"Kraken2 setup":kraken_status,"QC profiles":"PASS"}
         payload["total_seconds"]=time.monotonic()-start
         atomic_json(marker,payload)
         write_tsv(run_dir/"logs"/"preflight_timing.tsv",["phase","seconds"],[*timings,["total",f"{payload['total_seconds']:.6f}"]])
@@ -235,7 +231,7 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
     command=[]; executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_checkm2_executable()); threads=_checkm2_threads(cfg)
     try:
         capabilities=checkm2_predict_capabilities(executable)
-        command=checkm2_predict_command(executable,link,result_dir,cfg["CHECKM2_DB"],threads,capabilities)
+        command=checkm2_predict_command(executable,link,result_dir,cfg["CHECKM2_DB"],threads,capabilities,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false")))
         with _checkm2_prediction_slot(logs,cfg,isolate):
             run(command,stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr",env=_checkm2_environment())
         report=result_dir/"quality_report.tsv"
@@ -328,10 +324,10 @@ def _verify_checkm2_runtime(run_dir: Path, cfg: dict[str,str], resolution) -> No
         smoke_input_dir=smoke_dir/"input"; smoke_result_dir=smoke_dir/"results"
         try:
             capabilities=checkm2_predict_capabilities(executable)
-            run(checkm2_testrun_command(executable,resolution.path,1),stdout=stdout,stderr=stderr,env=_checkm2_environment())
+            run(checkm2_testrun_command(executable,resolution.path,1,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false"))),stdout=stdout,stderr=stderr,env=_checkm2_environment())
             genome=bundled_test_genome(executable)
             smoke_input=checkm2_named_input_link(genome,smoke_input_dir,"cleangene_checkm2_smoke")
-            smoke_cmd=checkm2_predict_command(executable,smoke_input,smoke_result_dir,resolution.path,1,capabilities)
+            smoke_cmd=checkm2_predict_command(executable,smoke_input,smoke_result_dir,resolution.path,1,capabilities,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false")))
             run(smoke_cmd,stdout=run_dir/"logs"/"checkm2-production-smoke.stdout",stderr=run_dir/"logs"/"checkm2-production-smoke.stderr",env=_checkm2_environment())
             parse_checkm2_quality_report(smoke_result_dir/"quality_report.tsv","cleangene_checkm2_smoke")
             marker=record_checkm2_runtime_verified(cfg,resolution.path,executable,version)
@@ -1221,6 +1217,19 @@ def _run_single_job(run_dir: Path, cfg: dict[str,str], stage: str, cpus: str, me
     _wait_jobs([jid],cfg,label,"single job submitted",f"job_id={jid} stage={stage} index=0 log={_stage_log_pattern(run_dir,stage)}")
     return jid
 
+def _run_database_setup_stages(run_dir: Path, cfg: dict[str,str], rows: list[dict[str,str]]) -> dict[str,str]:
+    if needs_kraken(rows,cfg):
+        _controller_log("step=kraken_db_setup | status=started")
+        _run_single_job(run_dir,cfg,"kraken_db_setup",cfg["KRAKEN2_DB_CPUS"],cfg["KRAKEN2_DB_MEM"],cfg["KRAKEN2_DB_TIME"],"CleanGene Kraken2 database setup")
+        cfg,rows=context(run_dir)
+        _controller_log("step=kraken_db_setup | status=PASS",ok=True)
+    if needs_checkm2(rows,cfg):
+        _controller_log("step=checkm2_db_setup | status=started")
+        _run_single_job(run_dir,cfg,"checkm2_db_setup",cfg["CHECKM2_CPUS"],cfg["CHECKM2_MEM"],cfg["CHECKM2_TIME"],"CleanGene CheckM2 database/runtime setup")
+        cfg,rows=context(run_dir)
+        _controller_log("step=checkm2_db_setup | status=PASS",ok=True)
+    return cfg
+
 def _index_done(run_dir: Path, stage: str, index: int) -> bool:
     kind="isolate" if stage in {"preprocess","validate"} else "group"
     row=task_row(run_dir,kind,index); name=row["isolate_id"] if kind=="isolate" else row["group_id"]
@@ -1438,6 +1447,8 @@ def slurm_controller(run_dir: Path, index: int | None = None) -> None:
         cfg, rows=context(run_dir)
         _controller_log(f"controller_started | run_dir={run_dir} | isolates={len(rows)} | stages=" + " -> ".join(stage for stage,_ in STAGE_DESCRIPTIONS))
         global_preflight(run_dir)
+        cfg, rows=context(run_dir)
+        cfg=_run_database_setup_stages(run_dir,cfg,rows)
         cfg, rows=context(run_dir)
         migrated=migrate_isolate_task_store(run_dir)
         if migrated: _controller_log(f"step=prepare_tasks | migrated_isolate_task_store={migrated}",ok=True)

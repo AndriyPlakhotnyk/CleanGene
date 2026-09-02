@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, CHECKM2_COMMAND_SCHEMA_VERSION, bundled_test_genome, checkm2_database_root, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, checkm2_runtime_marker, parse_checkm2_quality_report, resolve_checkm2_db, validate_checkm2_db
+from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, CHECKM2_COMMAND_SCHEMA_VERSION, bundled_test_genome, checkm2_database_root, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
 from cleangene.defaults import DEFAULTS
 from cleangene.tools import ToolResolutionError, resolve_checkm2_executable
 from cleangene.cli import make_run
@@ -83,6 +83,19 @@ class CheckM2DatabaseTests(unittest.TestCase):
             self.assertIn("--remove_intermediates",command)
             self.assertNotIn("--remove-intermediates",command)
 
+    def test_lowmem_is_explicit_for_testrun_and_predict(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe=_write_executable(Path(d)/"bin"/"checkm2")
+            caps=checkm2_predict_capabilities(exe)
+            normal_testrun=checkm2_testrun_command(exe,Path(d)/EXPECTED_CHECKM2_DB_NAME,1,lowmem=False)
+            normal_predict=checkm2_predict_command(exe,Path(d)/"i.fna",Path(d)/"out",Path(d)/EXPECTED_CHECKM2_DB_NAME,1,caps,lowmem=False)
+            low_testrun=checkm2_testrun_command(exe,Path(d)/EXPECTED_CHECKM2_DB_NAME,1,lowmem=True)
+            low_predict=checkm2_predict_command(exe,Path(d)/"i.fna",Path(d)/"out",Path(d)/EXPECTED_CHECKM2_DB_NAME,1,caps,lowmem=True)
+            self.assertNotIn("--lowmem",normal_testrun)
+            self.assertNotIn("--lowmem",normal_predict)
+            self.assertIn("--lowmem",low_testrun)
+            self.assertIn("--lowmem",low_predict)
+
     def test_runtime_marker_invalidates_when_schema_changes(self):
         with tempfile.TemporaryDirectory() as d:
             exe=_write_executable(Path(d)/"bin"/"checkm2")
@@ -112,6 +125,19 @@ class CheckM2DatabaseTests(unittest.TestCase):
                     checkm2_db_setup(run)
             self.assertFalse((run/"state"/"checkm2_db_setup.done.json").exists())
             self.assertFalse(checkm2_runtime_marker(cfg).exists())
+
+    def test_valid_shared_runtime_marker_skips_smoke_test(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); exe=_write_executable(root/"bin"/"checkm2"); run=root/"run"
+            cfg={"CHECKM2_MODE":"required","CHECKM2_DATABASE_ROOT":str(root/"checkm2"),"CHECKM2_AUTO_DOWNLOAD":"true","CHECKM2_EXECUTABLE":str(exe),"CHECKM2_LOWMEM":"false"}
+            db=checkm2_database_root(cfg)/"CheckM2_database"/EXPECTED_CHECKM2_DB_NAME; _write_db(db)
+            record_checkm2_runtime_verified(cfg,db,exe,"CheckM2 version 1.1.0")
+            atomic_json(run/"provenance"/"resolved_config.json",cfg)
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2"],[["i1","g","r1","r2"]])
+            with patch("cleangene.workers.run",side_effect=AssertionError("smoke test reran")):
+                checkm2_db_setup(run)
+            marker=load_json(run/"state"/"checkm2_db_setup.done.json")
+            self.assertTrue(marker["runtime_verified"])
 
     def test_missing_db_auto_downloads_once(self):
         with tempfile.TemporaryDirectory() as d:
@@ -168,10 +194,11 @@ class CheckM2DatabaseTests(unittest.TestCase):
             write_tsv(run / "provenance" / "manifest.tsv", ["isolate_id", "group_id", "R1", "R2"], [["i1", "g", str(r1), str(r2)]])
             write_tsv(run / "state" / "isolate_tasks.tsv", ["group_id", "isolate_id"], [["g", "i1"]])
             write_tsv(run / "state" / "group_tasks.tsv", ["group_id", "n_isolates", "group_size_class"], [["g", 1, "small"]])
-            with patch("cleangene.workers._run_single_job") as single:
+            with patch("cleangene.workers._run_single_job",side_effect=SystemExit("Explicit checkm2 executable is invalid")) as single, patch("cleangene.workers._controller_pipeline") as pipeline:
                 with self.assertRaisesRegex(SystemExit, "Explicit checkm2 executable is invalid"):
                     slurm_controller(run)
-            self.assertEqual(single.call_count,0)
+            self.assertEqual(single.call_count,1)
+            pipeline.assert_not_called()
             self.assertFalse((run / "results" / "sample_data" / "i1" / "qc.tsv").exists())
 
 
