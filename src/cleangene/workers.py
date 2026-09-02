@@ -15,7 +15,7 @@ from .manifest import groups, write_resolved
 from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_binary
 from .plotting import plot_presence_absence
 from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, ensure_qc_provenance, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
-from .slurm import array_task_count, assert_jobs_succeeded, available_slots, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
+from .slurm import array_task_count, assert_jobs_succeeded, available_slots, cancel_jobs, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .task_store import build_group_task_store, build_isolate_task_store, group_store_ready, load_group_task, load_isolate_task, migrate_group_task_store, migrate_isolate_task_store, task_store_ready
 from .tools import executable_version, resolve_checkm2_executable, ToolResolutionError
 from .util import atomic_json, command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
@@ -911,7 +911,7 @@ def preprocess(run_dir: Path, index: int) -> None:
                         run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
                     else:
                         if any(shov.iterdir()): shutil.rmtree(shov)
-                        run(["spades.py","--isolate","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
+                        run(["spades.py","--isolate","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
                 except subprocess.CalledProcessError as error:
                     errors.append(("assembly_failed",f"{assembler} assembly failed with exit status {error.returncode}")); assembly=""
         if assembler=="off" and not assembly: warnings.append(("shovill_skipped","assembly and annotation were not evaluated because assembly mode is off"))
@@ -1399,15 +1399,35 @@ class _RollingScheduler:
             discovered.setdefault((str(entry["job_id"]),stage),[]).append(index)
         for (jid,stage),indices in discovered.items():
             if jid not in self.active:
-                unique=sorted(set(indices)); self.active[jid]=_ActiveBatch(jid,stage,unique,",".join(map(str,unique)),seen=True)
-            self.submitted.setdefault(stage,set()).update(indices)
+                unique=sorted({i for i in indices if not self.is_done(stage,i)})
+                if not unique:
+                    continue
+                self.active[jid]=_ActiveBatch(jid,stage,unique,",".join(map(str,unique)),seen=True)
+            self.submitted.setdefault(stage,set()).update(i for i in indices if not self.is_done(stage,i))
 
     def refresh(self) -> None:
         self.snapshot=user_queue_snapshot(); queued=self.snapshot["jobs"]
         self._adopt_live_batches()
         for jid,batch in list(self.active.items()):
             if jid in queued:
-                batch.seen=True; batch.missing_polls=0; continue
+                batch.seen=True; batch.missing_polls=0
+                if batch.stage=="preprocess" and truthy(self.cfg.get("PREPROCESS_RECOVER_ACTIVE_COMPLETE_OUTPUTS","true")):
+                    isolate_rows=read_tsv(self.run_dir/"state"/"isolate_tasks.tsv")
+                    before=set(i for i in batch.indices if _index_done(self.run_dir,batch.stage,i))
+                    reconcile_preprocess_outputs(self.run_dir,self.cfg,isolate_rows,self.snapshot,indices=batch.indices)
+                    recovered=set(i for i in batch.indices if _index_done(self.run_dir,batch.stage,i))
+                    if recovered-before:
+                        _controller_log(f"step=CleanGene preprocess | active_output_recovered={len(recovered-before)} | job_id={jid}",ok=True)
+                    if len(recovered)==len(batch.indices):
+                        self.done.setdefault(batch.stage,set()).update(batch.indices)
+                        if truthy(self.cfg.get("PREPROCESS_CANCEL_RECOVERED_ACTIVE_JOBS","true")):
+                            try:
+                                cancel_jobs([jid])
+                                _controller_log(f"step=CleanGene preprocess | canceled_recovered_active_job={jid}",ok=True)
+                            except (OSError, subprocess.SubprocessError) as error:
+                                _controller_log(f"step=CleanGene preprocess | recovered_active_job_cancel_failed={jid} | reason={error}")
+                        del self.active[jid]
+                continue
             batch.missing_polls += 1
             if batch.missing_polls<2: continue
             details=f"job_id={jid} stage={batch.stage} index={batch.array} log={_stage_log_pattern(self.run_dir,batch.stage)}"

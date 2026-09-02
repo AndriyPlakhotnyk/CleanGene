@@ -1,9 +1,14 @@
 from __future__ import annotations
-import csv, hashlib, math, subprocess
+import csv, hashlib, math, os, subprocess
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
+from .checkm2 import checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, parse_checkm2_quality_report
+from .defaults import DEFAULTS
 from .fasta import read_fasta, write_fasta
 from .pangenome import recover_sequences
+from .qc import THRESHOLD_DEFAULTS, classify_isolate_qc, qc_value, validate_thresholds
+from .tools import resolve_checkm2_executable
 from .util import load_json, read_tsv, run, safe_name, write_tsv
 
 def available_organisms(run_dir: Path) -> list[str]:
@@ -325,7 +330,92 @@ def make_itol(request: dict[str,object]) -> None:
             labels=sorted(set(values.values())); target=filename if len(groups)==1 else f"{Path(filename).stem}.{safe_name(group)}.txt"
             _write_itol_strip(out/target,f"{label}: {group}",values,_colors(labels,scheme,custom))
 
-def run_request(request_path: Path) -> None:
+def _thresholds_for_run(run_dir: Path) -> dict[str,dict[str,float | None]]:
+    path=run_dir/"provenance"/"qc_thresholds.tsv"
+    if not path.is_file(): return {}
+    return {row["isolate_id"]:validate_thresholds({k:row.get(k,THRESHOLD_DEFAULTS[k]) for k in THRESHOLD_DEFAULTS},row["isolate_id"]) for row in read_tsv(path)}
+
+def _checkm2_status(completeness: float, contamination: float, thresholds: dict[str,float | None]) -> tuple[str,str]:
+    notes=[]
+    if completeness < thresholds["qc_min_completeness_fail"]:
+        notes.append(f"FAIL: completeness={qc_value(completeness)}% is below fail minimum {qc_value(thresholds['qc_min_completeness_fail'])}%")
+    elif completeness < thresholds["qc_min_completeness_pass"]:
+        notes.append(f"WARNING: completeness={qc_value(completeness)}% is below pass minimum {qc_value(thresholds['qc_min_completeness_pass'])}%")
+    if contamination > thresholds["qc_max_checkm2_contamination_fail"]:
+        notes.append(f"FAIL: checkm2_contamination={qc_value(contamination)}% exceeds fail maximum {qc_value(thresholds['qc_max_checkm2_contamination_fail'])}%")
+    elif contamination > thresholds["qc_max_checkm2_contamination_pass"]:
+        notes.append(f"WARNING: checkm2_contamination={qc_value(contamination)}% exceeds pass maximum {qc_value(thresholds['qc_max_checkm2_contamination_pass'])}%")
+    status="FAIL" if any(n.startswith("FAIL:") for n in notes) else "WARNING" if notes else "PASS"
+    return status,"; ".join(notes) if notes else "CheckM2 criteria passed"
+
+def _posthoc_task_paths(out: Path, isolate: str) -> tuple[Path,Path,Path]:
+    root=out/"isolates"/safe_name(isolate); return root,root/"result",root/"logs"
+
+def checkm2_posthoc_task(request: dict[str,object], index: int) -> None:
+    run_dir=Path(str(request["run_dir"])); out=Path(str(request["output_dir"])); tasks=read_tsv(out/"tasks.tsv")
+    if index<0 or index>=len(tasks): raise SystemExit(f"CheckM2 post-hoc task index {index} outside task list")
+    task=tasks[index]; iso=task["isolate_id"]; root,result_dir,logs=_posthoc_task_paths(out,iso); logs.mkdir(parents=True,exist_ok=True); result_dir.mkdir(parents=True,exist_ok=True)
+    done=root/"done.json"
+    if done.is_file() and not request.get("force",False): return
+    assembly=Path(task.get("assembly","")).expanduser()
+    if assembly and not assembly.is_absolute():
+        assembly=run_dir/assembly
+    if not assembly.is_file():
+        write_tsv(root/"checkm2_qc.tsv",["isolate_id","group_id","assembly","checkm2_completeness","checkm2_contamination","checkm2_status","checkm2_notes"],[[iso,task.get("group_id",""),str(assembly),"","","NOT_EVALUATED","assembly unavailable"]])
+        from .util import atomic_json
+        atomic_json(done,{"status":"NOT_EVALUATED","reason":"assembly_unavailable"})
+        return
+    cfg={**DEFAULTS,**load_json(run_dir/"provenance"/"resolved_config.json")}
+    executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_checkm2_executable())
+    capabilities=checkm2_predict_capabilities(executable)
+    link=checkm2_named_input_link(assembly,root/"input",iso)
+    command=checkm2_predict_command(executable,link,result_dir,cfg["CHECKM2_DB"],cfg["CHECKM2_POSTHOC_CPUS"],capabilities,lowmem=str(cfg.get("CHECKM2_LOWMEM","false")).lower() in {"1","true","yes","on"})
+    fields=["isolate_id","group_id","assembly","checkm2_completeness","checkm2_contamination","checkm2_status","checkm2_notes"]
+    from .util import atomic_json
+    try:
+        run(command,stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr")
+        completeness,contamination=parse_checkm2_quality_report(result_dir/"quality_report.tsv",iso)
+        thresholds=_thresholds_for_run(run_dir).get(iso,validate_thresholds(THRESHOLD_DEFAULTS,iso))
+        status,notes=_checkm2_status(completeness,contamination,thresholds)
+        write_tsv(root/"checkm2_qc.tsv",fields,[[iso,task.get("group_id",""),str(assembly),qc_value(completeness),qc_value(contamination),status,notes]])
+        atomic_json(done,{"status":status,"completeness":completeness,"contamination":contamination})
+    except Exception as error:
+        write_tsv(root/"checkm2_qc.tsv",fields,[[iso,task.get("group_id",""),str(assembly),"","","ERROR",str(error)]])
+        atomic_json(done,{"status":"ERROR","reason":str(error)})
+
+def checkm2_posthoc_merge(request: dict[str,object]) -> None:
+    run_dir=Path(str(request["run_dir"])); out=Path(str(request["output_dir"])); tasks=read_tsv(out/"tasks.tsv")
+    fields=["isolate_id","group_id","assembly","checkm2_completeness","checkm2_contamination","checkm2_status","checkm2_notes"]
+    rows=[]; failed=[]
+    for task in tasks:
+        path=_posthoc_task_paths(out,task["isolate_id"])[0]/"checkm2_qc.tsv"
+        row=read_tsv(path)[0] if path.is_file() else {"isolate_id":task["isolate_id"],"group_id":task.get("group_id",""),"assembly":task.get("assembly",""),"checkm2_completeness":"","checkm2_contamination":"","checkm2_status":"ERROR","checkm2_notes":"task output missing"}
+        rows.append(row)
+        if row["checkm2_status"] in {"ERROR","NOT_EVALUATED"}: failed.append(row)
+    write_tsv(out/"checkm2_qc.tsv",fields,rows)
+    write_tsv(out/"failed_isolates.tsv",fields,failed)
+    cohort_path=run_dir/"results"/"cohort"/"isolate_qc.tsv"
+    if cohort_path.is_file():
+        cohort=read_tsv(cohort_path); by_iso={r["isolate_id"]:r for r in rows}; thresholds=_thresholds_for_run(run_dir); evaluated_at=datetime.now().isoformat()
+        extra=["checkm2_posthoc_status","checkm2_posthoc_notes","checkm2_evaluated_at","PASS/FAIL_with_checkm2","Notes_with_checkm2"]
+        header=list(cohort[0].keys()) if cohort else []
+        for field in extra:
+            if field not in header: header.append(field)
+        for row in cohort:
+            hit=by_iso.get(row["isolate_id"])
+            if not hit: continue
+            row["checkm2_completeness"]=hit["checkm2_completeness"]; row["checkm2_contamination"]=hit["checkm2_contamination"]
+            row["checkm2_posthoc_status"]=hit["checkm2_status"]; row["checkm2_posthoc_notes"]=hit["checkm2_notes"]; row["checkm2_evaluated_at"]=evaluated_at
+            if hit["checkm2_status"] in {"PASS","WARNING","FAIL"}:
+                th=thresholds.get(row["isolate_id"],validate_thresholds(THRESHOLD_DEFAULTS,row["isolate_id"]))
+                result=classify_isolate_qc(thresholds=th,expected_organism="",top_species=row.get("top_species",""),kraken_contamination=float(row["contamination_pct"]) if row.get("contamination_pct") else None,read_length=float(row["trimmed_read_length"]) if row.get("trimmed_read_length") else None,mean_quality=float(row["mean_base_quality"]) if row.get("mean_base_quality") else None,coverage=float(row["sequencing_coverage"]) if row.get("sequencing_coverage") else None,contigs=float(row["contigs"]) if row.get("contigs") else None,n50=float(row["n50"]) if row.get("n50") else None,completeness=float(hit["checkm2_completeness"]),checkm2_contamination=float(hit["checkm2_contamination"]),checkm2_mode="required",internal_pangenome=bool(row.get("assembly")),external_pangenome=False,assembly_present=bool(row.get("assembly")),gff_present=bool(row.get("gff")))
+                row["PASS/FAIL_with_checkm2"]=result["PASS/FAIL"]; row["Notes_with_checkm2"]=result["Notes"]
+        tmp=cohort_path.with_name(f".{cohort_path.name}.tmp-{os.getpid()}"); write_tsv(tmp,header,cohort); os.replace(tmp,cohort_path)
+    summary=Counter(r["checkm2_status"] for r in rows)
+    (out/"summary.txt").write_text("CheckM2 post-hoc QC complete\n" + "\n".join(f"{k}: {summary.get(k,0)}" for k in ("PASS","WARNING","FAIL","ERROR","NOT_EVALUATED")) + f"\nCohort QC updated: {cohort_path}\nPost-hoc CheckM2 report: {out/'checkm2_qc.tsv'}\nPanaroo membership was not changed.\n")
+    print((out/"summary.txt").read_text())
+
+def run_request(request_path: Path, index: int = -1) -> None:
     request=load_json(request_path); out=Path(str(request["output_dir"])); out.mkdir(parents=True,exist_ok=True)
     kind=str(request["utility"])
     if kind=="get_samples": get_samples(request)
@@ -336,4 +426,7 @@ def run_request(request_path: Path) -> None:
         from .diagnostics import diagnose_call
         diagnose_call(request)
     elif kind=="itol": make_itol(request)
+    elif kind=="checkm2":
+        if index>=0: checkm2_posthoc_task(request,index)
+        else: checkm2_posthoc_merge(request)
     else: raise SystemExit(f"Unknown CleanGene utility: {kind}")

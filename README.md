@@ -84,6 +84,36 @@ then load only their indexed isolate or group record plus run-level config, with
 minimal per-task input checks. This keeps submission fast for cohorts up to tens
 of thousands of isolates while keeping the controller at orchestration scale.
 
+## CheckM2 Workflows
+
+For a fast main pipeline that never runs CheckM2, DIAMOND, CheckM2 database
+discovery, or CheckM2 companion-environment checks, launch with:
+
+```bash
+cleangene run --manifest manifest.tsv --analysis-root . --ignore-checkm2
+```
+
+In this mode, Kraken2 taxonomy/contamination, read quality, coverage, assembly
+metrics, and Prokka/GFF success still determine pangenome admission. CheckM2
+completeness and CheckM2 contamination are intentionally not evaluated, remain
+blank in isolate QC, and do not turn an otherwise clean isolate into a warning.
+
+Full CheckM2-gated mode remains available with `CHECKM2_MODE=required`. In that
+mode, CleanGene submits a dedicated `cg-checkm2_db_setup` job using
+`CHECKM2_CPUS`, `CHECKM2_MEM`, and `CHECKM2_TIME`, then runs per-isolate
+CheckM2 prediction inside preprocess with `CHECKM2_PREDICT_CPUS`.
+
+To evaluate assemblies later without changing the already-built pangenome:
+
+```bash
+cleangene utils checkm2 --run-dir <run>
+```
+
+The post-hoc utility writes `results/utils/<analysis_id>/checkm2/checkm2_qc.tsv`
+and enriches `results/cohort/isolate_qc.tsv` with CheckM2 values plus
+`PASS/FAIL_with_checkm2` and `Notes_with_checkm2`. Original `PASS/FAIL`,
+`Notes`, `excluded`, `reason`, and Panaroo membership are preserved.
+
 ## Manifest
 
 A minimal paired-FASTQ manifest is tab separated:
@@ -290,8 +320,8 @@ the Slurm allocation. Set `CHECKM2_LOWMEM=true` explicitly on constrained-memory
 systems to add CheckM2's `--lowmem` option to setup smoke tests and per-isolate
 prediction; CleanGene does not silently retry in low-memory mode. A supplied
 `checkm2_report` remains reusable.
-`CHECKM2_MODE=off` is supported but produces a QC warning because completeness
-and contamination were not evaluated.
+`CHECKM2_MODE=off` is supported and records an informational QC note because
+completeness and CheckM2 contamination were intentionally not evaluated.
 
 The `cleangene-checkm2` environment is an internal companion environment managed
 by `scripts/install_or_update.sh`. Normal users should update from the checkout

@@ -9,7 +9,7 @@ from cleangene.cli import main, make_run
 from cleangene.defaults import DEFAULTS
 from cleangene.qc import prepare_qc_provenance, resolve_threshold_rows
 from cleangene.task_store import build_group_task_store, build_isolate_task_store, load_group_task
-from cleangene.util import atomic_json, read_tsv, write_tsv
+from cleangene.util import atomic_json, load_json, read_tsv, write_tsv
 from cleangene.workers import global_preflight, retained_rows, slurm_controller, validate_preflight_input_paths
 
 
@@ -148,6 +148,24 @@ class ScalingArchitectureTests(unittest.TestCase):
                  patch("cleangene.workers._controller_pipeline",side_effect=lambda *args: order.append("pipeline")):
                 slurm_controller(run)
             self.assertEqual(order,["preflight","checkm2_db_setup","resolve_groups","pipeline"])
+
+    def test_resume_ignore_checkm2_skips_stale_setup_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            from cleangene.cli import main
+            run=Path(d)/"runs"/"failed"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir(parents=True)
+            cfg={**DEFAULTS,"TAXONOMY_MODE":"off","CHECKM2_MODE":"required","SLURM_POLL_SECONDS":"0"}
+            atomic_json(run/"provenance"/"resolved_config.json",cfg)
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2"],[["i1","g","r1","r2"]])
+            write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["g","i1"]])
+            write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[["g",1,"small"]])
+            atomic_json(run/"state"/"checkm2_db_setup.done.json",{"status":"failed","reason":"old oom"})
+            with patch("cleangene.cli.slurm",return_value="123"), \
+                 patch("cleangene.cli.resolve_checkm2_executable",side_effect=AssertionError("CheckM2 resolved during ignored resume")), \
+                 contextlib.redirect_stdout(StringIO()):
+                self.assertEqual(main(["resume","--run-dir",str(run),"--ignore-checkm2"]),0)
+            resolved=load_json(run/"provenance"/"resolved_config.json")
+            self.assertEqual(resolved["CHECKM2_MODE"],"off")
+            self.assertEqual(resolved["CHECKM2_DISABLED_BY_USER"],"true")
 
 
 if __name__ == "__main__":

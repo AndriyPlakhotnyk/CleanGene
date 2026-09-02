@@ -91,6 +91,45 @@ class CleanGeneUtilsTests(unittest.TestCase):
             command=submit_job.call_args.args[0]; self.assertEqual(command[0],"sbatch"); self.assertIn("_utils_worker",command[-1])
             request=json.loads((run/"results"/"utils"/"query"/"request.json").read_text()); self.assertEqual(request["slurm_job_id"],"123")
 
+    def test_checkm2_utility_submits_setup_array_and_merge_resources(self):
+        with tempfile.TemporaryDirectory() as d, patch("cleangene.utils_cli.submit",side_effect=["setup","array","merge"]) as submit_job:
+            run=self.make_run(Path(d)); sample=run/"results"/"sample_data"/"i1"; assembly=sample/"assembly"/"contigs.fasta"; assembly.parent.mkdir(parents=True); assembly.write_text(">c\nACGT\n")
+            write_tsv(run/"results"/"cohort"/"isolate_qc.tsv",["isolate_id","group_id","assembly","PASS/FAIL","Notes","excluded","reason","top_species","contamination_pct","trimmed_read_length","mean_base_quality","sequencing_coverage","contigs","n50","gff","checkm2_completeness","checkm2_contamination"],[["i1","Species one",assembly,"PASS","All evaluated QC criteria passed","0","","","",150,35,40,80,75000,"gff","",""]])
+            cfg=dict(DEFAULTS); cfg.update({"CHECKM2_MODE":"off","CHECKM2_CPUS":"16","CHECKM2_MEM":"128G","CHECKM2_TIME":"24:00:00","CHECKM2_POSTHOC_CPUS":"1","CHECKM2_POSTHOC_MEM":"32G","CHECKM2_POSTHOC_TIME":"02:00:00","CHECKM2_POSTHOC_MAX_INFLIGHT":"8"})
+            atomic_json(run/"provenance"/"resolved_config.json",cfg)
+            with contextlib.redirect_stdout(StringIO()):
+                self.assertEqual(main(["utils","checkm2","--run-dir",str(run),"--analysis-name","posthoc","--samples","i1"]),0)
+            commands=[call.args[0] for call in submit_job.call_args_list]
+            self.assertIn("cg-checkm2_posthoc_setup",commands[0])
+            self.assertEqual(commands[0][commands[0].index("--cpus-per-task")+1],"16")
+            self.assertEqual(commands[0][commands[0].index("--mem")+1],"128G")
+            self.assertIn("cg-util-checkm2",commands[1])
+            self.assertEqual(commands[1][commands[1].index("--cpus-per-task")+1],"1")
+            self.assertEqual(commands[1][commands[1].index("--mem")+1],"32G")
+            self.assertIn("--dependency",commands[1])
+            self.assertIn("cg-util-checkm2-merge",commands[2])
+            request=json.loads((run/"results"/"utils"/"posthoc"/"checkm2"/"request.json").read_text())
+            self.assertEqual(request["setup_slurm_job_id"],"setup")
+            self.assertEqual(request["array_slurm_job_id"],"array")
+            self.assertEqual(request["merge_slurm_job_id"],"merge")
+
+    def test_checkm2_posthoc_merge_enriches_cohort_without_rewriting_original_qc(self):
+        from cleangene.downstream import checkm2_posthoc_merge
+        with tempfile.TemporaryDirectory() as d:
+            run=self.make_run(Path(d)); out=run/"results"/"utils"/"posthoc"/"checkm2"; out.mkdir(parents=True)
+            write_tsv(out/"tasks.tsv",["isolate_id","group_id","assembly"],[["i1","Species one","asm.fa"]])
+            iso=out/"isolates"/"i1"; iso.mkdir(parents=True)
+            write_tsv(iso/"checkm2_qc.tsv",["isolate_id","group_id","assembly","checkm2_completeness","checkm2_contamination","checkm2_status","checkm2_notes"],[["i1","Species one","asm.fa","74","1","FAIL","FAIL: completeness=74% is below fail minimum 80%"]])
+            cohort=run/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","assembly","PASS/FAIL","Notes","excluded","reason","top_species","contamination_pct","trimmed_read_length","mean_base_quality","sequencing_coverage","contigs","n50","gff","checkm2_completeness","checkm2_contamination"],[["i1","Species one","asm.fa","PASS","All evaluated QC criteria passed","0","","","",150,35,40,80,75000,"i1.gff","",""]])
+            checkm2_posthoc_merge({"run_dir":str(run),"output_dir":str(out)})
+            row=read_tsv(cohort/"isolate_qc.tsv")[0]
+            self.assertEqual(row["PASS/FAIL"],"PASS")
+            self.assertEqual(row["excluded"],"0")
+            self.assertEqual(row["checkm2_completeness"],"74")
+            self.assertEqual(row["checkm2_posthoc_status"],"FAIL")
+            self.assertEqual(row["PASS/FAIL_with_checkm2"],"FAIL")
+            self.assertIn("Panaroo membership was not changed",(out/"summary.txt").read_text())
+
     def test_diagnostic_cli_submits_with_dedicated_resources(self):
         with tempfile.TemporaryDirectory() as d, patch("cleangene.utils_cli.submit",return_value="456") as submit_job:
             run=self.make_run(Path(d))

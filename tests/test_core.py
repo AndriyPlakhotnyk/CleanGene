@@ -116,7 +116,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run_dir,0)
             self.assertEqual(sum(command[0]=="spades.py" for command in commands),1); self.assertFalse(any(command[0]=="shovill" for command in commands))
             spades=next(command for command in commands if command[0]=="spades.py"); self.assertIn("--only-assembler",spades); self.assertTrue(Path(spades[spades.index("-1")+1]).is_symlink()); self.assertTrue(Path(spades[spades.index("-2")+1]).is_symlink())
-            qc=read_tsv(run_dir/"results"/"sample_data"/"iso1"/"qc.tsv")[0]; self.assertEqual(Path(qc["assembly"]).name,"contigs.fasta"); self.assertIn("+symlinked",qc["read_preprocessing"])
+            qc=read_tsv(run_dir/"results"/"sample_data"/"iso1"/"qc.tsv")[0]; self.assertEqual(Path(qc["assembly"]).name,"contigs.fasta"); self.assertIn("+symlinked",qc["read_preprocessing"]); self.assertEqual(qc["PASS/FAIL"],"PASS"); self.assertIn("INFO: CheckM2 was not evaluated",qc["Notes"]); self.assertEqual(qc["checkm2_completeness"],""); self.assertEqual(qc["checkm2_contamination"],"")
             for field in ("PASS/FAIL","Notes","trimmed_read_length","mean_base_quality","sequencing_coverage","checkm2_completeness","checkm2_contamination","qc_profile_source"): self.assertIn(field,qc)
 
     def test_exclude_filters_an_already_preprocessed_isolate(self):

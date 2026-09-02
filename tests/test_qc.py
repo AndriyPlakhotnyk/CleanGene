@@ -57,9 +57,9 @@ class IsolateQCTests(unittest.TestCase):
         self.assertEqual(self.classify(top_species="Klebsiella pneumoniae")["PASS/FAIL"],"FAIL")
         self.assertEqual(self.classify(expected_organism="",top_species="")["PASS/FAIL"],"PASS")
 
-    def test_checkm2_off_is_an_explicit_warning(self):
+    def test_checkm2_off_is_informational_not_a_warning(self):
         result=self.classify(checkm2_mode="off",completeness=None,checkm2_contamination=None)
-        self.assertEqual(result["PASS/FAIL"],"WARNING"); self.assertIn("CHECKM2_MODE=off",result["Notes"])
+        self.assertEqual(result["PASS/FAIL"],"PASS"); self.assertIn("INFO: CheckM2 was not evaluated",result["Notes"])
 
     def test_internal_missing_assembly_or_gff_fails(self):
         self.assertEqual(self.classify(assembly_present=False,gff_present=None)["PASS/FAIL"],"FAIL")

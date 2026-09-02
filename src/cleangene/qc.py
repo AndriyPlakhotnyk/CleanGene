@@ -190,10 +190,12 @@ def classify_isolate_qc(*, thresholds: dict[str,float | None], expected_organism
                         checkm2_mode: str, internal_pangenome: bool, external_pangenome: bool,
                         assembly_present: bool, gff_present: bool | None, user_exclusion: bool = False,
                         warnings: Iterable[tuple[str,str]] = (), errors: Iterable[tuple[str,str]] = ()) -> dict[str,str]:
-    notes=[]; codes=[]
+    notes=[]; info_notes=[]; codes=[]
     def add(level: str,code: str,message: str) -> None:
         notes.append((level,message))
         if level=="FAIL": codes.append(code)
+    def info(message: str) -> None:
+        info_notes.append(message)
     if user_exclusion:
         add("FAIL","user_excluded","isolate was explicitly excluded by the user")
         return {"PASS/FAIL":"FAIL","Notes":"FAIL: isolate was explicitly excluded by the user","excluded":"1","reason":"user_excluded"}
@@ -221,7 +223,7 @@ def classify_isolate_qc(*, thresholds: dict[str,float | None], expected_organism
     minimum(coverage,"qc_min_coverage_pass","qc_min_coverage_fail","coverage","x","sequencing coverage was unavailable")
     maximum(contigs,"qc_max_contigs_pass","qc_max_contigs_fail","contigs")
     minimum(n50,"qc_min_n50_pass","qc_min_n50_fail","N50"," bp")
-    if checkm2_mode=="off": add("WARNING","checkm2_off","CheckM2 completeness and contamination were not evaluated because CHECKM2_MODE=off")
+    if checkm2_mode=="off": info("CheckM2 was not evaluated because it was explicitly disabled")
     else:
         minimum(completeness,"qc_min_completeness_pass","qc_min_completeness_fail","completeness","%","CheckM2 completeness was unavailable")
         maximum(checkm2_contamination,"qc_max_checkm2_contamination_pass","qc_max_checkm2_contamination_fail","checkm2_contamination","%")
@@ -235,7 +237,9 @@ def classify_isolate_qc(*, thresholds: dict[str,float | None], expected_organism
         if not assembly_present: add("FAIL","assembly_missing","assembly was not produced for the internal pangenome")
         elif gff_present is False: add("FAIL","gff_missing","Prokka GFF was not produced for the internal pangenome")
     level="FAIL" if any(item[0]=="FAIL" for item in notes) else "WARNING" if notes else "PASS"
-    rendered="; ".join(f"{severity}: {message}" for severity,message in notes) if notes else "All evaluated QC criteria passed"
+    rendered_notes=[f"{severity}: {message}" for severity,message in notes]
+    rendered_notes.extend(f"INFO: {message}" for message in info_notes)
+    rendered="; ".join(rendered_notes) if rendered_notes else "All evaluated QC criteria passed"
     return {"PASS/FAIL":level,"Notes":rendered,"excluded":"1" if level=="FAIL" else "0","reason":";".join(codes)}
 
 def qc_value(value: float | int | None) -> str:

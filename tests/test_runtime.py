@@ -107,6 +107,31 @@ class RuntimeResolutionTests(unittest.TestCase):
                     self.assertEqual(main(["run", "--manifest", str(manifest), "--analysis-root", str(root), "--run-id", "r", "--dry-run"]),0)
             submit.assert_called_once()
 
+    def test_ignore_checkm2_overrides_config_and_skips_resolution(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); manifest=root/"manifest.tsv"; manifest.write_text("isolate_id\tgroup_id\tR1\tR2\ni1\tg\t/r1.fastq.gz\t/r2.fastq.gz\n")
+            cfg=root/"cfg.env"; cfg.write_text("CHECKM2_MODE=required\nTAXONOMY_MODE=off\n")
+            with patch("cleangene.cli.resolve_checkm2_executable",side_effect=AssertionError("CheckM2 resolved")), \
+                 patch("cleangene.cli.executable_version",side_effect=AssertionError("checkm2 --version ran")), \
+                 patch("cleangene.cli.slurm",return_value="123"), \
+                 contextlib.redirect_stdout(StringIO()):
+                self.assertEqual(main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","off","--config",str(cfg),"--ignore-checkm2"]),0)
+            resolved=__import__("cleangene.util",fromlist=["load_json"]).load_json(root/"runs"/"off"/"provenance"/"resolved_config.json")
+            self.assertEqual(resolved["CHECKM2_MODE"],"off")
+            self.assertEqual(resolved["CHECKM2_DISABLED_BY_USER"],"true")
+
+    def test_doctor_ignore_checkm2_does_not_probe_companion_environment(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); cfg=root/"cfg.env"; cfg.write_text("CHECKM2_MODE=required\nTAXONOMY_MODE=off\n")
+            output=StringIO(); environment={**os.environ,"CONDA_DEFAULT_ENV":"cleangene","CONDA_PREFIX":str(root/"envs"/"cleangene")}
+            with patch.dict(os.environ,environment,clear=True), \
+                 patch("cleangene.cli.sys.executable",str(root/"envs"/"cleangene"/"bin"/"python")), \
+                 patch("cleangene.cli.command_exists",return_value=True), \
+                 patch("cleangene.cli.resolve_checkm2_executable",side_effect=AssertionError("CheckM2 resolved")), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(main(["doctor","--config",str(cfg),"--ignore-checkm2"]),0)
+            self.assertIn("CheckM2: DISABLED by user",output.getvalue())
+
     def test_doctor_reports_automatic_missing_checkm2_database(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

@@ -169,6 +169,43 @@ class CompletionReconciliationTests(unittest.TestCase):
             self.assertEqual(counts["active"], 1)
             self.assertFalse((run / "state" / "preprocess" / "BI_0000.done.json").exists())
 
+    def test_active_complete_preprocess_output_is_recovered(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, rows = self.make_run(Path(d))
+            self.write_qc(run, "BI_0000")
+            snapshot = {"entries": [{"name": "cg-preprocess", "command": f"python -m cleangene _worker --run-dir {run}", "task_id": "0"}]}
+            counts = reconcile_preprocess_outputs(run, DEFAULTS, rows, snapshot)
+            self.assertEqual(counts["output_recovered"], 1)
+            self.assertTrue((run / "state" / "preprocess" / "BI_0000.done.json").is_file())
+            report=read_tsv(run / "state" / "preprocess_reconciliation.tsv")[0]
+            self.assertEqual(report["state"], "output_recovered")
+            self.assertIn("active_output_recovered", report["reason"])
+
+    def test_scheduler_cancels_active_batch_after_all_outputs_recovered(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, rows = self.make_run(Path(d))
+            self.write_qc(run, "BI_0000")
+            scheduler = _RollingScheduler(run, DEFAULTS)
+            scheduler.active["123"] = _ActiveBatch("123", "preprocess", [0], "0", seen=True)
+            snapshot = {"total": 1, "jobs": {"123": {"RUNNING": 1}}, "entries": [{"job_id":"123","name": "cg-preprocess", "command": f"python -m cleangene _worker --run-dir {run}", "task_id": "0"}]}
+            with patch("cleangene.workers.user_queue_snapshot", return_value=snapshot), patch("cleangene.workers.cancel_jobs") as cancel:
+                scheduler.refresh()
+            cancel.assert_called_once_with(["123"])
+            self.assertNotIn("123", scheduler.active)
+            self.assertTrue(scheduler.is_done("preprocess", 0))
+
+    def test_scheduler_does_not_readopt_already_recovered_live_preprocess_task(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, _ = self.make_run(Path(d))
+            atomic_json(run / "state" / "preprocess" / "BI_0000.done.json", {"status": "complete"})
+            scheduler = _RollingScheduler(run, DEFAULTS)
+            scheduler.seed_done("preprocess", [0])
+            snapshot = {"total": 1, "jobs": {"123": {"RUNNING": 1}}, "entries": [{"job_id":"123","name": "cg-preprocess", "command": f"python -m cleangene _worker --run-dir {run}", "task_id": "0"}]}
+            with patch("cleangene.workers.user_queue_snapshot", return_value=snapshot):
+                scheduler.refresh()
+            self.assertNotIn("123", scheduler.active)
+            self.assertEqual(scheduler.active_indices("preprocess"), set())
+
     def test_acceptance_1000_recovers_900_and_leaves_100_incomplete(self):
         with tempfile.TemporaryDirectory() as d:
             run, rows = self.make_run(Path(d), n=1000)

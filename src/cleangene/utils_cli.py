@@ -1,11 +1,11 @@
 from __future__ import annotations
-import argparse, json, sys
+import argparse, json, sys, shlex
 from datetime import datetime
 from pathlib import Path
 from .defaults import DEFAULTS
 from .downstream import read_ids, read_manifest_rows, resolve_organism, validate_matrix_selection
 from .slurm import sbatch_cmd, submit
-from .util import atomic_json, read_tsv, safe_name
+from .util import atomic_json, read_tsv, safe_name, write_tsv
 from .ux import completed, submitted, spinner
 
 def _run_args(parser: argparse.ArgumentParser) -> None:
@@ -23,6 +23,7 @@ def add_utils_parser(sub) -> None:
     variants=utilities.add_parser("get-variants",aliases=["get_variants"]); _run_args(variants); _organism_args(variants); variants.add_argument("--genes",nargs="+"); variants.add_argument("--operon",type=Path); variants.add_argument("--min-similarity",type=float,default=95.0); variants.add_argument("--flanking-genes",type=int,default=0); variants.add_argument("--analyze-flanks",action="store_true")
     diagnostic=utilities.add_parser("diagnose-call",aliases=["diagnose_call"]); _run_args(diagnostic); _organism_args(diagnostic); diagnostic.add_argument("--genes",nargs="+",required=True); diagnostic.add_argument("--max-samples",type=int,default=20); diagnostic.add_argument("--skip-assembly-replay",action="store_true")
     itol=utilities.add_parser("itol",aliases=["get_itol"]); _run_args(itol); _organism_args(itol); itol.add_argument("--genes",nargs="*",default=[]); itol.add_argument("--operon",type=Path); itol.add_argument("--variants",type=Path); itol.add_argument("--color-scheme",choices=("classic","muted","custom"),default="classic"); itol.add_argument("--custom-colors",type=Path)
+    checkm2=utilities.add_parser("checkm2",aliases=["checkm2-posthoc","checkm2_posthoc"]); _run_args(checkm2); _organism_args(checkm2); checkm2.add_argument("--force",action="store_true")
     root.set_defaults(func=utils_command)
 
 def locate_run(args) -> Path:
@@ -117,6 +118,14 @@ def _request(args, run: Path) -> dict[str,object]:
         organism=resolve_organism(run,args.organism,samples); validate_matrix_selection(run,organism,args.genes,samples)
         if args.max_samples<1: raise SystemExit("--max-samples must be at least 1")
         return {"utility":kind,"organism":organism,"genes":args.genes,"samples":samples,"max_samples":args.max_samples,"replay_assembly":not args.skip_assembly_replay}
+    if kind=="checkm2":
+        manifest=read_tsv(run/"provenance"/"manifest.tsv"); selected=samples
+        if args.organism:
+            selected.extend(r["isolate_id"] for r in manifest if r.get("group_id")==args.organism or r.get("organism")==args.organism)
+        selected=list(dict.fromkeys(selected)) if selected else [r["isolate_id"] for r in manifest]
+        known={r["isolate_id"] for r in manifest}; missing=[sample for sample in selected if sample not in known]
+        if missing: raise SystemExit("Sample IDs not found in run: " + ", ".join(missing[:20]))
+        return {"utility":"checkm2","samples":selected,"organism":args.organism or "","force":bool(args.force)}
     if not args.genes and not args.operon and not args.variants: raise SystemExit("itol requires --genes, --operon, and/or --variants")
     inferred_organisms=set(); inferred_samples=[]
     for path,filename in ((args.operon,"operon_calls.tsv"),(args.variants,"gene_variants.tsv")):
@@ -136,10 +145,35 @@ def utils_command(args) -> int:
     run=locate_run(args); print(f"Located run: {run}")
     with spinner("Getting ready to submit"):
         request=_request(args,run); cfg={**DEFAULTS,**json.loads((run/"provenance"/"resolved_config.json").read_text())}; stamp=datetime.now().strftime("%y%m%d_%H%M%S"); analysis_id=safe_name(args.analysis_name or f"{stamp}_{request['utility']}"); out=run/"results"/"utils"/analysis_id; logs=run/"logs"/"slurm"/"utils"; out.mkdir(parents=True,exist_ok=False); logs.mkdir(parents=True,exist_ok=True)
+        if request["utility"]=="checkm2":
+            checkm2_out=out/"checkm2"; checkm2_out.mkdir(parents=True,exist_ok=True)
+            tasks=[]
+            manifest_by_iso={r["isolate_id"]:r for r in read_tsv(run/"provenance"/"manifest.tsv")}
+            cohort=read_tsv(run/"results"/"cohort"/"isolate_qc.tsv") if (run/"results"/"cohort"/"isolate_qc.tsv").is_file() else []
+            cohort_by_iso={r["isolate_id"]:r for r in cohort}
+            for iso in request["samples"]:
+                row=cohort_by_iso.get(iso,{})
+                assembly=row.get("assembly","") or str(run/"results"/"sample_data"/safe_name(iso)/"assembly"/"contigs.fasta")
+                tasks.append({"isolate_id":iso,"group_id":manifest_by_iso.get(iso,{}).get("group_id",""),"assembly":assembly})
+            write_tsv(checkm2_out/"tasks.tsv",["isolate_id","group_id","assembly"],tasks)
+            request.update({"run_dir":str(run),"output_dir":str(checkm2_out),"analysis_id":analysis_id,"submitted":datetime.now().isoformat(),"task_count":len(tasks)})
+            request_path=checkm2_out/"request.json"; atomic_json(request_path,request)
+            setup_wrap=f"{shlex.quote(sys.executable)} -m cleangene _worker --stage checkm2_posthoc_setup --run-dir {shlex.quote(str(run))} --index 0"
+            setup_cmd=sbatch_cmd(name="cg-checkm2_posthoc_setup",wrap=setup_wrap,cpus=cfg["CHECKM2_CPUS"],mem=cfg["CHECKM2_MEM"],time=cfg["CHECKM2_TIME"],account=cfg.get("SLURM_ACCOUNT",""),partition=cfg.get("SLURM_PARTITION",""),log=logs/f"{analysis_id}.setup.%j.log")
+            setup_job=submit(setup_cmd,args.dry_run)
+            array=f"0-{len(tasks)-1}%{cfg['CHECKM2_POSTHOC_MAX_INFLIGHT']}" if tasks else None
+            task_wrap=f"{shlex.quote(sys.executable)} -m cleangene _utils_worker --request {shlex.quote(str(request_path))} --index $SLURM_ARRAY_TASK_ID"
+            task_cmd=sbatch_cmd(name="cg-util-checkm2",wrap=task_wrap,cpus=cfg["CHECKM2_POSTHOC_CPUS"],mem=cfg["CHECKM2_POSTHOC_MEM"],time=cfg["CHECKM2_POSTHOC_TIME"],array=array,dependency=setup_job,account=cfg.get("SLURM_ACCOUNT",""),partition=cfg.get("SLURM_PARTITION",""),log=logs/f"{analysis_id}.%A_%a.log")
+            array_job=submit(task_cmd,args.dry_run)
+            merge_wrap=f"{shlex.quote(sys.executable)} -m cleangene _utils_worker --request {shlex.quote(str(request_path))} --index -1"
+            merge_cmd=sbatch_cmd(name="cg-util-checkm2-merge",wrap=merge_wrap,cpus=cfg.get("UTILS_CPUS","8"),mem=cfg.get("UTILS_MEM","32G"),time=cfg.get("UTILS_TIME","12:00:00"),dependency=array_job,account=cfg.get("SLURM_ACCOUNT",""),partition=cfg.get("SLURM_PARTITION",""),log=logs/f"{analysis_id}.merge.%j.log")
+            merge_job=submit(merge_cmd,args.dry_run)
+            request.update({"setup_slurm_job_id":setup_job,"array_slurm_job_id":array_job,"merge_slurm_job_id":merge_job}); atomic_json(request_path,request)
+            print(submitted(f"CheckM2 post-hoc analysis submitted. Report will be in {checkm2_out/'checkm2_qc.tsv'}"))
+            return 0
         resource="DIAGNOSTIC" if request["utility"]=="diagnose_call" else "VARIANT" if request["utility"]=="get_variants" else ""
         cpus=cfg.get(f"UTILS_{resource}_CPUS" if resource else "UTILS_CPUS","8"); mem=cfg.get(f"UTILS_{resource}_MEM" if resource else "UTILS_MEM","32G"); limit=cfg.get(f"UTILS_{resource}_TIME" if resource else "UTILS_TIME","12:00:00")
         request.update({"run_dir":str(run),"output_dir":str(out),"analysis_id":analysis_id,"submitted":datetime.now().isoformat(),"cpus":int(cpus),"min_mapq":int(cfg.get("READ_VALIDATION_MIN_MAPQ","20")),"min_depth":float(cfg.get("READ_VALIDATION_MIN_MEAN_DEPTH","5")),"basequal":int(cfg.get("BASEQUAL","30"))}); request_path=out/"request.json"; atomic_json(request_path,request)
-        import shlex
         wrap=f"{shlex.quote(sys.executable)} -m cleangene _utils_worker --request {shlex.quote(str(request_path))}"
         command=sbatch_cmd(name=f"cg-util-{safe_name(str(request['utility']))[:20]}",wrap=wrap,cpus=cpus,mem=mem,time=limit,account=cfg.get("SLURM_ACCOUNT",""),partition=cfg.get("SLURM_PARTITION",""),log=logs/f"{analysis_id}.%j.log")
         job_id=submit(command,args.dry_run); request["slurm_job_id"]=job_id; atomic_json(request_path,request)

@@ -220,6 +220,11 @@ def reconcile_preprocess_outputs(
             marker_ok = marker_payload is not None
         if marker.is_file() and marker_ok and result.state == "complete":
             state = "marker_complete"; reason = "existing_marker"; counts["marker_complete"] += 1
+        elif index in active and result.state == "complete" and apply and truthy(cfg.get("PREPROCESS_RECOVER_ACTIVE_COMPLETE_OUTPUTS", "true")):
+            if marker.is_file() and not marker_ok:
+                _quarantine_marker(marker, marker_error)
+            touch_done(marker, result.marker_payload or {})
+            state = "output_recovered"; reason = "active_output_recovered;" + result.reason; counts["output_recovered"] += 1
         elif index in active:
             state = "active"; reason = "live_preprocess_task"; counts["active"] += 1
         else:
