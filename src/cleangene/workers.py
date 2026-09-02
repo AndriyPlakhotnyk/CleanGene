@@ -587,9 +587,37 @@ def _replace_symlink(link: Path, target: Path) -> None:
 def _acquire_preprocess_lock(run_dir: Path, isolate: str):
     lock_path=run_dir/"state"/"preprocess"/"locks"/f"{safe_name(isolate)}.lock"
     lock_path.parent.mkdir(parents=True,exist_ok=True)
-    handle=lock_path.open("w")
-    fcntl.flock(handle,fcntl.LOCK_EX)
-    handle.write(f"pid={os.getpid()} isolate_id={isolate}\n"); handle.flush()
+
+    # Never truncate another worker's lock metadata before acquiring it.
+    handle=lock_path.open("a+")
+
+    deadline=time.monotonic()+60.0
+    while True:
+        try:
+            fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.seek(0)
+                holder=handle.read().strip() or "<holder metadata unavailable>"
+                handle.close()
+                raise SystemExit(
+                    f"Timed out waiting for preprocess lock for isolate {isolate}: "
+                    f"{lock_path}; current holder: {holder}"
+                )
+            time.sleep(1)
+
+    handle.seek(0)
+    handle.truncate()
+    handle.write(
+        f"pid={os.getpid()} "
+        f"isolate_id={isolate} "
+        f"job_id={os.environ.get('SLURM_JOB_ID','unknown')} "
+        f"array_job_id={os.environ.get('SLURM_ARRAY_JOB_ID','unknown')} "
+        f"array_task_id={os.environ.get('SLURM_ARRAY_TASK_ID','unknown')} "
+        f"host={os.uname().nodename}\n"
+    )
+    handle.flush()
     return handle
 
 def _release_preprocess_lock(handle) -> None:
