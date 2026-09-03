@@ -9,11 +9,11 @@ from .config import assembler_mode, checkm2_mode, truthy
 from .checkm2 import CheckM2DbError, CheckM2DbNotReady, bundled_test_genome, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, checkm2_runtime_is_verified, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
 from .completion import find_isolate_qc_candidates, reconcile_preprocess_outputs, validate_preprocess_completion
 from .defaults import DEFAULTS
-from .evidence import validate_isolate, validation_decision_logic_rows
-from .fasta import assembly_metrics
+from .evidence import METRIC_FIELDS, classify_gene_evidence, targeted_local_reconstruction, validate_isolate, validation_decision_logic_rows
+from .fasta import assembly_metrics, read_fasta
 from .kraken import Kraken2DbError, Kraken2DbNotReady, managed_kraken2_db_path, resolve_kraken2_db, validate_kraken2_db
 from .manifest import groups, write_resolved
-from .pangenome import normalize_panaroo, recover_sequences, select_rows, write_binary
+from .pangenome import cluster_locus_rows, gff_cds_loci, normalize_panaroo, recover_sequences, select_rows, write_binary
 from .plotting import plot_presence_absence
 from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, ensure_qc_provenance, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, cancel_jobs, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
@@ -31,12 +31,13 @@ STAGE_DESCRIPTIONS = (
     ("panaroo", "build and clean each group pangenome with Panaroo"),
     ("prepare_validation", "select genes and recover pangenome reference sequences"),
     ("validate", "map isolate reads with BWA and measure gene coverage, depth, and identity"),
+    ("arbitrate", "resolve only discordant read and locus evidence"),
     ("reduce", "apply read evidence and publish the final cleaned pangenome matrix"),
     ("plot", "render each group presence/absence summary"),
     ("summary", "compile cohort and group QC tables"),
 )
 
-ARRAY_STAGES = {"preprocess","panaroo","prepare_validation","validate","reduce","plot"}
+ARRAY_STAGES = {"preprocess","panaroo","prepare_validation","validate","arbitrate","reduce","plot"}
 
 def _controller_log(message: str, *, ok: bool = False) -> None:
     color=completed if ok else waiting
@@ -1209,7 +1210,7 @@ def orchestrate_downstream(run_dir: Path, index: int | None = None) -> None:
 
 def _stage_log_pattern(run_dir: Path, stage: str) -> Path:
     base=run_dir/"logs"/"slurm"
-    return base/(stage if stage in {"preprocess","validate"} else "")/f"{stage}.%A_%a.log"
+    return base/(stage if stage in {"preprocess","validate","arbitrate"} else "")/f"{stage}.%A_%a.log"
 
 def _controller_cmd(run_dir: Path, cfg: dict[str,str], stage: str, array: str | None, cpus: str, mem: str, time_limit: str) -> list[str]:
     exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
@@ -1246,6 +1247,10 @@ def incomplete_validate_indices(run_dir: Path) -> list[int]:
     rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
     return [i for i,r in enumerate(rows) if not _successful_marker(run_dir/"state"/"validate"/f"{safe_name(r['isolate_id'])}.done.json")]
 
+def incomplete_arbitrate_indices(run_dir: Path) -> list[int]:
+    rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
+    return [i for i,r in enumerate(rows) if not _successful_marker(run_dir/"state"/"arbitrate"/f"{safe_name(r['isolate_id'])}.done.json")]
+
 def _float_or_none(value: str | None) -> float | None:
     try:
         return float(value) if value not in {"", "NA", None} else None
@@ -1264,6 +1269,7 @@ def _invalidate_group_after_panaroo_failure(run_dir: Path, group: str) -> None:
         for row in read_tsv(tasks):
             if row.get("group_id")==group:
                 _remove_done(run_dir/"state"/"validate"/f"{safe_name(row['isolate_id'])}.done.json")
+                _remove_done(run_dir/"state"/"arbitrate"/f"{safe_name(row['isolate_id'])}.done.json")
     _remove_done(run_dir/"state"/"summary.done.json")
     _remove_done(run_dir/"state"/"orchestrate_downstream.done.json")
 
@@ -1288,6 +1294,7 @@ def invalidate_failed_panaroo_downstream(run_dir: Path) -> int:
         for row in read_tsv(isolate_tasks):
             if row.get("group_id") in failed_set:
                 _remove_done(run_dir/"state"/"validate"/f"{safe_name(row['isolate_id'])}.done.json")
+                _remove_done(run_dir/"state"/"arbitrate"/f"{safe_name(row['isolate_id'])}.done.json")
     if failed:
         _remove_done(run_dir/"state"/"summary.done.json")
         _remove_done(run_dir/"state"/"orchestrate_downstream.done.json")
@@ -1303,7 +1310,7 @@ def invalidate_legacy_identity_metrics(run_dir: Path, cfg: dict[str,str]) -> int
                 rows=list(csv.DictReader(handle,delimiter="\t"))
         except OSError:
             continue
-        stale=False
+        stale=bool(rows) and not {"evidence_state","sequence_resolution","normalized_depth","unique_mapped_reads","ambiguous_mapped_reads","arbitration_status"}.issubset(rows[0])
         for row in rows:
             mapped=_float_or_none(row.get("mapped_reads")) or 0
             breadth=_float_or_none(row.get("breadth")) or 0
@@ -1319,6 +1326,7 @@ def invalidate_legacy_identity_metrics(run_dir: Path, cfg: dict[str,str]) -> int
         if not backup.is_file(): shutil.copy2(metrics,backup)
         group_safe=metrics.parents[3].name; iso_safe=metrics.parent.name
         _remove_done(run_dir/"state"/"validate"/f"{iso_safe}.done.json")
+        _remove_done(run_dir/"state"/"arbitrate"/f"{iso_safe}.done.json")
         _remove_done(run_dir/"state"/"reduce"/f"{group_safe}.done.json")
         _remove_done(run_dir/"state"/"plot"/f"{group_safe}.done.json")
         _remove_done(run_dir/"state"/"summary.done.json")
@@ -1402,7 +1410,7 @@ def _run_database_setup_stages(run_dir: Path, cfg: dict[str,str], rows: list[dic
     return cfg
 
 def _index_done(run_dir: Path, stage: str, index: int) -> bool:
-    kind="isolate" if stage in {"preprocess","validate"} else "group"
+    kind="isolate" if stage in {"preprocess","validate","arbitrate"} else "group"
     row=task_row(run_dir,kind,index); name=row["isolate_id"] if kind=="isolate" else row["group_id"]
     marker={"validate":"validate"}.get(stage,stage)
     done_path=run_dir/"state"/marker/f"{safe_name(name)}.done.json"; done=_successful_marker(done_path)
@@ -1411,7 +1419,7 @@ def _index_done(run_dir: Path, stage: str, index: int) -> bool:
     return done
 
 def _index_failed(run_dir: Path, stage: str, index: int) -> bool:
-    kind="isolate" if stage in {"preprocess","validate"} else "group"
+    kind="isolate" if stage in {"preprocess","validate","arbitrate"} else "group"
     row=task_row(run_dir,kind,index); name=row["isolate_id"] if kind=="isolate" else row["group_id"]
     path=run_dir/"state"/stage/f"{safe_name(name)}.done.json"
     if not path.is_file(): return False
@@ -1569,6 +1577,7 @@ class _RollingScheduler:
 def _stage_limit(cfg: dict[str,str],stage: str) -> int:
     if stage=="preprocess": return int(cfg["SLURM_PREPROCESS_MAX_INFLIGHT"])
     if stage=="validate": return int(cfg["SLURM_VALIDATION_MAX_INFLIGHT"])
+    if stage=="arbitrate": return int(cfg["SLURM_ARBITRATION_MAX_INFLIGHT"])
     return int(cfg["SLURM_GROUP_MAX_INFLIGHT"])
 
 def _run_index_stage(run_dir: Path, cfg: dict[str,str], stage: str, indices: list[int], cpus: str, mem: str, time_limit: str, label: str) -> list[str]:
@@ -1590,7 +1599,7 @@ def _controller_pipeline(run_dir: Path,include_preprocess: bool) -> None:
     rank={r["group_id"]:i for i,r in enumerate(group_rows)}; prep_order=sorted(range(len(isolate_rows)),key=lambda i:(rank.get(isolate_rows[i]["group_id"],len(rank)),i))
     all_prep=list(range(len(isolate_rows))); all_groups=list(range(len(group_rows))); all_validate=list(range(len(isolate_rows)))
     if hasattr(scheduler,"seed_done"):
-        for stage,indices in (("preprocess",all_prep),("panaroo",all_groups),("prepare_validation",all_groups),("validate",all_validate),("reduce",all_groups),("plot",all_groups)):
+        for stage,indices in (("preprocess",all_prep),("panaroo",all_groups),("prepare_validation",all_groups),("validate",all_validate),("arbitrate",all_validate),("reduce",all_groups),("plot",all_groups)):
             scheduler.seed_done(stage,indices)
     while True:
         scheduler.refresh()
@@ -1609,7 +1618,9 @@ def _controller_pipeline(run_dir: Path,include_preprocess: bool) -> None:
                 cpus,mem,limit=_group_resources(cfg,group_rows[ready[0]]); scheduler.submit_ready("prepare_validation",ready,cpus,mem,limit,"CleanGene prepare_validation",_stage_limit(cfg,"prepare_validation"))
         validation_ready=[i for i,row in enumerate(isolate_rows) if done("prepare_validation",group_index[row["group_id"]])]
         scheduler.submit_ready("validate",validation_ready,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],"CleanGene validate",_stage_limit(cfg,"validate"))
-        reduce_ready=[gi for gi,row in enumerate(group_rows) if done("prepare_validation",gi) and all(done("validate",i) for i in members[row["group_id"]])]
+        arbitration_ready=[i for i in all_validate if done("validate",i)]
+        scheduler.submit_ready("arbitrate",arbitration_ready,cfg["ARBITRATION_CPUS"],cfg["ARBITRATION_MEM"],cfg["ARBITRATION_TIME"],"CleanGene arbitrate",_stage_limit(cfg,"arbitrate"))
+        reduce_ready=[gi for gi,row in enumerate(group_rows) if done("prepare_validation",gi) and all(done("arbitrate",i) for i in members[row["group_id"]])]
         scheduler.submit_ready("reduce",reduce_ready,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene reduce",_stage_limit(cfg,"reduce"))
         plot_ready=[i for i in all_groups if done("reduce",i)]
         scheduler.submit_ready("plot",plot_ready,cfg["PLOT_CPUS"],cfg["PLOT_MEM"],cfg["PLOT_TIME"],"CleanGene plot",_stage_limit(cfg,"plot"))
@@ -1632,6 +1643,8 @@ def controller_downstream(run_dir: Path) -> None:
                 cpus,mem,limit=_group_resources(cfg,group_rows[indices[0]]); _run_index_stage(run_dir,cfg,stage,indices,cpus,mem,limit,f"CleanGene {stage}")
     val_indices=incomplete_validate_indices(run_dir)
     if val_indices: _run_index_stage(run_dir,cfg,"validate",val_indices,cfg["VALIDATION_CPUS"],cfg["VALIDATION_MEM"],cfg["VALIDATION_TIME"],"CleanGene validate")
+    arbitration_indices=incomplete_arbitrate_indices(run_dir)
+    if arbitration_indices: _run_index_stage(run_dir,cfg,"arbitrate",arbitration_indices,cfg["ARBITRATION_CPUS"],cfg["ARBITRATION_MEM"],cfg["ARBITRATION_TIME"],"CleanGene arbitrate")
     for stage,cpus,mem,limit in (("reduce",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"]),("plot",cfg["PLOT_CPUS"],cfg["PLOT_MEM"],cfg["PLOT_TIME"])):
         indices=incomplete_indices(run_dir,stage)
         if indices: _run_index_stage(run_dir,cfg,stage,indices,cpus,mem,limit,f"CleanGene {stage}")
@@ -1764,8 +1777,15 @@ def prepare_validation(run_dir: Path, index: int) -> None:
         for r in csv.DictReader(h,delimiter="\t"): rows.append({"Gene":r["Gene"],**{i:int(r[i]) for i in isolates}})
     selected=select_rows(rows,isolates,cfg["VALIDATION_SCOPE"],float(cfg["ACCESSORY_PREVALENCE_CUTOFF"])); out=root/"03_read_validation"; out.mkdir(parents=True,exist_ok=True)
     records,sources=recover_sequences(selected,panaroo_dir); from .fasta import write_fasta; write_fasta(out/"tested_gene_references.fasta",records); write_tsv(out/"tested_gene_key.tsv",["reference_id","Gene","sequence_source","source_locus","length"],sources)
+    assignments=cluster_locus_rows(selected,panaroo_dir,isolates); qc={r["isolate_id"]:r for r in retained}; locus_rows=[]; locus_cache={iso:gff_cds_loci(Path(row["gff"]),Path(row["assembly"])) for iso,row in qc.items() if row.get("gff") and row.get("assembly")}
+    for assignment in assignments:
+        loci=locus_cache.get(assignment["isolate_id"],{})
+        if assignment["locus_tag"] in loci: locus_rows.append({**assignment,**loci[assignment["locus_tag"]]})
+    write_tsv(out/"cluster_isolate_loci.tsv",["Gene","isolate_id","locus_tag","assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus"],locus_rows)
     write_tsv(out/"selected_genes.tsv",["Gene"],([r["Gene"]] for r in selected))
-    if records: run(["bwa","index",str(out/"tested_gene_references.fasta")],stdout=root/"logs"/"bwa-index.stdout",stderr=root/"logs"/"bwa-index.stderr")
+    if records:
+        run(["bwa","index",str(out/"tested_gene_references.fasta")],stdout=root/"logs"/"bwa-index.stdout",stderr=root/"logs"/"bwa-index.stderr")
+        run(["samtools","faidx",str(out/"tested_gene_references.fasta")],stdout=root/"logs"/"faidx.stdout",stderr=root/"logs"/"faidx.stderr")
     touch_done(done,{"n_selected":len(selected)})
 
 def validate(run_dir: Path, index: int) -> None:
@@ -1777,8 +1797,52 @@ def validate(run_dir: Path, index: int) -> None:
     if iso not in retained: touch_done(done,{"status":"skipped_excluded"}); return
     key=out/"tested_gene_key.tsv"; ref=out/"tested_gene_references.fasta"
     if not key.is_file() or key.stat().st_size==0 or len(read_tsv(key))==0:
-        ev.mkdir(parents=True,exist_ok=True); write_tsv(ev/"metrics.tsv",["reference_id","Gene","validated_call","validation_state","decision_reason","final_call_source","breadth","percent_coverage","mean_depth","identity","percent_identity","identity_method","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"],[]); touch_done(done,{"status":"no_selected_genes"}); return
-    rr=retained[iso]; validate_isolate(ref,key,rr["R1"],rr["R2"],ev,int(cfg["VALIDATION_CPUS"]),float(cfg["READ_VALIDATION_MIN_BREADTH"]),float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"]),float(cfg["READ_VALIDATION_MIN_IDENTITY"]),int(cfg["READ_VALIDATION_MIN_MAPQ"]),int(cfg["BASEQUAL"])); touch_done(done)
+        ev.mkdir(parents=True,exist_ok=True); write_tsv(ev/"metrics.tsv",METRIC_FIELDS,[]); write_tsv(ev/"arbitrated_metrics.tsv",METRIC_FIELDS,[]); touch_done(done,{"status":"no_selected_genes"}); touch_done(run_dir/"state"/"arbitrate"/f"{safe_name(iso)}.done.json",{"status":"no_selected_genes"}); return
+    initial={r["Gene"]:int(r[iso]) for r in read_tsv(root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv")}
+    sample_loci=[r for r in read_tsv(out/"cluster_isolate_loci.tsv") if r["isolate_id"]==iso]; locus_file=ev/"loci.tsv"; write_tsv(locus_file,["Gene","isolate_id","locus_tag","assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus"],sample_loci)
+    rr=retained[iso]; validate_isolate(ref,key,locus_file,Path(rr["assembly"]),rr["R1"],rr["R2"],ev,int(cfg["VALIDATION_CPUS"]),float(cfg["READ_VALIDATION_MIN_BREADTH"]),float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"]),float(cfg["READ_VALIDATION_MIN_IDENTITY"]),int(cfg["READ_VALIDATION_MIN_MAPQ"]),int(cfg["BASEQUAL"]),initial_calls=initial,truncation_breadth=float(cfg["READ_VALIDATION_TRUNCATION_MIN_BREADTH"]),divergent_breadth=float(cfg["READ_VALIDATION_DIVERGENT_MIN_BREADTH"]),divergent_identity=float(cfg["READ_VALIDATION_DIVERGENT_MIN_IDENTITY"])); touch_done(done)
+    metric_rows=read_tsv(ev/"metrics.tsv")
+    if not any(r.get("arbitration_status")=="pending" for r in metric_rows):
+        shutil.copy2(ev/"metrics.tsv",ev/"arbitrated_metrics.tsv"); touch_done(run_dir/"state"/"arbitrate"/f"{safe_name(iso)}.done.json",{"status":"not_required","discordant_cases":0})
+
+def arbitrate_evidence(row: dict[str,str], *, deletion_spanned: bool=False) -> dict[str,str]:
+    """Apply the evidence hierarchy; costly reconstruction adapters feed this function."""
+    result=dict(row)
+    if deletion_spanned:
+        result.update(evidence_state="confirmed_absent_locus",validation_state="confirmed_absent_locus",validated_call="0",sequence_resolution="deletion_spanned",final_call_source="targeted_locus_reconstruction",arbitration_status="resolved",arbitration_reason="flanking loci joined across a read-supported deletion")
+    elif row.get("evidence_state") in {"possible_truncation","not_detected","partial_homolog"} and row.get("initial_call")=="1":
+        result.update(validated_call="1",final_call_source="initial_call_after_arbitration",arbitration_status="unresolved",arbitration_reason="no physical deletion junction demonstrated")
+    elif row.get("evidence_state")=="ambiguous_multimap":
+        result.update(validated_call=row.get("initial_call","0"),final_call_source="initial_call_after_arbitration",arbitration_status="family_only",arbitration_reason="gene family supported but exact cluster unresolved")
+    else:
+        result.update(arbitration_status="not_required",arbitration_reason="")
+    return result
+
+def arbitrate(run_dir: Path,index: int) -> None:
+    cfg=load_run_config(run_dir); row=task_row(run_dir,"isolate",index); iso=row["isolate_id"]; root=run_dir/"results"/"groups"/safe_name(row["group_id"]); ev=root/"03_read_validation"/"evidence"/safe_name(iso); done=run_dir/"state"/"arbitrate"/f"{safe_name(iso)}.done.json"
+    if done.is_file() and (ev/"arbitrated_metrics.tsv").is_file(): return
+    metrics=read_tsv(ev/"metrics.tsv") if (ev/"metrics.tsv").is_file() else []
+    if not metrics: ev.mkdir(parents=True,exist_ok=True); write_tsv(ev/"arbitration_cases.tsv",METRIC_FIELDS,[]); write_tsv(ev/"arbitrated_metrics.tsv",METRIC_FIELDS,[]); touch_done(done,{"discordant_cases":0}); return
+    pending=[r for r in metrics if r.get("arbitration_status")=="pending"]; maximum=int(cfg["READ_VALIDATION_ARBITRATION_MAX_CASES"]); selected={r["Gene"] for r in pending[:maximum]}; sample=retained_rows(run_dir,row["group_id"]); sample=next((r for r in sample if r["isolate_id"]==iso),{}); assembly=Path(sample["assembly"]) if sample.get("assembly") else None; assembly_seqs=read_fasta(assembly) if assembly and assembly.is_file() else {}; ref_path=root/"03_read_validation"/"tested_gene_references.fasta"; refs=read_fasta(ref_path) if ref_path.is_file() else {}; results=[]
+    for metric in metrics:
+        if metric.get("arbitration_status")!="pending": results.append(metric); continue
+        if metric.get("Gene") not in selected: results.append({**metric,"arbitration_status":"deferred_limit","arbitration_reason":"per-isolate arbitration case limit reached"}); continue
+        initial=metric.get("initial_call")=="1"; scaffold=metric.get("assembly_scaffold",""); start=int(metric.get("cds_start") or 0); end=int(metric.get("cds_end") or 0); flank=int(cfg["READ_VALIDATION_FLANK_LENGTH"]); reference_seq=refs.get(metric.get("reference_id",""),""); junction=""
+        if initial and scaffold in assembly_seqs and start and end:
+            sequence=assembly_seqs[scaffold]; reference_seq=sequence[start-1:end]
+            if metric.get("cds_strand")=="-": reference_seq=reference_seq.translate(str.maketrans("ACGTN","TGCAN"))[::-1]
+            left=sequence[max(0,start-1-flank):start-1]; right=sequence[end:min(len(sequence),end+flank)]; junction=left+right; region=f"{scaffold}:{max(1,start-flank)}-{min(len(sequence),end+flank)}"; bam=ev/"own_assembly_reads.bam"
+        else: region=metric.get("reference_id",""); bam=ev/"pangenome_reads.bam"
+        try: reconstruction=targeted_local_reconstruction(bam=bam,region=region,reference_seq=reference_seq,outdir=ev/"arbitration"/safe_name(metric["Gene"]),threads=int(cfg["ARBITRATION_CPUS"]),flank_junction=junction)
+        except (OSError,subprocess.CalledProcessError) as error:
+            results.append({**arbitrate_evidence(metric),"arbitration_reason":f"targeted reconstruction failed: {error}"}); continue
+        if reconstruction.get("deletion_spanned"): results.append(arbitrate_evidence(metric,deletion_spanned=True)); continue
+        match=reconstruction.get("candidate")
+        if match:
+            decision=classify_gene_evidence(initial_call=int(initial),mapped_reads=float(metric.get("mapped_reads") or 1),breadth=float(match["breadth"]),mean_depth=float(metric.get("mean_depth") or cfg["READ_VALIDATION_MIN_MEAN_DEPTH"]),identity=float(match["identity"]),min_breadth=float(cfg["READ_VALIDATION_MIN_BREADTH"]),min_depth=float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"]),min_identity=float(cfg["READ_VALIDATION_MIN_IDENTITY"]),truncation_breadth=float(cfg["READ_VALIDATION_TRUNCATION_MIN_BREADTH"]),divergent_breadth=float(cfg["READ_VALIDATION_DIVERGENT_MIN_BREADTH"]),divergent_identity=float(cfg["READ_VALIDATION_DIVERGENT_MIN_IDENTITY"]))
+            results.append({**metric,**decision,"sequence_resolution":"reconstructed","final_call_source":"targeted_local_reconstruction","identity":match["identity"],"percent_identity":float(match["identity"])*100,"reconstructed_length":match["aligned_length"],"aligned_positions":match["aligned_length"],"reference_length":match["reference_length"],"arbitration_status":"resolved","arbitration_reason":"targeted local reconstruction"}); continue
+        results.append({**arbitrate_evidence(metric),"arbitration_reason":f"targeted reconstruction unresolved: {reconstruction.get('status','unknown')}"})
+    write_tsv(ev/"arbitration_cases.tsv",METRIC_FIELDS,pending); write_tsv(ev/"arbitrated_metrics.tsv",METRIC_FIELDS,results); touch_done(done,{"discordant_cases":len(pending),"processed_cases":min(len(pending),maximum),"deferred_cases":max(0,len(pending)-maximum)})
 
 def reduce_group(run_dir: Path, index: int) -> None:
     cfg=load_run_config(run_dir); group=task_row(run_dir,"group",index)["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); done=run_dir/"state"/"reduce"/f"{safe_name(group)}.done.json"; cleaned=root/"cleaned_pangenome.tsv"
@@ -1789,7 +1853,7 @@ def reduce_group(run_dir: Path, index: int) -> None:
     if not initial_path.is_file(): touch_done(done,{"status":"skipped","reason":"missing_initial_pangenome"}); return
     initial=read_tsv(initial_path); by_gene={r["Gene"]:{i:int(r[i]) for i in isolates} for r in initial}; out=root/"03_read_validation"; metrics=[]
     for iso in isolates:
-        p=out/"evidence"/safe_name(iso)/"metrics.tsv"
+        ev=out/"evidence"/safe_name(iso); p=ev/"arbitrated_metrics.tsv" if (ev/"arbitrated_metrics.tsv").is_file() else ev/"metrics.tsv"
         for r in read_tsv(p) if p.is_file() else []:
             r={**r,"isolate_id":iso,"initial_call":by_gene[r["Gene"]][iso]}
             r.setdefault("percent_coverage", str(float(r.get("breadth") or 0) * 100.0))
@@ -1806,15 +1870,16 @@ def reduce_group(run_dir: Path, index: int) -> None:
         elif str(r.get("validated_call",""))!="":
             validated[r["Gene"]][r["isolate_id"]]=int(r["validated_call"])
     fields=["Gene",*isolates]; validated_matrix=out/"validated_gene_presence_absence.binary.tsv"; write_tsv(validated_matrix,fields,([g,*[validated[g][i] for i in isolates]] for g in by_gene)); shutil.copy2(validated_matrix,cleaned)
-    metric_fields=["Gene","isolate_id","initial_call","validated_call","validation_state","decision_reason","final_call_source","breadth","percent_coverage","mean_depth","identity","percent_identity","identity_method","identical_positions","aligned_positions","mapped_reads","mean_mapping_quality"]
+    metric_fields=["Gene","isolate_id",*[f for f in METRIC_FIELDS if f not in {"Gene","initial_call"}]]
     write_tsv(out/"read_validation_metrics.tsv",metric_fields,metrics)
     evidence_rows=[]
     metric_index={(r["Gene"],r["isolate_id"]):r for r in metrics}
     for gene in by_gene:
         for iso in isolates:
             m=metric_index.get((gene,iso)); initial_call=by_gene[gene][iso]; final=validated[gene][iso]
-            evidence_rows.append([group,gene,iso,initial_call,final,m["validation_state"] if m else "not_tested_carried_forward",m.get("final_call_source","not_tested") if m else "not_tested",m.get("breadth","") if m else "",m.get("percent_coverage","") if m else "",m.get("mean_depth","") if m else "",m.get("identity","") if m else "",m.get("percent_identity","") if m else "",m.get("identity_method","") if m else "",m.get("mapped_reads","") if m else ""])
-    write_tsv(out/"gene_call_evidence.long.tsv",["group_id","Gene","isolate_id","initial_call","validated_call","validation_state","final_call_source","breadth","percent_coverage","mean_depth","identity","percent_identity","identity_method","mapped_reads"],evidence_rows)
+            evidence_rows.append({"group_id":group,"Gene":gene,"isolate_id":iso,"initial_call":initial_call,"final_call":final,**({f:m.get(f,"") for f in METRIC_FIELDS if f not in {"Gene","initial_call","validated_call"}} if m else {"evidence_state":"not_tested_carried_forward","validation_state":"not_tested_carried_forward","final_call_source":"not_tested"})})
+    evidence_fields=["group_id","Gene","isolate_id","initial_call","final_call",*[f for f in METRIC_FIELDS if f not in {"Gene","initial_call","validated_call"}]]
+    write_tsv(out/"gene_call_evidence.long.tsv",evidence_fields,evidence_rows)
     changes=[]
     for g in by_gene:
         a=[by_gene[g][i] for i in isolates]; b=[validated[g][i] for i in isolates]; changes.append([g,sum(a),sum(b),sum(x==0 and y==1 for x,y in zip(a,b)),sum(x==1 and y==0 for x,y in zip(a,b)),sum(x==y for x,y in zip(a,b))])
@@ -1859,6 +1924,7 @@ def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
     elif stage=="panaroo": panaroo(run_dir,int(index))
     elif stage=="prepare_validation": prepare_validation(run_dir,int(index))
     elif stage=="validate": validate(run_dir,int(index))
+    elif stage=="arbitrate": arbitrate(run_dir,int(index))
     elif stage=="reduce": reduce_group(run_dir,int(index))
     elif stage=="plot": plot_group(run_dir,int(index))
     elif stage=="summary": summarize(run_dir)

@@ -388,6 +388,43 @@ Final group matrices are written to
 storage-free symlink index into sample data. Cohort summaries are under
 `results/cohort/`.
 
+### Locus-aware read validation
+
+Panaroo supplies the initial binary calls. For each retained isolate, CleanGene
+maps reads once to that isolate's assembly and measures Panaroo-positive CDSs at
+their GFF coordinates. A second competitive pangenome mapping searches for
+Panaroo-negative genes and retains both unique and ambiguous alignments. The
+assembly and pangenome BAMs are reused across every gene in the isolate.
+
+Evidence is reported as `confirmed_present`, `possible_truncation`,
+`divergent_variant`, `partial_homolog`, `ambiguous_multimap`, `not_detected`, or
+`insufficient_evidence`. Discordant rows pass through the resume-safe
+`arbitrate` stage. It uses an evidence hierarchy and never treats zero unique
+mappings as proof of absence; a `confirmed_absent_locus` call is reserved for a
+read-supported deletion junction. Cases without physical locus resolution keep
+the initial call and remain explicitly flagged.
+
+Arbitration recruits target-overlapping read names plus their retained mates
+from the existing BAM, runs a bounded local SPAdes assembly, and compares the
+result to the candidate and, when sample coordinates exist, the flank-to-flank
+deletion junction. At most `READ_VALIDATION_ARBITRATION_MAX_CASES` discordances
+are reconstructed per isolate; excess cases are marked `deferred_limit` rather
+than silently forced to a binary result.
+
+The binary result remains `cleaned_pangenome.tsv`. Rich evidence is available in
+`03_read_validation/read_validation_metrics.tsv` and
+`03_read_validation/gene_call_evidence.long.tsv`, including initial/final calls,
+evidence and sequence-resolution states, breadth, depth, normalized depth,
+consensus identity and lengths, ORF integrity, unique and ambiguous reads, CDS
+coordinates, contig-edge status, and arbitration status/reason.
+
+Thresholds are configured with `READ_VALIDATION_MIN_BREADTH`,
+`READ_VALIDATION_MIN_MEAN_DEPTH`, `READ_VALIDATION_MIN_IDENTITY`,
+`READ_VALIDATION_TRUNCATION_MIN_BREADTH`,
+`READ_VALIDATION_DIVERGENT_MIN_BREADTH`, and
+`READ_VALIDATION_DIVERGENT_MIN_IDENTITY`. Arbitration concurrency and resources
+use `SLURM_ARBITRATION_MAX_INFLIGHT` and the `ARBITRATION_*` settings.
+
 ### Local debugging and utilities
 
 Small local tests can use `--profile local`. This does not replace the supported

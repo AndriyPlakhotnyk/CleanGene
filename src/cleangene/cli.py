@@ -184,13 +184,17 @@ def _doctor_config_errors(cfg: dict[str,str]) -> list[str]:
     for key,allowed in enums.items():
         value=cfg.get(key,"").strip().lower()
         if value not in allowed: errors.append(f"{key} must be one of {', '.join(sorted(allowed))}; got {value!r}")
-    positive=("CPUS","SLURM_CPUS","SLURM_ARRAY_CHUNK_SIZE","SLURM_MAX_OUTSTANDING_CHUNKS","SLURM_USER_JOB_LIMIT","SLURM_CONTROLLER_CPUS","KRAKEN2_DB_CPUS","CHECKM2_CPUS","CHECKM2_PREDICT_CPUS","CHECKM2_MAX_INFLIGHT","CHECKM2_POSTHOC_CPUS","CHECKM2_POSTHOC_MAX_INFLIGHT","PREFLIGHT_FILE_CHECK_WORKERS","VALIDATION_CPUS")
-    nonnegative=("SLURM_MAX_PARALLEL","SLURM_PREPROCESS_MAX_INFLIGHT","SLURM_VALIDATION_MAX_INFLIGHT","SLURM_GROUP_MAX_INFLIGHT","SLURM_JOB_HEADROOM","SLURM_USER_CPU_LIMIT","SLURM_CPU_HEADROOM","SLURM_POLL_SECONDS")
+    positive=("CPUS","SLURM_CPUS","SLURM_ARRAY_CHUNK_SIZE","SLURM_MAX_OUTSTANDING_CHUNKS","SLURM_USER_JOB_LIMIT","SLURM_CONTROLLER_CPUS","KRAKEN2_DB_CPUS","CHECKM2_CPUS","CHECKM2_PREDICT_CPUS","CHECKM2_MAX_INFLIGHT","CHECKM2_POSTHOC_CPUS","CHECKM2_POSTHOC_MAX_INFLIGHT","PREFLIGHT_FILE_CHECK_WORKERS","VALIDATION_CPUS","ARBITRATION_CPUS","READ_VALIDATION_ARBITRATION_MAX_CASES","READ_VALIDATION_FLANK_LENGTH")
+    nonnegative=("SLURM_MAX_PARALLEL","SLURM_PREPROCESS_MAX_INFLIGHT","SLURM_VALIDATION_MAX_INFLIGHT","SLURM_ARBITRATION_MAX_INFLIGHT","SLURM_GROUP_MAX_INFLIGHT","SLURM_JOB_HEADROOM","SLURM_USER_CPU_LIMIT","SLURM_CPU_HEADROOM","SLURM_POLL_SECONDS")
     for key in positive+nonnegative:
         try: value=int(cfg.get(key,""))
         except ValueError: errors.append(f"{key} must be an integer; got {cfg.get(key,'')!r}"); continue
         if key in positive and value<=0: errors.append(f"{key} must be greater than zero; got {value}")
         if key in nonnegative and value<0: errors.append(f"{key} must be zero or greater; got {value}")
+    for key in ("READ_VALIDATION_MIN_BREADTH","READ_VALIDATION_MIN_IDENTITY","READ_VALIDATION_TRUNCATION_MIN_BREADTH","READ_VALIDATION_DIVERGENT_MIN_BREADTH","READ_VALIDATION_DIVERGENT_MIN_IDENTITY"):
+        try: value=float(cfg.get(key,""))
+        except ValueError: errors.append(f"{key} must be numeric; got {cfg.get(key,'')!r}"); continue
+        if not 0<value<=1: errors.append(f"{key} must be greater than zero and at most one; got {value}")
     for key,value in cfg.items():
         if key.endswith("_MEM") and value and not re.fullmatch(r"[1-9][0-9]*(?:\.[0-9]+)?[KMGT]",value,re.IGNORECASE):
             errors.append(f"{key} must be a positive Slurm memory value such as 32G; got {value!r}")
@@ -307,7 +311,7 @@ def doctor(args) -> int:
 
 def estimate(args) -> int:
     rows=load_manifest(args.manifest); total=sum(Path(r[k]).stat().st_size for r in rows for k in (("raw_bam",) if r.get("raw_bam") else ("R1","R2"))); ng=len(groups(rows)); n=len(rows)
-    print(json.dumps({"isolates":n,"groups":ng,"compressed_read_bytes":total,"slurm_preprocess_tasks":n,"slurm_panaroo_tasks":ng,"slurm_validation_tasks":n,"slurm_reduce_tasks":ng},indent=2)); return 0
+    print(json.dumps({"isolates":n,"groups":ng,"compressed_read_bytes":total,"slurm_preprocess_tasks":n,"slurm_panaroo_tasks":ng,"slurm_validation_tasks":n,"slurm_arbitration_tasks":n,"slurm_reduce_tasks":ng},indent=2)); return 0
 
 def local(run: Path) -> None:
     cfg,rows={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")},read_tsv(run/"provenance"/"manifest.tsv")
@@ -321,6 +325,7 @@ def local(run: Path) -> None:
     for i in range(ng): dispatch("panaroo",run,i)
     for i in range(ng): dispatch("prepare_validation",run,i)
     for i in range(ni): dispatch("validate",run,i)
+    for i in range(ni): dispatch("arbitrate",run,i)
     for i in range(ng): dispatch("reduce",run,i)
     for i in range(ng): dispatch("plot",run,i)
     dispatch("summary",run,None)
@@ -446,7 +451,7 @@ def reconcile_preprocess_command(args) -> int:
 def exclude_command(args) -> int:
     run=args.run_dir.expanduser().resolve(); validate_run_dir(run)
     downstream=[]
-    for stage in ("panaroo","prepare_validation","validate","reduce","plot"):
+    for stage in ("panaroo","prepare_validation","validate","arbitrate","reduce","plot"):
         downstream.extend((run/"state"/stage).glob("*.done.json"))
     if downstream or (run/"state"/"summary.done.json").is_file() or any((run/"results"/"groups").glob("*/02_pangenome/panaroo/gene_presence_absence.csv")):
         raise SystemExit("Exclusion refused: downstream pangenome work has already started. Create a new run from a filtered manifest to avoid mixing old and new cohort results.")

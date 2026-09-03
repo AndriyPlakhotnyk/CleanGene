@@ -3,13 +3,13 @@ from pathlib import Path
 from io import StringIO
 import contextlib
 from cleangene.manifest import groups, load_manifest
-from cleangene.evidence import classify_gene_evidence, fixed_coordinate_identity
+from cleangene.evidence import classify_gene_evidence, coverage, fixed_coordinate_identity
 from cleangene.fasta import assembly_metrics
-from cleangene.pangenome import normalize_panaroo, present, select_rows
+from cleangene.pangenome import cluster_locus_rows, gff_cds_loci, normalize_panaroo, present, select_rows
 from cleangene.slurm import active_cleangene_jobs_for_run, array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
 from cleangene.task_store import build_isolate_task_store, load_isolate_task, migrate_isolate_task_store
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, invalidate_failed_panaroo_downstream, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, arbitrate_evidence, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, invalidate_failed_panaroo_downstream, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, preprocess, reduce_group, slurm_controller, task_row
 from cleangene.cli import apply_cli_overrides, exclude_command, invalidate_legacy_identity_metrics, local, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
@@ -29,6 +29,17 @@ def _paired_ubam_flagstat(mapped: int = 0) -> dict[str,dict[str,int | float | No
     return {"QC-passed reads":passed,"QC-failed reads":failed}
 
 class CleanGeneCoreTests(unittest.TestCase):
+    def test_coverage_uses_prefiltered_bam_without_mapq_option(self):
+        result=subprocess.CompletedProcess(
+            ["samtools","coverage","reads.bam"],
+            0,
+            stdout="#rname\tstartpos\tendpos\tnumreads\tcovbases\tcoverage\tmeandepth\tmeanbaseq\tmeanmapq\n",
+            stderr="",
+        )
+        with patch("cleangene.evidence.subprocess.run",return_value=result) as runner:
+            self.assertEqual(coverage(Path("reads.bam"),20),{})
+        runner.assert_called_once_with(["samtools","coverage","reads.bam"],check=True,capture_output=True,text=True)
+
     def test_organism_results_index_links_complete_isolate_directories(self):
         with tempfile.TemporaryDirectory() as d:
             run=Path(d)/"run"; source=run/"results"/"groups"/"pending"/"01_isolates"/"BI_06_0500"
@@ -149,6 +160,17 @@ class CleanGeneCoreTests(unittest.TestCase):
         self.assertEqual([r["Gene"] for r in select_rows(rows,isolates,"differential",0.95)],["g2"])
         self.assertEqual([r["Gene"] for r in select_rows(rows,isolates,"all",0.95)],["g1","g2","g3"])
 
+    def test_panaroo_cluster_to_sample_cds_coordinates(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); (root/"gene_presence_absence.csv").write_text("Gene,iso1,iso2\ngA,locus_2,locus_x\n")
+            rows=cluster_locus_rows([{"Gene":"gA"}],root,["iso1","iso2"])
+            self.assertEqual(rows[0],{"Gene":"gA","isolate_id":"iso1","locus_tag":"locus_2"})
+            assembly=root/"assembly.fa"; assembly.write_text(">ctg\n"+"A"*600+"\n")
+            gff=root/"genes.gff"; gff.write_text("ctg\tP\tCDS\t20\t90\t.\t+\t0\tID=locus_1;locus_tag=locus_1\nctg\tP\tCDS\t150\t300\t.\t-\t0\tID=locus_2;locus_tag=locus_2\nctg\tP\tCDS\t400\t500\t.\t+\t0\tID=locus_3;locus_tag=locus_3\n")
+            locus=gff_cds_loci(gff,assembly)["locus_2"]
+            self.assertEqual((locus["assembly_scaffold"],locus["cds_start"],locus["cds_end"]),("ctg",150,300))
+            self.assertEqual((locus["left_flank_locus"],locus["right_flank_locus"]),("locus_1","locus_3"))
+
     def test_assembly_metrics(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/"x.fa"; p.write_text(">a\nAAAA\n>b\nGGNN\n")
@@ -159,17 +181,37 @@ class CleanGeneCoreTests(unittest.TestCase):
 
     def test_validation_classification_preserves_unresolved_identity(self):
         d=classify_gene_evidence(mapped_reads=274,breadth=0.998255,mean_depth=59.8726,identity=None,min_breadth=0.90,min_depth=5,min_identity=0.95)
-        self.assertEqual(d["validation_state"],"identity_unresolved")
+        self.assertEqual(d["validation_state"],"insufficient_evidence")
         self.assertEqual(d["validated_call"],"")
         self.assertEqual(d["final_call_source"],"initial_call_unresolved")
 
     def test_validation_classification_states(self):
         args=dict(min_breadth=0.90,min_depth=5,min_identity=0.95)
         self.assertEqual(classify_gene_evidence(mapped_reads=0,breadth=0,mean_depth=0,identity=None,**args)["validation_state"],"not_detected")
-        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=0.5,mean_depth=10,identity=1.0,**args)["validation_state"],"partial_coverage")
-        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=1.0,mean_depth=2,identity=1.0,**args)["validation_state"],"low_depth")
-        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=1.0,mean_depth=10,identity=0.8,**args)["validation_state"],"divergent")
+        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=0.5,mean_depth=10,identity=1.0,**args)["validation_state"],"partial_homolog")
+        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=1.0,mean_depth=2,identity=1.0,**args)["validation_state"],"insufficient_evidence")
+        self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=1.0,mean_depth=10,identity=0.8,**args)["validation_state"],"partial_homolog")
         self.assertEqual(classify_gene_evidence(mapped_reads=10,breadth=1.0,mean_depth=10,identity=0.99,**args)["validation_state"],"confirmed_present")
+
+    def test_locus_aware_biological_states(self):
+        args=dict(initial_call=1,mapped_reads=20,mean_depth=20,min_breadth=.95,min_depth=5,min_identity=.95)
+        self.assertEqual(classify_gene_evidence(breadth=.80,identity=.98,**args)["validation_state"],"possible_truncation")
+        self.assertEqual(classify_gene_evidence(breadth=.93,identity=.92,**args)["validation_state"],"divergent_variant")
+        self.assertEqual(classify_gene_evidence(breadth=.60,identity=.98,**args)["validation_state"],"partial_homolog")
+        ambiguous=classify_gene_evidence(breadth=.99,identity=.99,unique_reads=0,ambiguous_reads=20,**args)
+        self.assertEqual(ambiguous["validation_state"],"ambiguous_multimap")
+        self.assertEqual(ambiguous["validated_call"],"")
+        recovered=classify_gene_evidence(initial_call=0,mapped_reads=30,breadth=.99,mean_depth=30,identity=.99)
+        self.assertEqual((recovered["validated_call"],recovered["final_call_source"]),(1,"pangenome_read_recovery"))
+        competitive_zero=classify_gene_evidence(initial_call=1,mapped_reads=0,breadth=0,mean_depth=0,identity=None)
+        self.assertEqual((competitive_zero["validated_call"],competitive_zero["final_call_source"]),("","arbitration_pending"))
+
+    def test_arbitration_requires_physical_evidence_for_absence(self):
+        row={"initial_call":"1","evidence_state":"not_detected"}
+        self.assertEqual(arbitrate_evidence(row)["validated_call"],"1")
+        deleted=arbitrate_evidence(row,deletion_spanned=True)
+        self.assertEqual(deleted["evidence_state"],"confirmed_absent_locus")
+        self.assertEqual(deleted["sequence_resolution"],"deletion_spanned")
 
     def test_fixed_coordinate_identity_avoids_false_zero_for_matching_names(self):
         self.assertEqual(fixed_coordinate_identity("ACGT","ACGT")["identity"],1.0)
@@ -722,7 +764,7 @@ class CleanGeneCoreTests(unittest.TestCase):
                 def active_indices(self,stage): return set()
                 def submit_ready(self,stage,indices,*args):
                     self.calls.append((stage,list(indices)))
-                    kind="isolate" if stage in {"preprocess","validate"} else "group"; rows=read_tsv(run/"state"/f"{kind}_tasks.tsv")
+                    kind="isolate" if stage in {"preprocess","validate","arbitrate"} else "group"; rows=read_tsv(run/"state"/f"{kind}_tasks.tsv")
                     for i in indices:
                         name=rows[i]["isolate_id" if kind=="isolate" else "group_id"]; atomic_json(run/"state"/stage/f"{name}.done.json",{})
                         if stage=="reduce": write_tsv(run/"results"/"groups"/name/"cleaned_pangenome.tsv",["Gene"],[])
@@ -735,6 +777,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             panaroo_calls=[indices for stage,indices in scheduler.calls if stage=="panaroo"]
             self.assertEqual(panaroo_calls[0],[0])
             self.assertEqual(panaroo_calls[1],[1])
+            self.assertTrue(any(stage=="arbitrate" for stage,_ in scheduler.calls))
             self.assertLess(scheduler.calls.index(("panaroo",[0])),scheduler.calls.index(("preprocess",[0,1])))
 
     def test_resume_config_updates_execution_values_and_preserves_db(self):
