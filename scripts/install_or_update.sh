@@ -89,6 +89,15 @@ mamba run -n cleangene sh -c '
     done
 '
 
+echo "Verifying Panaroo runtime"
+mamba run -n cleangene python -c '
+from importlib.metadata import version
+from panaroo.__main__ import main
+package = "panaroo"
+print(f"Panaroo version: {version(package)}")
+print("Panaroo Python entry point: READY")
+'
+
 if [[ ! -e config/cleangene.arc.local.env ]]; then
     cp config/cleangene.arc.env config/cleangene.arc.local.env
     echo "Created config/cleangene.arc.local.env"

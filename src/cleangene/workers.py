@@ -1,5 +1,6 @@
 from __future__ import annotations
 import csv, fcntl, gzip, hashlib, os, shutil, subprocess, sys, tempfile, time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -129,6 +130,23 @@ def global_preflight(run_dir: Path) -> dict[str,object]:
         inputs=load_json(run_dir/"provenance"/"inputs.json") if (run_dir/"provenance"/"inputs.json").is_file() else {}
         manifest_base=Path(str(inputs.get("manifest",""))).expanduser().parent if inputs.get("manifest") else None
         input_summary=_timed(timings,"input_paths",lambda: validate_preflight_input_paths(rows,cfg,manifest_base))
+        group_sizes=Counter(r.get("group_id","") for r in rows)
+        panaroo_required=assembler_mode(cfg)!="off" and any(
+            not r.get("pangenome_dir","").strip()
+            and (r.get("grouping_source")=="kraken_pending" or group_sizes.get(r.get("group_id",""),0)>=2)
+            for r in rows
+        )
+        if panaroo_required:
+            try:
+                panaroo_version=_timed(timings,"panaroo_runtime",lambda: executable_version("panaroo","Panaroo",60))
+            except ToolResolutionError as error:
+                raise SystemExit(
+                    "Panaroo runtime validation failed before pipeline work was submitted:\n"
+                    f"{error}\n"
+                    "Repair the CleanGene environment with: bash scripts/install_or_update.sh"
+                ) from error
+        else:
+            panaroo_version="not_required"
         cfg=_timed(timings,"qc_profiles",lambda: ensure_qc_provenance(run_dir,rows,cfg))
         _timed(timings,"task_store",lambda: (build_isolate_task_store(run_dir,rows), build_group_task_store(run_dir,rows)))
         atomic_json(run_dir/"provenance"/"resolved_config.json",cfg)
@@ -140,7 +158,7 @@ def global_preflight(run_dir: Path) -> dict[str,object]:
             disabled=truthy(cfg.get("CHECKM2_DISABLED_BY_USER","false")) or checkm2_mode(cfg)=="off"
             if disabled: _controller_log("CheckM2: disabled by user; setup and prediction skipped",ok=True)
             _timed(timings,"checkm2_requirement",lambda: touch_done(run_dir/"state"/"checkm2_db_setup.done.json",{"status":"not_required","reason":"user_disabled" if disabled else "not_required"}))
-        payload={"status":"PASS",**input_summary,"runtime":"PASS","CheckM2 setup":checkm2_status,"Kraken2 setup":kraken_status,"QC profiles":"PASS"}
+        payload={"status":"PASS",**input_summary,"runtime":"PASS","Panaroo":panaroo_version,"CheckM2 setup":checkm2_status,"Kraken2 setup":kraken_status,"QC profiles":"PASS"}
         payload["total_seconds"]=time.monotonic()-start
         atomic_json(marker,payload)
         write_tsv(run_dir/"logs"/"preflight_timing.tsv",["phase","seconds"],[*timings,["total",f"{payload['total_seconds']:.6f}"]])
@@ -1211,17 +1229,22 @@ def _indices_spec(indices: list[int], max_parallel: str) -> str:
 def _done(path: Path) -> bool:
     return path.is_file()
 
+def _successful_marker(path: Path) -> bool:
+    if not _done(path): return False
+    try: return str(load_json(path).get("status","")).lower()!="failed"
+    except (OSError,ValueError): return False
+
 def incomplete_indices(run_dir: Path, stage: str) -> list[int]:
     if stage=="preprocess":
         rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
-        return [i for i,r in enumerate(rows) if not _done(run_dir/"state"/"preprocess"/f"{safe_name(r['isolate_id'])}.done.json")]
+        return [i for i,r in enumerate(rows) if not _successful_marker(run_dir/"state"/"preprocess"/f"{safe_name(r['isolate_id'])}.done.json")]
     rows=read_tsv(run_dir/"state"/"group_tasks.tsv")
     marker={"panaroo":"panaroo","prepare_validation":"prepare_validation","reduce":"reduce","plot":"plot"}[stage]
-    return [i for i,r in enumerate(rows) if not _done(run_dir/"state"/marker/f"{safe_name(r['group_id'])}.done.json")]
+    return [i for i,r in enumerate(rows) if not _successful_marker(run_dir/"state"/marker/f"{safe_name(r['group_id'])}.done.json")]
 
 def incomplete_validate_indices(run_dir: Path) -> list[int]:
     rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
-    return [i for i,r in enumerate(rows) if not _done(run_dir/"state"/"validate"/f"{safe_name(r['isolate_id'])}.done.json")]
+    return [i for i,r in enumerate(rows) if not _successful_marker(run_dir/"state"/"validate"/f"{safe_name(r['isolate_id'])}.done.json")]
 
 def _float_or_none(value: str | None) -> float | None:
     try:
@@ -1231,6 +1254,44 @@ def _float_or_none(value: str | None) -> float | None:
 
 def _remove_done(path: Path) -> None:
     if path.is_file(): path.unlink()
+
+def _invalidate_group_after_panaroo_failure(run_dir: Path, group: str) -> None:
+    group_name=safe_name(group)
+    for stage in ("prepare_validation","reduce","plot"):
+        _remove_done(run_dir/"state"/stage/f"{group_name}.done.json")
+    tasks=run_dir/"state"/"isolate_tasks.tsv"
+    if tasks.is_file():
+        for row in read_tsv(tasks):
+            if row.get("group_id")==group:
+                _remove_done(run_dir/"state"/"validate"/f"{safe_name(row['isolate_id'])}.done.json")
+    _remove_done(run_dir/"state"/"summary.done.json")
+    _remove_done(run_dir/"state"/"orchestrate_downstream.done.json")
+
+def invalidate_failed_panaroo_downstream(run_dir: Path) -> int:
+    tasks=run_dir/"state"/"group_tasks.tsv"
+    if not tasks.is_file(): return 0
+    failed=[]
+    for row in read_tsv(tasks):
+        marker=run_dir/"state"/"panaroo"/f"{safe_name(row['group_id'])}.done.json"
+        if marker.is_file():
+            try:
+                if str(load_json(marker).get("status","")).lower()=="failed": failed.append(row["group_id"])
+            except (OSError,ValueError):
+                continue
+    failed_set=set(failed)
+    for group in failed:
+        group_name=safe_name(group)
+        for stage in ("prepare_validation","reduce","plot"):
+            _remove_done(run_dir/"state"/stage/f"{group_name}.done.json")
+    isolate_tasks=run_dir/"state"/"isolate_tasks.tsv"
+    if isolate_tasks.is_file():
+        for row in read_tsv(isolate_tasks):
+            if row.get("group_id") in failed_set:
+                _remove_done(run_dir/"state"/"validate"/f"{safe_name(row['isolate_id'])}.done.json")
+    if failed:
+        _remove_done(run_dir/"state"/"summary.done.json")
+        _remove_done(run_dir/"state"/"orchestrate_downstream.done.json")
+    return len(failed)
 
 def invalidate_legacy_identity_metrics(run_dir: Path, cfg: dict[str,str]) -> int:
     min_breadth=float(cfg["READ_VALIDATION_MIN_BREADTH"]); min_depth=float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"])
@@ -1344,10 +1405,18 @@ def _index_done(run_dir: Path, stage: str, index: int) -> bool:
     kind="isolate" if stage in {"preprocess","validate"} else "group"
     row=task_row(run_dir,kind,index); name=row["isolate_id"] if kind=="isolate" else row["group_id"]
     marker={"validate":"validate"}.get(stage,stage)
-    done_path=run_dir/"state"/marker/f"{safe_name(name)}.done.json"; done=_done(done_path)
+    done_path=run_dir/"state"/marker/f"{safe_name(name)}.done.json"; done=_successful_marker(done_path)
     if stage=="reduce" and done:
         done=load_json(done_path).get("status")=="skipped" or _done(run_dir/"results"/"groups"/safe_name(name)/"cleaned_pangenome.tsv")
     return done
+
+def _index_failed(run_dir: Path, stage: str, index: int) -> bool:
+    kind="isolate" if stage in {"preprocess","validate"} else "group"
+    row=task_row(run_dir,kind,index); name=row["isolate_id"] if kind=="isolate" else row["group_id"]
+    path=run_dir/"state"/stage/f"{safe_name(name)}.done.json"
+    if not path.is_file(): return False
+    try: return str(load_json(path).get("status","")).lower()=="failed"
+    except (OSError,ValueError): return False
 
 @dataclass
 class _ActiveBatch:
@@ -1375,11 +1444,14 @@ def _failed_stage_log_excerpt(run_dir: Path, stage: str, job_id: str) -> str:
 
 class _RollingScheduler:
     def __init__(self,run_dir: Path,cfg: dict[str,str]):
-        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.done: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}
+        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.done: dict[str,set[int]]={}; self.failed: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}
 
     def seed_done(self,stage: str,indices: list[int]) -> set[int]:
         if stage not in self.done:
-            self.done[stage]={i for i in indices if _index_done(self.run_dir,stage,i)}
+            self.done[stage]=set(); self.failed[stage]=set()
+            for i in indices:
+                if _index_done(self.run_dir,stage,i): self.done[stage].add(i)
+                elif _index_failed(self.run_dir,stage,i): self.failed[stage].add(i)
         return self.done[stage]
 
     def is_done(self,stage: str,index: int) -> bool:
@@ -1474,19 +1546,21 @@ class _RollingScheduler:
             array=_indices_spec(part,self.cfg["SLURM_MAX_PARALLEL"]); cmd=_controller_cmd(self.run_dir,self.cfg,stage,array,cpus,mem,time_limit)
             jid=submit_with_qos_retry(cmd,self.cfg,array_task_count(array),label); batch=_ActiveBatch(jid,stage,part,array,seen=True)
             self.active[jid]=batch; self.jobs.append(jid); self.submitted.setdefault(stage,set()).update(part)
+            self.failed.setdefault(stage,set()).difference_update(part)
             local_jobs=self.snapshot["jobs"]; local_jobs[jid]={"PENDING":n}; self.snapshot["total"]=int(self.snapshot["total"])+n
             submitted += n; stage_queued += n; avail -= n; batches += 1
         return submitted
 
     def progress(self,stage: str,total_indices: list[int],label: str) -> None:
         done=self.seed_done(stage,total_indices); complete=len(done.intersection(total_indices)); running,pending=self.stage_queue(stage)
+        failed=len(self.failed.get(stage,set()).intersection(total_indices))
         submitted=len(done.intersection(total_indices)|self.submitted.get(stage,set()))
         current=int(self.snapshot["total"]); avail=available_slots(int(self.cfg["SLURM_USER_JOB_LIMIT"]),int(self.cfg["SLURM_JOB_HEADROOM"]),current)
         total=len(total_indices); not_submitted=max(0,total-submitted)
         message=(
             f"step={label} | user_jobs={current}/{self.cfg['SLURM_USER_JOB_LIMIT']} | available_slots={avail} | "
             f"total_submitted={submitted} | total_completed={complete} | current_step_completed={complete}/{total} | "
-            f"running={running} | slurm_pending={pending} | not_submitted_yet={not_submitted} | failed=0"
+            f"running={running} | slurm_pending={pending} | not_submitted_yet={not_submitted} | failed={failed}"
         )
         _controller_log(message)
 
@@ -1574,35 +1648,47 @@ def _controller_lock(run_dir: Path):
 
 def slurm_controller(run_dir: Path, index: int | None = None) -> None:
     with _controller_lock(run_dir):
-        cfg, rows=context(run_dir)
-        _controller_log(f"controller_started | run_dir={run_dir} | isolates={len(rows)} | stages=" + " -> ".join(stage for stage,_ in STAGE_DESCRIPTIONS))
-        global_preflight(run_dir)
-        cfg, rows=context(run_dir)
-        cfg=_run_database_setup_stages(run_dir,cfg,rows)
-        cfg, rows=context(run_dir)
-        migrated=migrate_isolate_task_store(run_dir)
-        if migrated: _controller_log(f"step=prepare_tasks | migrated_isolate_task_store={migrated}",ok=True)
-        group_migrated=migrate_group_task_store(run_dir)
-        if group_migrated: _controller_log(f"step=prepare_group_tasks | migrated_group_task_store={group_migrated}",ok=True)
-        run_resume_maintenance(run_dir,cfg)
+        status_path=run_dir/"state"/"controller_status.json"
+        atomic_json(status_path,{"status":"running","job_id":os.environ.get("SLURM_JOB_ID","local"),"started_at":time.time()})
         try:
-            snapshot=user_queue_snapshot()
-        except (OSError, subprocess.SubprocessError) as error:
-            _controller_log(f"step=preprocess_reconciliation | active_snapshot_unavailable={error}")
-            snapshot={"total":0,"jobs":{},"entries":[]}
-        reconcile=reconcile_preprocess_outputs(run_dir,cfg,read_tsv(run_dir/"state"/"isolate_tasks.tsv"),snapshot)
-        _controller_log("step=preprocess_reconciliation | " + " | ".join(f"{key}={reconcile[key]}" for key in ("total","marker_complete","output_recovered","active","incomplete","inconsistent")),ok=reconcile.get("inconsistent",0)==0)
-        unresolved=any(r.get("grouping_source")=="kraken_pending" for r in rows)
-        if not unresolved and not _done(run_dir/"state"/"resolve_groups.done.json"):
-            _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
-        if unresolved:
-            prep_indices=incomplete_indices(run_dir,"preprocess")
-            if prep_indices: _run_index_stage(run_dir,cfg,"preprocess",prep_indices,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess")
-            if not _done(run_dir/"state"/"resolve_groups.done.json"):
+            cfg, rows=context(run_dir)
+            _controller_log(f"controller_started | run_dir={run_dir} | isolates={len(rows)} | stages=" + " -> ".join(stage for stage,_ in STAGE_DESCRIPTIONS))
+            global_preflight(run_dir)
+            cfg, rows=context(run_dir)
+            cfg=_run_database_setup_stages(run_dir,cfg,rows)
+            cfg, rows=context(run_dir)
+            migrated=migrate_isolate_task_store(run_dir)
+            if migrated: _controller_log(f"step=prepare_tasks | migrated_isolate_task_store={migrated}",ok=True)
+            group_migrated=migrate_group_task_store(run_dir)
+            if group_migrated: _controller_log(f"step=prepare_group_tasks | migrated_group_task_store={group_migrated}",ok=True)
+            failed_groups=invalidate_failed_panaroo_downstream(run_dir)
+            if failed_groups: _controller_log(f"step=panaroo_retry | invalidated_failed_group_downstream={failed_groups}",ok=True)
+            run_resume_maintenance(run_dir,cfg)
+            try:
+                snapshot=user_queue_snapshot()
+            except (OSError, subprocess.SubprocessError) as error:
+                _controller_log(f"step=preprocess_reconciliation | active_snapshot_unavailable={error}")
+                snapshot={"total":0,"jobs":{},"entries":[]}
+            reconcile=reconcile_preprocess_outputs(run_dir,cfg,read_tsv(run_dir/"state"/"isolate_tasks.tsv"),snapshot)
+            _controller_log("step=preprocess_reconciliation | " + " | ".join(f"{key}={reconcile[key]}" for key in ("total","marker_complete","output_recovered","active","incomplete","inconsistent")),ok=reconcile.get("inconsistent",0)==0)
+            unresolved=any(r.get("grouping_source")=="kraken_pending" for r in rows)
+            if not unresolved and not _done(run_dir/"state"/"resolve_groups.done.json"):
                 _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
-            controller_downstream(run_dir)
-        else:
-            _controller_pipeline(run_dir,True)
+            if unresolved:
+                prep_indices=incomplete_indices(run_dir,"preprocess")
+                if prep_indices: _run_index_stage(run_dir,cfg,"preprocess",prep_indices,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess")
+                if not _done(run_dir/"state"/"resolve_groups.done.json"):
+                    _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
+                controller_downstream(run_dir)
+            else:
+                _controller_pipeline(run_dir,True)
+        except BaseException as error:
+            reason=str(error) or error.__class__.__name__
+            atomic_json(status_path,{"status":"failed","job_id":os.environ.get("SLURM_JOB_ID","local"),"reason":reason,"failed_at":time.time()})
+            _controller_log(f"controller_failed | reason={reason}")
+            raise
+        atomic_json(status_path,{"status":"complete","job_id":os.environ.get("SLURM_JOB_ID","local"),"completed_at":time.time()})
+        _controller_log("controller_completed | status=PASS",ok=True)
 
 def manifest_pangenome_dir(rows: list[dict[str,str]], group: str) -> Path | None:
     paths=sorted({r.get("pangenome_dir","").strip() for r in rows if r["group_id"]==group and r.get("pangenome_dir","").strip()})
@@ -1624,10 +1710,15 @@ def prepared_pangenome_dir(run_dir: Path, group: str, root: Path) -> Path:
 
 def panaroo(run_dir: Path, index: int) -> None:
     cfg=load_run_config(run_dir); task=task_row(run_dir,"group",index); group=task["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); out=root/"02_pangenome"/"panaroo"; done=run_dir/"state"/"panaroo"/f"{safe_name(group)}.done.json"
-    root.mkdir(parents=True,exist_ok=True); (root/"logs").mkdir(parents=True,exist_ok=True); out.mkdir(parents=True,exist_ok=True)
+    root.mkdir(parents=True,exist_ok=True); (root/"logs").mkdir(parents=True,exist_ok=True)
     if done.is_file():
         status=load_json(done)
         if status.get("status")=="skipped" or status.get("external_pangenome_dir") or (out/"gene_presence_absence.csv").is_file(): return
+        if status.get("status")=="failed":
+            _invalidate_group_after_panaroo_failure(run_dir,group)
+            done.unlink()
+            if out.is_dir(): shutil.rmtree(out)
+    out.mkdir(parents=True,exist_ok=True)
     retained=retained_rows(run_dir,group)
     if len(retained)<2: touch_done(done,{"status":"skipped","reason":"fewer_than_two_retained"}); return
     external=Path(task["pangenome_dir"]).expanduser().resolve() if task.get("pangenome_dir","").strip() else None
@@ -1651,7 +1742,7 @@ def panaroo(run_dir: Path, index: int) -> None:
         if stderr_tail: print("Panaroo stderr tail:\n"+stderr_tail,file=sys.stderr,flush=True)
         if stdout_tail: print("Panaroo stdout tail:\n"+stdout_tail,file=sys.stderr,flush=True)
         touch_done(done,{"status":"failed","reason":reason,"returncode":error.returncode,"stdout":str(stdout),"stderr":str(stderr),"stderr_tail":stderr_tail[-4000:],"stdout_tail":stdout_tail[-2000:]})
-        return
+        raise RuntimeError(f"Panaroo failed for group {group}: {reason}\n{stderr_tail or stdout_tail}") from error
     isolates=[r["isolate_id"] for r in retained]; rows=normalize_panaroo(out/"gene_presence_absence.csv",isolates); calls=root/"02_pangenome"/"initial_calls"; calls.mkdir(parents=True,exist_ok=True); write_binary(calls/"gene_presence_absence.binary.tsv",rows,isolates)
     touch_done(done,{"n_isolates":len(isolates),"n_genes":len(rows)})
 

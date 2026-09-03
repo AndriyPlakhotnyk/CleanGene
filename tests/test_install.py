@@ -57,6 +57,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("env create -f environment.checkm2.yml", commands)
         self.assertFalse(any("env update" in command or "env remove" in command for command in commands))
         self.assertIn("run -n cleangene cleangene doctor --config config/cleangene.arc.local.env", commands)
+        self.assertTrue(any("run -n cleangene python -c" in command for command in commands))
         self.assertEqual(local, "SLURM_ACCOUNT=\n")
 
     def test_update_mode_updates_both_and_preserves_local_config(self):

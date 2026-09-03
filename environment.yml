@@ -6,7 +6,7 @@ dependencies:
   - python>=3.10
   - shovill
   - prokka
-  - panaroo
+  - "bioconda::panaroo>=1.5.2,<2"
   - bwa
   - samtools=1.20
   - bcftools

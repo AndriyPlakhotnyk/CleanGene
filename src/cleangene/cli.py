@@ -383,6 +383,7 @@ def run_command(args) -> int:
         print(submitted(f"CleanGene run created: {run.name}"))
         print(submitted(f"Controller submitted: {controller_job_id}"))
         print(submitted(f"Run directory: {run}"))
+        print(submitted(f"Controller log: {run/'logs'/'slurm'/f'controller.{controller_job_id}.log'}"))
     return 0
 
 def resume_command(args) -> int:
@@ -409,6 +410,7 @@ def resume_command(args) -> int:
     print(submitted(f"CleanGene run created: {run.name}"))
     print(submitted(f"Controller submitted: {controller_job_id}"))
     print(submitted(f"Run directory: {run}"))
+    print(submitted(f"Controller log: {run/'logs'/'slurm'/f'controller.{controller_job_id}.log'}"))
     return 0
 
 def cleanup_command(args) -> int:

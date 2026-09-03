@@ -9,6 +9,7 @@ from cleangene.cli import main, make_run
 from cleangene.defaults import DEFAULTS
 from cleangene.qc import prepare_qc_provenance, resolve_threshold_rows
 from cleangene.task_store import build_group_task_store, build_isolate_task_store, load_group_task
+from cleangene.tools import ToolResolutionError
 from cleangene.util import atomic_json, load_json, read_tsv, write_tsv
 from cleangene.workers import global_preflight, retained_rows, slurm_controller, validate_preflight_input_paths
 
@@ -87,6 +88,22 @@ class ScalingArchitectureTests(unittest.TestCase):
             self.assertFalse((run/"state"/"kraken_db_setup.done.json").exists())
             self.assertFalse((run/"state"/"checkm2_db_setup.done.json").exists())
 
+    def test_global_preflight_rejects_broken_panaroo_runtime(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); run=root/"run"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
+            r1=root/"r1.fq"; r2=root/"r2.fq"; r1.write_text("@r\nA\n+\nI\n"); r2.write_text("@r\nT\n+\nI\n")
+            cfg={**DEFAULTS,"TAXONOMY_MODE":"off","CHECKM2_MODE":"off","PREFLIGHT_FILE_CHECK_WORKERS":"1"}
+            atomic_json(run/"provenance"/"resolved_config.json",cfg)
+            atomic_json(run/"provenance"/"inputs.json",{"manifest":str(root/"manifest.tsv")})
+            rows=[["i1","g",str(r1),str(r2)],["i2","g",str(r1),str(r2)]]
+            write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","R1","R2"],rows)
+            with patch("cleangene.workers.executable_version",side_effect=ToolResolutionError("Bio.Alphabet has been removed")):
+                with self.assertRaisesRegex(SystemExit,"Panaroo runtime validation failed"):
+                    global_preflight(run)
+            preflight=load_json(run/"provenance"/"preflight.json")
+            self.assertEqual(preflight["status"],"FAIL")
+            self.assertIn("Bio.Alphabet",preflight["reason"])
+
     def test_controller_routes_database_setup_to_dedicated_resources_before_preprocess(self):
         with tempfile.TemporaryDirectory() as d:
             run=Path(d)/"run"; (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
@@ -129,6 +146,9 @@ class ScalingArchitectureTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,"setup failed"):
                     slurm_controller(run)
             pipeline.assert_not_called()
+            status=load_json(run/"state"/"controller_status.json")
+            self.assertEqual(status["status"],"failed")
+            self.assertEqual(status["reason"],"setup failed")
 
     def test_resume_after_incomplete_checkm2_setup_submits_setup_then_pipeline(self):
         with tempfile.TemporaryDirectory() as d:

@@ -9,7 +9,7 @@ from cleangene.pangenome import normalize_panaroo, present, select_rows
 from cleangene.slurm import active_cleangene_jobs_for_run, array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
 from cleangene.task_store import build_isolate_task_store, load_isolate_task, migrate_isolate_task_store
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, prepare_validation, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, invalidate_failed_panaroo_downstream, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, preprocess, reduce_group, slurm_controller, task_row
 from cleangene.cli import apply_cli_overrides, exclude_command, invalidate_legacy_identity_metrics, local, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
@@ -597,7 +597,7 @@ class CleanGeneCoreTests(unittest.TestCase):
     def test_progress_counts_done_markers_not_submitted_boundary(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10"}
         with tempfile.TemporaryDirectory() as d:
-            run=Path(d); write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],(("g",f"i{i}") for i in range(3))); atomic_json(run/"state"/"preprocess"/"i0.done.json",{})
+            run=Path(d); write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],(("g",f"i{i}") for i in range(3))); atomic_json(run/"state"/"preprocess"/"i0.done.json",{}); atomic_json(run/"state"/"preprocess"/"i1.done.json",{"status":"failed"})
             scheduler=_RollingScheduler(run,cfg); scheduler.snapshot={"total":2,"jobs":{}}; scheduler.submitted={"preprocess":{0,1,2}}
             output=StringIO()
             with contextlib.redirect_stdout(output): scheduler.progress("preprocess",[0,1,2],"CleanGene preprocess")
@@ -607,6 +607,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertIn("current_step_completed=1/3",text)
             self.assertIn("total_submitted=3",text)
             self.assertIn("not_submitted_yet=0",text)
+            self.assertIn("failed=1",text)
 
     def test_wait_jobs_sleep_branch_has_time_import(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0"}
@@ -637,7 +638,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             panaroo(run,0)
             self.assertTrue((run/"results"/"groups"/"Streptococcus_gallolyticus"/"logs").is_dir())
 
-    def test_panaroo_failure_marks_group_failed_and_validation_skips(self):
+    def test_panaroo_failure_marks_group_failed_and_raises_with_detail(self):
         with tempfile.TemporaryDirectory() as d:
             run=Path(d)/"run"; group="Streptococcus gallolyticus"; safe="Streptococcus_gallolyticus"
             (run/"provenance").mkdir(parents=True); (run/"state").mkdir()
@@ -650,16 +651,17 @@ class CleanGeneCoreTests(unittest.TestCase):
             def fail_panaroo(command,stdout=None,stderr=None,**kwargs):
                 Path(stderr).write_text("panaroo internal failure\n")
                 raise subprocess.CalledProcessError(1,command)
-            with patch("cleangene.workers.run",side_effect=fail_panaroo), contextlib.redirect_stderr(StringIO()):
-                panaroo(run,0)
+            error_output=StringIO()
+            with patch("cleangene.workers.run",side_effect=fail_panaroo), contextlib.redirect_stderr(error_output):
+                with self.assertRaisesRegex(RuntimeError,"Panaroo failed for group Streptococcus gallolyticus"):
+                    panaroo(run,0)
             marker=read_tsv(run/"state"/"group_tasks.tsv")
             self.assertEqual(marker[0]["group_id"],group)
             status=json.loads((run/"state"/"panaroo"/f"{safe}.done.json").read_text())
             self.assertEqual(status["status"],"failed")
             self.assertIn("panaroo internal failure",status["stderr_tail"])
-            prepare_validation(run,0)
-            prepared=json.loads((run/"state"/"prepare_validation"/f"{safe}.done.json").read_text())
-            self.assertEqual(prepared["reason"],"panaroo_failed")
+            self.assertIn("panaroo internal failure",error_output.getvalue())
+            self.assertFalse(_index_done(run,"panaroo",0))
 
     def test_resume_skips_completed_preprocess_and_resolve(self):
         with tempfile.TemporaryDirectory() as d:
@@ -692,6 +694,20 @@ class CleanGeneCoreTests(unittest.TestCase):
                 controller_downstream(run)
             self.assertIn(("panaroo",[1]),seen)
             self.assertNotIn(("panaroo",[0]),seen)
+
+    def test_failed_panaroo_retry_invalidates_stale_downstream_markers(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)/"run"; group="failed group"
+            write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[[group,2,"small"]])
+            write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[[group,"i1"],[group,"i2"]])
+            atomic_json(run/"state"/"panaroo"/"failed_group.done.json",{"status":"failed"})
+            for path in (run/"state"/"prepare_validation"/"failed_group.done.json",run/"state"/"reduce"/"failed_group.done.json",run/"state"/"plot"/"failed_group.done.json",run/"state"/"validate"/"i1.done.json",run/"state"/"validate"/"i2.done.json",run/"state"/"summary.done.json",run/"state"/"orchestrate_downstream.done.json"):
+                atomic_json(path,{"status":"skipped"})
+            self.assertEqual(invalidate_failed_panaroo_downstream(run),1)
+            self.assertTrue((run/"state"/"panaroo"/"failed_group.done.json").is_file())
+            self.assertFalse((run/"state"/"prepare_validation"/"failed_group.done.json").exists())
+            self.assertFalse((run/"state"/"validate"/"i1.done.json").exists())
+            self.assertFalse((run/"state"/"summary.done.json").exists())
 
     def test_known_groups_overlap_downstream_with_preprocess(self):
         with tempfile.TemporaryDirectory() as d:
