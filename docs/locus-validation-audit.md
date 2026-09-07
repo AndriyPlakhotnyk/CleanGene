@@ -159,11 +159,12 @@ original regression command with a fresh run ID. This command is documented,
 not submitted by this audit:
 
 ```bash
+CLEANGENE_ROOT="$PWD"  # Run from your CleanGene checkout on ARC.
 cleangene run \
   --profile slurm \
-  --manifest /work/LSARP/genomics/analyses/andriy/pipelines/CleanGene/input/arc_GDS_test.manifest.tsv \
-  --analysis-root /work/LSARP/genomics/analyses/andriy/pipelines/CleanGene \
-  --config /work/LSARP/genomics/analyses/andriy/pipelines/CleanGene/config/cleangene.arc.no-checkm2.env \
+  --manifest "${CLEANGENE_ROOT}/input/arc_GDS_test.manifest.tsv" \
+  --analysis-root "${CLEANGENE_ROOT}" \
+  --config "${CLEANGENE_ROOT}/config/cleangene.arc.no-checkm2.env" \
   --assembler spades \
   --compress-assembly-outputs intermediates \
   --compress-annotation-outputs nonessential

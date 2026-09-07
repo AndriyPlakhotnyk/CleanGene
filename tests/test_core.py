@@ -508,12 +508,20 @@ class CleanGeneCoreTests(unittest.TestCase):
     def test_preprocess_cannot_build_missing_kraken_db(self):
         with tempfile.TemporaryDirectory() as d:
             run=Path(d)/"runs"/"r"; (run/"provenance").mkdir(parents=True)
-            cfg={"TAXONOMY_MODE":"kraken2","KRAKEN2_DB":"","KRAKEN2_AUTO_DOWNLOAD":"true","KRAKEN2_DATABASE_SIZE":"standard-8"}
+            cfg={"TAXONOMY_MODE":"kraken2","KRAKEN2_DB":"","KRAKEN2_DATABASE_ROOT":str(Path(d)/"missing_databases"),"KRAKEN2_AUTO_DOWNLOAD":"true","KRAKEN2_DATABASE_SIZE":"standard-8"}
             rows=[{"isolate_id":"i1","group_id":"g","grouping_source":"manifest_group_id","R1":"r1","R2":"r2"}]
             atomic_json(run/"provenance"/"resolved_config.json",cfg)
             write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id","grouping_source","R1","R2"],rows)
-            with self.assertRaisesRegex(SystemExit,"kraken_db_setup"):
-                ensure_kraken2_db(run,cfg,rows)
+            # A site's installed database must not satisfy this missing-DB fixture.
+            site_root=Path(d)/"site_databases"
+            site_db=site_root/"kraken2_standard-8"; site_db.mkdir(parents=True)
+            for name in ("hash.k2d","opts.k2d","taxo.k2d"):
+                (site_db/name).write_text("database fixture")
+            with patch("cleangene.kraken.default_kraken2_database_root",return_value=site_root) as default_root:
+                with self.assertRaisesRegex(SystemExit,"kraken_db_setup"):
+                    ensure_kraken2_db(run,cfg,rows)
+                default_root.assert_not_called()
+            self.assertFalse(Path(cfg["KRAKEN2_DATABASE_ROOT"]).exists())
 
     def test_preprocess_threads_kraken_and_suppresses_per_read_output(self):
         with tempfile.TemporaryDirectory() as d:
