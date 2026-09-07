@@ -401,8 +401,9 @@ Evidence is reported as `confirmed_present`, `possible_truncation`,
 `insufficient_evidence`. Discordant rows pass through the resume-safe
 `arbitrate` stage. It uses an evidence hierarchy and never treats zero unique
 mappings as proof of absence; a `confirmed_absent_locus` call is reserved for a
-read-supported deletion junction. Cases without physical locus resolution keep
-the initial call and remain explicitly flagged.
+read-supported deletion junction. Unresolved absence and family-only cases keep
+the initial binary call and remain explicitly flagged; partial homologs retain
+an intact-gene call of zero without claiming a demonstrated deletion.
 
 Arbitration recruits target-overlapping read names plus their retained mates
 from the existing BAM, runs a bounded local SPAdes assembly, and compares the
@@ -433,3 +434,12 @@ ARC installation and is not intended for large cohorts.
 Completed runs provide Slurm-native sample queries, differential gene tests,
 operon typing, read-backed variant analysis, and iTOL datasets through
 `cleangene utils`. See [docs/UTILS.md](docs/UTILS.md).
+
+The [validation audit](docs/locus-validation-audit.md) records fixes, tests,
+configuration defaults, local/ARC commands, and current limitations. CDS support
+is measured in two streamed BAM passes. Mapping signatures permit reuse after
+interruption. Daughter reconstruction is additionally bounded by
+`READ_VALIDATION_ARBITRATION_MAX_READS` and
+`READ_VALIDATION_ARBITRATION_MEMORY_GB`; deletion evidence uses
+`READ_VALIDATION_DELETION_MIN_IDENTITY` and
+`READ_VALIDATION_DELETION_MIN_ANCHOR`.

@@ -1,13 +1,22 @@
 from __future__ import annotations
-import csv, subprocess
+import subprocess, json
 from pathlib import Path
 from .fasta import read_fasta, write_fasta
-from .util import run, write_tsv
+from .util import read_tsv, run, write_tsv
 
-METRIC_FIELDS=["reference_id","Gene","initial_call","validated_call","evidence_state","validation_state","decision_reason","sequence_resolution","final_call_source","breadth","percent_coverage","mean_depth","normalized_depth","identity","percent_identity","identity_method","reconstructed_length","identical_positions","aligned_positions","reference_length","orf_integrity","mapped_reads","unique_mapped_reads","ambiguous_mapped_reads","mean_mapping_quality","assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus","arbitration_status","arbitration_reason"]
+EVIDENCE_VERSION="2"
+
+METRIC_FIELDS=["evidence_version","family_breadth","reconstructed_coverage","reference_id","Gene","initial_call","validated_call","evidence_state","validation_state","decision_reason","sequence_resolution","final_call_source","breadth","percent_coverage","mean_depth","normalized_depth","identity","percent_identity","identity_method","reconstructed_length","identical_positions","aligned_positions","reference_length","orf_integrity","mapped_reads","unique_mapped_reads","ambiguous_mapped_reads","mean_mapping_quality","assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus","arbitration_status","arbitration_reason"]
 
 def map_reads(reference: Path,r1: str,r2: str,bam: Path,threads: int,min_mapq: int,log: Path,*,retain_ambiguous: bool=False) -> None:
     bam.parent.mkdir(parents=True,exist_ok=True); log.parent.mkdir(parents=True,exist_ok=True)
+    marker=bam.with_suffix(".mapping.json")
+    signature={"version":EVIDENCE_VERSION,"min_mapq":min_mapq,"retain_ambiguous":retain_ambiguous,"inputs":[[str(Path(x).resolve()),Path(x).stat().st_size,Path(x).stat().st_mtime_ns] for x in (reference,r1,r2)]}
+    if marker.is_file() and bam.is_file() and Path(str(bam)+".bai").is_file():
+        try:
+            if json.loads(marker.read_text())==signature: return
+        except (ValueError,OSError): pass
+    marker.unlink(missing_ok=True)
     view=["samtools","view","-u"]
     if not retain_ambiguous: view += ["-F","3332","-q",str(min_mapq)]
     view.append("-")
@@ -20,9 +29,10 @@ def map_reads(reference: Path,r1: str,r2: str,bam: Path,threads: int,min_mapq: i
         sam.stdout.close(); statuses=(sort.wait(),sam.wait(),bwa.wait())
     if any(statuses): raise subprocess.CalledProcessError(next(x for x in statuses if x),"bwa mem | samtools view | samtools sort")
     run(["samtools","index",str(bam)])
+    temporary=marker.with_suffix(".tmp"); temporary.write_text(json.dumps(signature)); temporary.replace(marker)
 
-def coverage(bam: Path,min_mapq: int) -> dict[str,dict[str,float]]:
-    p=subprocess.run(["samtools","coverage",str(bam)],check=True,capture_output=True,text=True); out={}
+def coverage(bam: Path,min_mapq: int,*,include_ambiguous: bool=False) -> dict[str,dict[str,float]]:
+    p=subprocess.run(["samtools","coverage","-q",str(0 if include_ambiguous else min_mapq),"--ff",str(1540 if include_ambiguous else 3844),str(bam)],check=True,capture_output=True,text=True); out={}
     for line in p.stdout.splitlines():
         if not line or line.startswith("#"): continue
         f=line.split("\t")
@@ -31,9 +41,9 @@ def coverage(bam: Path,min_mapq: int) -> dict[str,dict[str,float]]:
 
 def region_coverage(bam: Path,contig: str,start: int,end: int,min_mapq: int) -> dict[str,float]:
     region=f"{contig}:{start}-{end}"; length=max(1,end-start+1)
-    p=subprocess.run(["samtools","depth","-aa","-d","0","-Q",str(min_mapq),"-r",region,str(bam)],check=True,capture_output=True,text=True)
+    p=subprocess.run(["samtools","depth","-aa","-d","0","-G","2048","-Q",str(min_mapq),"-r",region,str(bam)],check=True,capture_output=True,text=True)
     depths=[int(line.rsplit("\t",1)[1]) for line in p.stdout.splitlines() if line]; depths += [0]*max(0,length-len(depths))
-    mapped=int(subprocess.run(["samtools","view","-c","-q",str(min_mapq),str(bam),region],check=True,capture_output=True,text=True).stdout or 0)
+    mapped=int(subprocess.run(["samtools","view","-c","-F","3844","-q",str(min_mapq),str(bam),region],check=True,capture_output=True,text=True).stdout or 0)
     return {"mapped_reads":mapped,"breadth":sum(x>0 for x in depths)/length,"mean_depth":sum(depths)/length}
 
 def representative_depth(cov: dict[str,dict[str,float]],assembly: Path) -> float:
@@ -44,7 +54,7 @@ def representative_depth(cov: dict[str,dict[str,float]],assembly: Path) -> float
     return 0.0
 
 def low_depth_bed(bam: Path,path: Path,min_depth: float,min_mapq: int) -> None:
-    p=subprocess.run(["samtools","depth","-aa","-d","0","-Q",str(min_mapq),str(bam)],check=True,capture_output=True,text=True); intervals=[]; cur=None
+    p=subprocess.run(["samtools","depth","-aa","-d","0","-G","2048","-Q",str(min_mapq),str(bam)],check=True,capture_output=True,text=True); intervals=[]; cur=None
     for line in p.stdout.splitlines():
         chrom,pos,dep=line.split("\t")[:3]; pos0=int(pos)-1
         if float(dep)>=min_depth:
@@ -63,7 +73,7 @@ def consensus(reference: Path,bam: Path,prefix: Path,min_depth: float,min_mapq: 
     call=subprocess.run(["bcftools","call","-mv","--ploidy","1","-Oz","-o",str(vcf)],stdin=mp.stdout); mp.stdout.close(); status=mp.wait()
     if status or call.returncode: raise subprocess.CalledProcessError(status or call.returncode,"bcftools")
     run(["bcftools","index","--force",str(vcf)]); low_depth_bed(bam,mask,min_depth,min_mapq)
-    cmd=["bcftools","consensus","-f",str(reference)]+(["-m",str(mask)] if mask.stat().st_size else [])+[str(vcf)]
+    cmd=["bcftools","consensus","-c",str(prefix.with_suffix(".chain")),"-f",str(reference)]+(["-m",str(mask)] if mask.stat().st_size else [])+[str(vcf)]
     with fa.open("w") as out: subprocess.run(cmd,check=True,stdout=out)
     return fa
 
@@ -86,41 +96,60 @@ def align_identity(reference: Path,consensus_fa: Path) -> dict[str,dict[str,floa
     return best
 
 def orf_integrity(seq: str) -> str:
-    seq=seq.upper().replace("N","")
+    seq=seq.upper()
+    if not seq or any(base not in "ACGT" for base in seq): return "unresolved"
     if not seq or len(seq)%3: return "disrupted"
     return "intact" if all(seq[i:i+3] not in {"TAA","TAG","TGA"} for i in range(0,len(seq)-3,3)) else "internal_stop"
 
 def best_sequence_match(reference_seq: str, contigs: Path, work: Path) -> dict[str,object]|None:
+    work.mkdir(parents=True,exist_ok=True)
     reference=work/"target.fasta"; write_fasta(reference,[("target",reference_seq)])
     p=subprocess.run(["minimap2","-x","asm5","--secondary=no","-c",str(reference),str(contigs)],check=True,capture_output=True,text=True); best=None
     for line in p.stdout.splitlines():
         f=line.split("\t")
         if len(f)<12: continue
-        candidate={"identity":int(f[9])/int(f[10]) if int(f[10]) else 0,"aligned_length":int(f[10]),"reference_length":len(reference_seq),"breadth":min(1.0,(int(f[8])-int(f[7]))/max(1,len(reference_seq))),"contig":f[0]}
+        candidate={"identity":int(f[9])/int(f[10]) if int(f[10]) else 0,"aligned_length":int(f[10]),"identical_positions":int(f[9]),"query_aligned_length":int(f[3])-int(f[2]),"reference_length":len(reference_seq),"breadth":min(1.0,(int(f[8])-int(f[7]))/max(1,len(reference_seq))),"contig":f[0],"reference_start":int(f[7]),"reference_end":int(f[8]),"alignment_cigar":next((x[5:] for x in f[12:] if x.startswith("cg:Z:")),"")}
         if best is None or (candidate["breadth"],candidate["identity"])>(best["breadth"],best["identity"]): best=candidate
     return best
 
-def targeted_local_reconstruction(*,bam: Path,region: str,reference_seq: str,outdir: Path,threads: int,flank_junction: str="") -> dict[str,object]:
+def targeted_local_reconstruction(*,bam: Path,region: str,reference_seq: str,outdir: Path,threads: int,flank_junction: str="",junction_offset: int=0,max_reads: int=100000,memory_gb: int=12,deletion_identity: float=.95,deletion_anchor: int=50) -> dict[str,object]:
     """Recruit alignments and their mates, locally assemble, and resolve a target."""
     outdir.mkdir(parents=True,exist_ok=True); names=outdir/"read_names.txt"
-    p=subprocess.run(["samtools","view",str(bam),region],check=True,capture_output=True,text=True)
-    read_names=sorted({line.split("\t",1)[0] for line in p.stdout.splitlines() if line})
+    command=["samtools","view",str(bam),region]; read_names=set()
+    with subprocess.Popen(command,stdout=subprocess.PIPE,text=True) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if line: read_names.add(line.split("\t",1)[0])
+            if len(read_names)>max_reads:
+                process.terminate(); process.wait()
+                return {"status":"recruitment_limit"}
+        status=process.wait()
+    if status: raise subprocess.CalledProcessError(status,command)
     if not read_names: return {"status":"no_recruited_reads"}
+    read_names=sorted(read_names)
     names.write_text("".join(f"{name}\n" for name in read_names))
     recruited=outdir/"recruited.bam"; run(["samtools","view","-b","-F","2304","-N",str(names),"-o",str(recruited),str(bam)])
+    collated=outdir/"recruited.collated.bam"
+    run(["samtools","collate","-o",str(collated),str(recruited)])
     r1=outdir/"recruited_R1.fastq"; r2=outdir/"recruited_R2.fastq"; singles=outdir/"recruited_singletons.fastq"; other=outdir/"recruited_other.fastq"
-    run(["samtools","fastq","-n","-1",str(r1),"-2",str(r2),"-0",str(other),"-s",str(singles),str(recruited)],stdout=outdir/"samtools_fastq.stdout",stderr=outdir/"samtools_fastq.stderr")
-    assembly=outdir/"spades"; command=["spades.py","--only-assembler","--careful","-t",str(threads),"-o",str(assembly)]
+    run(["samtools","fastq","-n","-1",str(r1),"-2",str(r2),"-0",str(other),"-s",str(singles),str(collated)],stdout=outdir/"samtools_fastq.stdout",stderr=outdir/"samtools_fastq.stderr")
+    assembly=outdir/"spades"; command=["spades.py","--only-assembler","--careful","-m",str(memory_gb),"-t",str(threads),"-o",str(assembly)]
     has_reads=False
     if r1.stat().st_size and r2.stat().st_size: command += ["-1",str(r1),"-2",str(r2)]; has_reads=True
     if singles.stat().st_size or other.stat().st_size:
-        single_input=singles if singles.stat().st_size else other; command += ["-s",str(single_input)]; has_reads=True
+        single_input=outdir/"all_singletons.fastq"
+        with single_input.open("wb") as handle:
+            for source in (singles,other):
+                with source.open("rb") as source_handle:
+                    import shutil
+                    shutil.copyfileobj(source_handle,handle)
+        command += ["-s",str(single_input)]; has_reads=True
     if not has_reads: return {"status":"no_reconstructed_reads"}
     run(command,stdout=outdir/"spades.stdout",stderr=outdir/"spades.stderr"); contigs=assembly/"contigs.fasta"
     if not contigs.is_file() or not read_fasta(contigs): return {"status":"no_contigs"}
     match=best_sequence_match(reference_seq,contigs,outdir/"candidate_match") if reference_seq else None
     deletion=best_sequence_match(flank_junction,contigs,outdir/"deletion_match") if flank_junction else None
-    deletion_spanned=bool(deletion and deletion["breadth"]>=.90 and deletion["identity"]>=.95)
+    deletion_spanned=bool(deletion and junction_offset>=deletion_anchor and len(flank_junction)-junction_offset>=deletion_anchor and deletion["identity"]>=deletion_identity and spans_junction(deletion,junction_offset,deletion_anchor))
     return {"status":"reconstructed","candidate":match,"deletion_spanned":deletion_spanned,"deletion":deletion}
 
 def classify_gene_evidence(*,initial_call: int=0,mapped_reads: float,breadth: float,mean_depth: float,identity: float|None,min_breadth: float=.95,min_depth: float=5,min_identity: float=.95,truncation_breadth: float=.70,divergent_breadth: float=.90,divergent_identity: float=.90,unique_reads: float|None=None,ambiguous_reads: float=0) -> dict[str,object]:
@@ -128,7 +157,7 @@ def classify_gene_evidence(*,initial_call: int=0,mapped_reads: float,breadth: fl
     elif not mapped_reads or not breadth: state,call,source="not_detected","" if initial_call else 0,"arbitration_pending" if initial_call else "read_validation"
     elif mean_depth<min_depth or identity is None: state,call,source="insufficient_evidence","","initial_call_unresolved"
     elif breadth>=min_breadth and identity>=min_identity: state,call,source="confirmed_present",1,"own_locus_read_validation" if initial_call else "pangenome_read_recovery"
-    elif breadth>=divergent_breadth and identity>=divergent_identity: state,call,source="divergent_variant",1,"read_validation"
+    elif breadth>=divergent_breadth and divergent_identity<=identity<min_identity: state,call,source="divergent_variant",1,"read_validation"
     elif breadth>=truncation_breadth and identity>=min_identity: state,call,source="possible_truncation",1 if initial_call else "","arbitration_pending"
     else: state,call,source="partial_homolog",0,"arbitration_pending" if initial_call else "read_validation"
     return {"evidence_state":state,"validation_state":state,"validated_call":call,"final_call_source":source,"decision_reason":state.replace("_"," ")}
@@ -141,24 +170,140 @@ def _slice(seqs: dict[str,str],row: dict[str,str]) -> str:
     return seq.translate(str.maketrans("ACGTNacgtn","TGCANtgcan"))[::-1] if row.get("cds_strand")=="-" else seq
 
 def validate_isolate(reference: Path,key_tsv: Path,locus_tsv: Path,assembly: Path,r1: str,r2: str,outdir: Path,threads: int,min_breadth: float,min_depth: float,min_identity: float,min_mapq: int,basequal: int,*,initial_calls: dict[str,int]|None=None,truncation_breadth: float=.70,divergent_breadth: float=.90,divergent_identity: float=.90) -> None:
-    outdir.mkdir(parents=True,exist_ok=True); keys=list(csv.DictReader(key_tsv.open(newline=""),delimiter="\t")); loci={r["Gene"]:r for r in csv.DictReader(locus_tsv.open(newline=""),delimiter="\t")}; initial_calls=initial_calls or {}
+    outdir.mkdir(parents=True,exist_ok=True); keys=read_tsv(key_tsv); locus_rows=read_tsv(locus_tsv); loci={}; initial_calls=initial_calls or {}
+    for locus_row in locus_rows: loci.setdefault(locus_row["Gene"],[]).append(locus_row)
     if assembly.suffix==".gz":
         uncompressed=outdir/"own_assembly.fasta"
         if not uncompressed.is_file(): write_fasta(uncompressed,list(read_fasta(assembly).items()))
         assembly=uncompressed
     if not Path(str(assembly)+".bwt").is_file(): run(["bwa","index",str(assembly)],stdout=outdir/"own_assembly_bwa_index.stdout",stderr=outdir/"own_assembly_bwa_index.stderr")
     if not Path(str(assembly)+".fai").is_file(): run(["samtools","faidx",str(assembly)])
-    own=outdir/"own_assembly_reads.bam"; map_reads(assembly,r1,r2,own,threads,min_mapq,outdir/"own_assembly_bwa.log"); own_cov=coverage(own,min_mapq); chrom_depth=representative_depth(own_cov,assembly)
+    own=outdir/"own_assembly_reads.bam"; map_reads(assembly,r1,r2,own,threads,min_mapq,outdir/"own_assembly_bwa.log",retain_ambiguous=True); own_cov=coverage(own,min_mapq); chrom_depth=representative_depth(own_cov,assembly)
     own_cons=read_fasta(consensus(assembly,own,outdir/"own_assembly_reads",min_depth,min_mapq,basequal)); assembly_seqs=read_fasta(assembly)
-    search=outdir/"pangenome_reads.bam"; map_reads(reference,r1,r2,search,threads,min_mapq,outdir/"pangenome_bwa.log",retain_ambiguous=True); search_cov=coverage(search,min_mapq); search_cons=read_fasta(consensus(reference,search,outdir/"pangenome_reads",min_depth,min_mapq,basequal)); refs=read_fasta(reference); rows=[]
+    locus_metrics=locus_coverage(own,locus_rows,outdir,min_mapq)
+    def locus_key(row): return (row["assembly_scaffold"],int(row["cds_start"]),int(row["cds_end"]))
+    search=outdir/"pangenome_reads.bam"; map_reads(reference,r1,r2,search,threads,min_mapq,outdir/"pangenome_bwa.log",retain_ambiguous=True); search_cov=coverage(search,min_mapq,include_ambiguous=True); search_unique_cov=coverage(search,min_mapq); search_cons=read_fasta(consensus(reference,search,outdir/"pangenome_reads",min_depth,min_mapq,basequal)); refs=read_fasta(reference); rows=[]
     for key in keys:
-        gene=key["Gene"]; initial=int(initial_calls.get(gene,key.get("initial_call",0))); locus=loci.get(gene) if initial else None
+        gene=key["Gene"]; initial=int(initial_calls.get(gene,key.get("initial_call",0))); candidates=loci.get(gene,[]) if initial else []; locus=max(candidates,key=lambda r:(locus_metrics[locus_key(r)]["breadth"],locus_metrics[locus_key(r)]["mean_depth"])) if candidates else None
         if locus:
-            c=region_coverage(own,locus["assembly_scaffold"],int(locus["cds_start"]),int(locus["cds_end"]),min_mapq); refseq=_slice(assembly_seqs,locus); reconstructed=_slice(own_cons,locus); ident=fixed_coordinate_identity(refseq,reconstructed); unique=int(c["mapped_reads"]); ambiguous=0; resolution="exact"
+            c=locus_metrics[locus_key(locus)]; refseq=_slice(assembly_seqs,locus); reconstructed=consensus_locus(own_cons,locus,outdir/"own_assembly_reads.chain"); ident=sequence_identity(refseq,reconstructed); unique=int(c["mapped_reads"]); ambiguous=int(c["ambiguous_mapped_reads"]); resolution="exact"
         else:
-            c=search_cov.get(key["reference_id"],{}); refseq=refs.get(key["reference_id"],""); reconstructed=search_cons.get(key["reference_id"],"") if c.get("breadth",0) else ""; ident=fixed_coordinate_identity(refseq,reconstructed) if reconstructed else None; total=int(c.get("mapped_reads",0)); unique=int(subprocess.run(["samtools","view","-c","-F","2304","-q",str(min_mapq),str(search),key["reference_id"]],check=True,capture_output=True,text=True).stdout or 0); ambiguous=max(0,total-unique); resolution="reconstructed" if unique else "family_only" if ambiguous else "unresolved"
+            c=search_cov.get(key["reference_id"],{}); refseq=refs.get(key["reference_id"],""); reconstructed=search_cons.get(key["reference_id"],"") if c.get("breadth",0) else ""; ident=sequence_identity(refseq,reconstructed) if reconstructed else None; total=int(c.get("mapped_reads",0)); unique=int(search_unique_cov.get(key["reference_id"],{}).get("mapped_reads",0)); ambiguous=max(0,total-unique); resolution="reconstructed" if unique else "family_only" if ambiguous else "unresolved"
+        family_breadth=float(c.get("breadth",0))
+        if not locus and unique:
+            c=search_unique_cov.get(key["reference_id"],{})
         identity=None if not ident else ident["identity"]; decision=classify_gene_evidence(initial_call=initial,mapped_reads=float(c.get("mapped_reads",0)),breadth=float(c.get("breadth",0)),mean_depth=float(c.get("mean_depth",0)),identity=identity,min_breadth=min_breadth,min_depth=min_depth,min_identity=min_identity,truncation_breadth=truncation_breadth,divergent_breadth=divergent_breadth,divergent_identity=divergent_identity,unique_reads=unique,ambiguous_reads=ambiguous)
-        row={f:"" for f in METRIC_FIELDS}; row.update(key); row.update(decision); row.update({"initial_call":initial,"sequence_resolution":resolution,"breadth":c.get("breadth",0),"percent_coverage":float(c.get("breadth",0))*100,"mean_depth":c.get("mean_depth",0),"normalized_depth":float(c.get("mean_depth",0))/chrom_depth if chrom_depth else "","identity":"NA" if identity is None else identity,"percent_identity":"NA" if identity is None else identity*100,"identity_method":ident.get("identity_method","") if ident else "","reconstructed_length":len(reconstructed.replace("N","")),"identical_positions":ident.get("identical_positions","") if ident else "","aligned_positions":ident.get("aligned_positions","") if ident else "","reference_length":len(refseq),"orf_integrity":orf_integrity(reconstructed),"mapped_reads":int(c.get("mapped_reads",0)),"unique_mapped_reads":unique,"ambiguous_mapped_reads":ambiguous,"mean_mapping_quality":c.get("mean_mapping_quality","")});
+        if ambiguous and float(c.get("breadth",0))<min_breadth and family_breadth>=min_breadth:
+            decision.update(evidence_state="ambiguous_multimap",validation_state="ambiguous_multimap",validated_call="",final_call_source="arbitration_pending"); resolution="family_only"
+        if decision["evidence_state"]=="ambiguous_multimap": resolution="family_only"
+        elif decision["evidence_state"] in {"not_detected","insufficient_evidence"}: resolution="unresolved"
+        row={f:"" for f in METRIC_FIELDS}; row.update(key); row.update(decision); row.update({"evidence_version":EVIDENCE_VERSION,"family_breadth":family_breadth,"reconstructed_coverage":min(1.,sum(b in "ACGTacgt" for b in reconstructed)/len(refseq)) if refseq else 0.,"initial_call":initial,"sequence_resolution":resolution,"breadth":c.get("breadth",0),"percent_coverage":float(c.get("breadth",0))*100,"mean_depth":c.get("mean_depth",0),"normalized_depth":float(c.get("mean_depth",0))/chrom_depth if chrom_depth else "","identity":"NA" if identity is None else identity,"percent_identity":"NA" if identity is None else identity*100,"identity_method":ident.get("identity_method","") if ident else "","reconstructed_length":len(reconstructed.replace("N","")),"identical_positions":ident.get("identical_positions","") if ident else "","aligned_positions":ident.get("aligned_positions","") if ident else "","reference_length":len(refseq),"orf_integrity":orf_integrity(reconstructed),"mapped_reads":unique+ambiguous,"unique_mapped_reads":unique,"ambiguous_mapped_reads":ambiguous,"mean_mapping_quality":c.get("mean_mapping_quality","")});
         if locus: row.update({k:locus.get(k,"") for k in ("assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus")})
-        row["arbitration_status"]="pending" if row["final_call_source"]=="arbitration_pending" else "not_required"; rows.append(row)
+        row["arbitration_status"]="pending" if row["final_call_source"]=="arbitration_pending" or (not initial and row["validated_call"]==1) or (initial and row["evidence_state"]=="insufficient_evidence") else "not_required"; rows.append(row)
     write_tsv(outdir/"metrics.tsv",METRIC_FIELDS,rows)
+
+
+def sequence_identity(ref: str, reconstructed: str) -> dict[str,object]|None:
+    """Compare reconstructed bases with gaps, excluding unknown reference positions."""
+    ref=ref.upper(); reconstructed=reconstructed.upper()
+    if not reconstructed or not any(b in "ACGT" for b in reconstructed): return None
+    # Strip identical ends before dynamic programming; most own-locus calls
+    # therefore require no alignment matrix. Bound exceptional divergent cases.
+    left=0; right=0; limit=min(len(ref),len(reconstructed))
+    while left<limit and ref[left]==reconstructed[left]: left+=1
+    while right<limit-left and ref[len(ref)-right-1]==reconstructed[len(reconstructed)-right-1]: right+=1
+    ends=ref[:left]+(ref[len(ref)-right:] if right else "")
+    a=ref[left:len(ref)-right if right else len(ref)]
+    b=reconstructed[left:len(reconstructed)-right if right else len(reconstructed)]
+    if len(a)*len(b)>2_000_000: return None
+    # Entries contain edit cost, matches, and observed alignment columns.
+    previous=[(j,0,sum(x in "ACGT" for x in b[:j])) for j in range(len(b)+1)]
+    for i,x in enumerate(a,1):
+        current=[(i,0,sum(t in "ACGT" for t in a[:i]))]
+        for j,y in enumerate(b,1):
+            known=x in "ACGT" and y in "ACGT"; equal=x==y and known
+            cost,matches,columns=previous[j-1]
+            diagonal=(cost+int(known and not equal),matches+int(equal),columns+int(known))
+            cost,matches,columns=previous[j]; deletion=(cost+1,matches,columns+int(x in "ACGT"))
+            cost,matches,columns=current[j-1]; insertion=(cost+1,matches,columns+int(y in "ACGT"))
+            current.append(min((diagonal,deletion,insertion),key=lambda entry:(entry[0],-entry[1],entry[2])))
+        previous=current
+    _,same,compared=previous[-1]; end_count=sum(x in "ACGT" for x in ends); same+=end_count; compared+=end_count
+    return None if not compared else {"identity":same/compared,"identical_positions":same,"aligned_positions":compared,"identity_method":"reconstructed_global_edit_alignment"}
+
+
+def consensus_locus(seqs: dict[str,str], locus: dict[str,str], chain: Path) -> str:
+    """Lift reference CDS endpoints through the bcftools consensus chain."""
+    start=int(locus["cds_start"])-1; end=int(locus["cds_end"]); chrom=locus["assembly_scaffold"]
+    blocks=[]; active=False; target=query=0
+    for line in chain.read_text().splitlines():
+        fields=line.split()
+        if not fields: continue
+        if fields[0]=="chain":
+            active=fields[2]==chrom; target=int(fields[5]); query=int(fields[10]); continue
+        if not active: continue
+        size=int(fields[0]); blocks.append((target,target+size,query,query+size))
+        target+=size; query+=size
+        if len(fields)==3:
+            dt,dq=map(int,fields[1:]); blocks.append((target,target+dt,query,query+dq)); target+=dt; query+=dq
+    def lift(pos: int) -> int:
+        for a,b,c,d in blocks:
+            if a<=pos<=b: return c+min(pos-a,d-c)
+        raise ValueError(f"CDS coordinate {chrom}:{pos} is outside consensus chain")
+    lifted={**locus,"cds_start":str(lift(start)+1),"cds_end":str(lift(end))}
+    return _slice(seqs,lifted)
+
+
+def spans_junction(match: dict[str,object], offset: int, anchor: int=50) -> bool:
+    """Require a contiguous aligned block on both sides; a gapped flank join is insufficient."""
+    import re
+    pos=int(match["reference_start"])
+    for length,op in re.findall(r"(\d+)([MIDNSHP=X])",str(match.get("alignment_cigar",""))):
+        length=int(length)
+        if op in "M=X" and pos<=offset-anchor and pos+length>=offset+anchor: return True
+        if op in "MDN=X": pos+=length
+    return False
+
+
+def locus_coverage(bam: Path,loci: list[dict[str,str]],outdir: Path,min_mapq: int) -> dict[tuple,dict[str,float]]:
+    """Measure all CDSs in two streamed BAM passes, including overlapping CDSs."""
+    import bisect, re
+    regions={}
+    for row in loci:
+        key=(row['assembly_scaffold'],int(row['cds_start']),int(row['cds_end']))
+        regions[key]={"mapped_reads":0,"ambiguous_mapped_reads":0,"covered":0,"depth_sum":0}
+    if not regions: return {}
+    by_contig={}
+    for key in sorted(regions): by_contig.setdefault(key[0],[]).append(key)
+    indices={}
+    for chrom,keys in by_contig.items():
+        maxima=[]; maximum=0
+        for _,start,end in keys: maximum=max(maximum,end); maxima.append(maximum)
+        indices[chrom]=([k[1] for k in keys],maxima,keys)
+    def overlapping(chrom,start,end):
+        if chrom not in indices: return
+        starts,maxima,keys=indices[chrom]; i=bisect.bisect_right(starts,end)-1
+        while i>=0 and maxima[i]>=start:
+            if keys[i][2]>=start: yield keys[i]
+            i-=1
+    bed=outdir/'cds_regions.bed'
+    bed.write_text(''.join(f'{chrom}\t{start-1}\t{end}\n' for chrom,start,end in regions))
+    commands=[['samtools','depth','-d','0','-G','2048','-Q',str(min_mapq),'-b',str(bed),str(bam)],['samtools','view','-M','-L',str(bed),'-F','1540',str(bam)]]
+    for mode,command in enumerate(commands):
+        with subprocess.Popen(command,stdout=subprocess.PIPE,text=True) as process:
+            assert process.stdout is not None
+            for line in process.stdout:
+                fields=line.rstrip().split('\t')
+                if mode==0:
+                    chrom,pos,depth=fields[:3]; pos=int(pos); depth=int(depth)
+                    for key in overlapping(chrom,pos,pos): regions[key]['covered']+=int(depth>0); regions[key]['depth_sum']+=depth
+                else:
+                    flag=int(fields[1]); chrom=fields[2]; start=int(fields[3]); mapq=int(fields[4])
+                    span=sum(int(n) for n,op in re.findall(r'(\d+)([MIDNSHP=X])',fields[5]) if op in 'MDN=X')
+                    kind='mapped_reads' if mapq>=min_mapq and not flag&2304 else 'ambiguous_mapped_reads'
+                    for key in overlapping(chrom,start,start+span-1): regions[key][kind]+=1
+            status=process.wait()
+        if status: raise subprocess.CalledProcessError(status,command)
+    for (_,start,end),values in regions.items():
+        values['breadth']=values.pop('covered')/(end-start+1); values['mean_depth']=values.pop('depth_sum')/(end-start+1)
+    return regions

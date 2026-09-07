@@ -29,7 +29,7 @@ def _paired_ubam_flagstat(mapped: int = 0) -> dict[str,dict[str,int | float | No
     return {"QC-passed reads":passed,"QC-failed reads":failed}
 
 class CleanGeneCoreTests(unittest.TestCase):
-    def test_coverage_uses_prefiltered_bam_without_mapq_option(self):
+    def test_coverage_filters_retained_bam_by_mapq(self):
         result=subprocess.CompletedProcess(
             ["samtools","coverage","reads.bam"],
             0,
@@ -38,7 +38,7 @@ class CleanGeneCoreTests(unittest.TestCase):
         )
         with patch("cleangene.evidence.subprocess.run",return_value=result) as runner:
             self.assertEqual(coverage(Path("reads.bam"),20),{})
-        runner.assert_called_once_with(["samtools","coverage","reads.bam"],check=True,capture_output=True,text=True)
+        runner.assert_called_once_with(["samtools","coverage","-q","20","--ff","3844","reads.bam"],check=True,capture_output=True,text=True)
 
     def test_organism_results_index_links_complete_isolate_directories(self):
         with tempfile.TemporaryDirectory() as d:
