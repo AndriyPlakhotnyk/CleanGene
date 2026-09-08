@@ -1,11 +1,23 @@
 # CleanGene
 
-CleanGene is a Slurm-native bacterial isolate workflow for read QC, assembly,
-annotation, pangenome construction, read-backed gene validation, and cohort QC.
+**Read-supported bacterial pangenomes, from sequencing reads to gene-level evidence.**
 
-## Installation and update
+CleanGene combines read and assembly quality control, annotation, Panaroo pangenome
+construction, and read-backed gene validation. It produces a binary gene
+presence/absence matrix alongside evidence that distinguishes supported genes,
+partial homologs, divergent variants, ambiguous mappings, and unresolved calls.
 
-The supported ARC installation is:
+Run cohorts through Slurm or use local execution for smaller analyses. Both modes
+use the same validation and arbitration logic.
+
+[Installation](#installation) · [Quick start](#quick-start) · [Pipeline](#pipeline) ·
+[Gene decisions](#gene-presence-and-absence-decisions) · [Arguments](#command-line-arguments) ·
+[Outputs](#outputs)
+
+## Installation
+
+Requirements: Linux, Git, and a working Miniforge/Mambaforge installation providing
+`mamba`. Slurm is required only for the Slurm execution profile.
 
 ```bash
 git clone https://github.com/AndriyPlakhotnyk/CleanGene.git
@@ -14,432 +26,297 @@ bash scripts/install_or_update.sh
 conda activate cleangene
 ```
 
-For an existing checkout:
+The installer creates or updates the bioinformatics environments, installs
+CleanGene from the checkout, and verifies its tools. CheckM2 runs through an
+automatically managed companion environment. Installing the Python package alone
+with `pip` does not install the external bioinformatics tools.
+
+To update your current branch:
 
 ```bash
-git pull
+git pull --ff-only
 bash scripts/install_or_update.sh
 conda activate cleangene
 ```
 
-The script creates missing environments, updates existing environments in
-place, installs the current checkout, preserves an existing local config, and
-runs deployment checks. To remove and rebuild both managed environments:
+## Quick start
+
+### 1. Configure the run
+
+The installer creates `config/cleangene.arc.local.env` from the supplied Slurm
+template without overwriting an existing local file. Set `SLURM_ACCOUNT` and
+`SLURM_PARTITION` for your cluster, and adjust resource requests as needed.
 
 ```bash
-bash scripts/install_or_update.sh --recreate
-conda activate cleangene
-```
-
-CheckM2 is isolated in a companion environment because its TensorFlow and
-DIAMOND dependencies conflict with parts of the primary bioinformatics
-toolchain. CleanGene creates and calls that environment automatically. Do not
-activate it or configure its executable during normal use.
-
-`pip install .` and `pip install -e .` install only the CleanGene Python
-package. They do not install Shovill, SPAdes, Prokka, Panaroo, Kraken2, CheckM2,
-or the other required bioinformatics tools. Use the setup script for a complete
-installation.
-
-## ARC configuration
-
-The setup script creates `config/cleangene.arc.local.env` from the tracked
-`config/cleangene.arc.env` template only when the local file is absent. It never
-overwrites an existing local config.
-
-Edit site-specific values in the ignored local file, then verify them:
-
-```bash
-vi config/cleangene.arc.local.env
 cleangene doctor --config config/cleangene.arc.local.env
 ```
 
-Leave `CHECKM2_EXECUTABLE`, `CHECKM2_DB`, `CHECKM2_DATABASE_ROOT`, and
-`KRAKEN2_DB` blank for automatic software and database management. Set
-`CLEANGENE_DATABASE_ROOT` only when managed databases should live on a shared
-filesystem outside the checkout. Keep account names, private paths, and other
-site-specific values out of the tracked template.
+Managed databases are downloaded when needed and reused. Set
+`CLEANGENE_DATABASE_ROOT` to place them on a shared filesystem; use `KRAKEN2_DB`
+or `CHECKM2_DB` to select an existing database explicitly.
 
-## Execution model
+### 2. Prepare a manifest
 
-`cleangene run` is intentionally a thin launcher:
+Use a tab-separated file with one row per isolate. The example below contains
+paired FASTQ paths and an explicit analysis group:
 
-```text
-cleangene run
-    -> fast local submission
-    -> SLURM cg-controller
-    -> one global preflight
-    -> cg-kraken_db_setup / cg-checkm2_db_setup when required
-    -> daughter arrays
+```tsv
+isolate_id	group_id	R1	R2
+isolate_01	species_A	/data/isolate_01_R1.fastq.gz	/data/isolate_01_R2.fastq.gz
+isolate_02	species_A	/data/isolate_02_R1.fastq.gz	/data/isolate_02_R2.fastq.gz
 ```
 
-The interactive launcher parses config syntax and manifest structure, creates
-the run directory, records launcher timing, submits the controller, and returns
-to your shell. The controller performs lightweight input-file metadata checks,
-QC profile resolution, and indexed task-store construction once before daughter
-arrays are submitted. CheckM2 runtime verification and Kraken2 database
-download/build work run in dedicated setup jobs, using the `CHECKM2_*` and
-`KRAKEN2_DB_*` resources rather than the controller allocation. Daughter tasks
-then load only their indexed isolate or group record plus run-level config, with
-minimal per-task input checks. This keeps submission fast for cohorts up to tens
-of thousands of isolates while keeping the controller at orchestration scale.
+Use groups of biologically comparable isolates. Pangenome analysis requires at
+least two retained isolates per group.
 
-## CheckM2 Workflows
+| Column | Purpose |
+| --- | --- |
+| `isolate_id` | Unique sample identifier. |
+| `R1`, `R2` | Paired FASTQ inputs; compressed FASTQs are supported. |
+| `raw_bam` | Alternative to `R1`/`R2`: a paired, unmapped sequencing BAM containing both mates. |
+| `group_id` | Explicit pangenome group. |
+| `organism` | Defines the group when `group_id` is absent. Without either field, Kraken2 determines grouping. |
+| `assembly`, `gff` | Reusable assembly and annotation artifacts. |
+| `pangenome_dir` | Existing Panaroo output to use instead of generating a new pangenome. |
 
-For a fast main pipeline that never runs CheckM2, DIAMOND, CheckM2 database
-discovery, or CheckM2 companion-environment checks, launch with:
+Provide either paired FASTQs or a uBAM for each isolate. Optional reuse fields
+include `reads_processed`, `fastp_json`, `kraken_report`, `protein_fasta`, and
+`checkm2_report`.
 
-```bash
-cleangene run --manifest manifest.tsv --analysis-root . --ignore-checkm2
-```
-
-In this mode, Kraken2 taxonomy/contamination, read quality, coverage, assembly
-metrics, and Prokka/GFF success still determine pangenome admission. CheckM2
-completeness and CheckM2 contamination are intentionally not evaluated, remain
-blank in isolate QC, and do not turn an otherwise clean isolate into a warning.
-
-Full CheckM2-gated mode remains available with `CHECKM2_MODE=required`. In that
-mode, CleanGene submits a dedicated `cg-checkm2_db_setup` job using
-`CHECKM2_CPUS`, `CHECKM2_MEM`, and `CHECKM2_TIME`, then runs per-isolate
-CheckM2 prediction inside preprocess with `CHECKM2_PREDICT_CPUS`.
-
-To evaluate assemblies later without changing the already-built pangenome:
-
-```bash
-cleangene utils checkm2 --run-dir <run>
-```
-
-The post-hoc utility writes `results/utils/<analysis_id>/checkm2/checkm2_qc.tsv`
-and enriches `results/cohort/isolate_qc.tsv` with CheckM2 values plus
-`PASS/FAIL_with_checkm2` and `Notes_with_checkm2`. Original `PASS/FAIL`,
-`Notes`, `excluded`, `reason`, and Panaroo membership are preserved.
-
-## Manifest
-
-A minimal paired-FASTQ manifest is tab separated:
-
-```text
-isolate_id  group_id  R1                    R2
-ERR001      sp00001   /data/r1.fastq.gz     /data/r2.fastq.gz
-```
-
-One paired, unmapped sequencing BAM (uBAM) is accepted per sample instead of
-the two FASTQ files. The canonical column is `raw_bam`; `ubam`, `uBAM`,
-`unaligned_bam`, `BAM`, and `bam` are accepted aliases:
-
-```text
-isolate_id  group_id  raw_bam
-ERR001      sp00001   /data/raw_reads.bam
-```
-
-Each uBAM must contain both mates as unmapped records with balanced READ1 and
-READ2 flags. CleanGene validates it with `samtools flagstat`, name-collates it,
-and extracts complete pairs to run-local compressed FASTQs. Supplying both a
-uBAM and `R1`/`R2` for one sample is an error.
-
-Grouping behavior:
-
-- A supplied `group_id` is used directly.
-- With no `group_id`, a supplied `organism` defines the group.
-- With neither value, Kraken2 identifies the top species and defines the group.
-- A supplied `pangenome_dir` skips pangenome generation and validates against
-  that existing Panaroo output.
-
-Reusable artifact columns include `reads_processed`,
-`read_processing_pipeline`, `read_processing_version`, `read_qc_tsv`,
-`fastp_json`, `kraken_report`, `assembly`, `gff`, `protein_fasta`,
-`checkm2_report`, `expected_genome_size`, `prodigal_training_file`, and
-`pangenome_dir`.
-
-## Dry run
+### 3. Launch
 
 ```bash
 cleangene run \
-    --manifest input/manifest.tsv \
-    --analysis-root /path/to/cleangene-output \
-    --config config/cleangene.arc.local.env \
-    --profile slurm \
-    --dry-run
+  --profile slurm \
+  --manifest input/cohort.manifest.tsv \
+  --analysis-root /data/cleangene-analysis \
+  --config config/cleangene.arc.local.env \
+  --assembler spades \
+  --compress-assembly-outputs intermediates \
+  --compress-annotation-outputs nonessential
 ```
 
-The dry run prints the `sbatch` commands without submitting jobs.
+This submits a controller job and returns to the shell. Add `--ignore-checkm2`
+to omit CheckM2 completeness and contamination assessment. Other QC criteria
+remain active.
 
-## Run
+For a small local analysis, use `--profile local`. For a Slurm submission preview,
+add `--dry-run`; it creates run metadata and prints the controller submission
+command without submitting jobs. **Dry-run is a Slurm option; do not use it to
+preview local execution.**
 
-```bash
-cleangene run \
-    --manifest input/manifest.tsv \
-    --analysis-root /path/to/cleangene-output \
-    --config config/cleangene.arc.local.env
+## Pipeline
+
+```mermaid
+flowchart TD
+    A["Manifest: paired FASTQs or uBAM"] --> B{"Execution profile"}
+    B -->|Slurm| C["Submit controller and stage arrays"]
+    B -->|Local| D["Run stages locally"]
+    C --> E["Preflight and required database setup"]
+    D --> E
+    E --> F["Read QC and processing; Kraken2 taxonomy"]
+    F --> G["Assembly and annotation; CheckM2 when enabled"]
+    G --> H{"Isolate QC"}
+    H -->|FAIL| X["Record exclusion and QC evidence"]
+    H -->|PASS or WARNING| I["Resolve retained analysis groups"]
+    I --> J["Run Panaroo or load supplied Panaroo output"]
+    J --> K["Prepare gene references and sample CDS coordinates"]
+    K --> L["Map reads to own assembly and pangenome references"]
+    L --> M["Classify gene evidence"]
+    M --> N{"Discordance or unresolved assignment?"}
+    N -->|Yes| O["Bounded targeted reconstruction and arbitration"]
+    N -->|No| P["Combine gene calls"]
+    O --> P
+    P --> Q["Binary matrices, evidence tables, and cohort summaries"]
 ```
 
-CleanGene resolves and records runtime executables and database paths before
-or during their dedicated setup stages. Missing managed databases are prepared
-once and reused by every isolate and later run.
+The diagram shows stage dependencies. Slurm may overlap independent samples and
+groups. Existing artifacts can bypass their corresponding preparation stages.
 
-## Resume and monitoring
+Isolates receive `PASS`, `WARNING`, or `FAIL` QC status. Warnings remain eligible
+for downstream analysis; failures are excluded. QC includes taxonomy, read
+quality, sequencing coverage, assembly quality, annotation success, and CheckM2
+when enabled. Thresholds can be configured globally or through QC profiles and
+per-isolate manifest overrides.
+
+## Gene presence and absence decisions
+
+Panaroo supplies the initial calls. Initial positives are evaluated at their
+sample-specific CDS coordinates using reads mapped to the isolate's own assembly.
+Initial negatives are searched against pangenome references to recover genes
+missed by assembly or annotation. Missing CDS coordinates also require the
+reference-search fallback.
+
+```mermaid
+flowchart TD
+    A{"Initial Panaroo call"} -->|Present| B["Own-assembly CDS support"]
+    A -->|Absent| C["Pangenome reference search"]
+    B --> D["Evaluate breadth, depth, consensus identity, and mapping ambiguity"]
+    C --> D
+    D --> E{"Family supported but exact assignment unresolved?"}
+    E -->|Yes| F["ambiguous_multimap"]
+    E -->|No| G["Classify sequence evidence using configured thresholds"]
+    G --> H["confirmed_present or divergent_variant: call 1"]
+    G --> I["possible_truncation: retain initial positive provisionally"]
+    G --> J["partial_homolog: intact-gene call 0"]
+    G --> K["not_detected or insufficient_evidence"]
+    F --> L["Arbitrate discordant and unresolved cases"]
+    I --> L
+    J -->|Initial positive| L
+    K -->|Initial positive| L
+    H -->|Recovered initial negative| L
+    L --> M{"Targeted reconstruction outcome"}
+    M -->|Supported deletion junction| N["confirmed_absent_locus: call 0"]
+    M -->|Resolved candidate sequence| O["Update call and evidence state"]
+    M -->|Unresolved or case limit reached| P["Retain evidence and mark unresolved or deferred"]
+    K -->|Initial negative with no evidence| Q["not_detected: call 0; absence not proven"]
+```
+
+The flowchart summarizes routing. The evidence table below defines the primary
+states; arbitration can refine a provisional decision.
+
+| Evidence state | Default interpretation | Binary treatment |
+| --- | --- | --- |
+| `confirmed_present` | Breadth ≥95%, identity ≥95%, and sufficient depth. | `1` |
+| `divergent_variant` | Breadth ≥90%, identity ≥90% but <95%, and sufficient depth. | `1`, flagged as divergent |
+| `possible_truncation` | Breadth ≥70% but <95%, identity ≥95%, and sufficient depth. | Initial positive remains provisionally `1`; otherwise unresolved |
+| `partial_homolog` | Partial coverage or weak sequence similarity does not support an intact gene. | `0`, with evidence retained |
+| `ambiguous_multimap` | Reads support a family but cannot resolve the exact cluster. | Unresolved; no automatic presence for every homolog |
+| `not_detected` | No meaningful read evidence. | Initial negative stays `0`; initial positive requires arbitration |
+| `insufficient_evidence` | Depth or reconstructed identity is insufficient for a decision. | Unresolved; preserve the initial binary call unless resolved |
+| `confirmed_absent_locus` | A local reconstruction supports a deletion junction spanning both flanks. | `0`, with physical absence evidence |
+
+**Zero unique mappings do not prove biological absence.** Unresolved validated
+calls can be blank in the evidence table. When no resolved replacement exists,
+the binary matrix preserves the initial call; consult the evidence table when
+interpreting that value. `partial_homolog` and `confirmed_absent_locus` both permit
+an intact-gene call of zero but describe different biology.
+
+Identity is measured from reconstructed sequence rather than average read
+alignment identity. Own-locus identity uses the sample CDS as its reference;
+recovery uses the pangenome reference. Normalized depth is gene depth divided by
+a representative sample depth estimate and is supporting evidence, not a universal
+presence threshold.
+
+## Command-line arguments
+
+Run `cleangene run --help` for the complete CLI reference. Configuration values
+apply unless overridden by a command-line option.
+
+| Argument | Values / default | Purpose |
+| --- | --- | --- |
+| `--manifest` | TSV path | Sample inputs; required for a new run. |
+| `--analysis-root` | Directory | Parent directory for `runs/<run-id>/`. Required by `run`. |
+| `--config` | Environment-style file | QC, database, and execution settings. |
+| `--profile` | `slurm` (default), `local` | Execution backend. |
+| `--assembler` | `shovill` (built-in default), `spades`, `off` | Assembly strategy; `off` skips assembly and annotation. |
+| `--ignore-checkm2` | Flag | Skip CheckM2 assessment during the run. |
+| `--skip-trim` | Flag | Bypass fastp trimming. |
+| `--compress-assembly-outputs` | `off`, `intermediates`, `all` | Assembly storage policy; built-in default is `off`. |
+| `--compress-annotation-outputs` | `off`, `nonessential` | Annotation storage policy; built-in default is `off`. |
+| `--cleanup-trimmed-fastq` | Flag | Enable final cleanup of retained trimmed FASTQs. |
+| `--run-id` | Identifier | Set a run name instead of the generated timestamp. |
+| `--resume` | Existing run ID | Resume a run under the analysis root. |
+| `--dry-run` | Flag, Slurm profile | Print submission command without submitting. |
+| `--cancel-active` | Flag, resume | Cancel active jobs associated with the run before resubmission. |
+
+Direct SPAdes mode uses original paired reads with `--only-assembler`. Choose
+Shovill when you want its assembly preparation workflow.
+
+### Validation settings
+
+Set these in your config file. Breadth and identity thresholds use fractions
+between zero and one, not percentages.
+
+| Setting | Built-in default | Purpose |
+| --- | --- | --- |
+| `VALIDATION_SCOPE` | `all` | Validate all genes; `accessory` and `differential` restrict selection. |
+| `READ_VALIDATION_MIN_BREADTH` | `0.95` | Confirmed-presence breadth. |
+| `READ_VALIDATION_MIN_IDENTITY` | `0.95` | Confirmed-presence sequence identity. |
+| `READ_VALIDATION_MIN_MEAN_DEPTH` | `5` | Minimum mean depth for sequence-based calls. |
+| `READ_VALIDATION_MIN_MAPQ` | `20` | High-confidence mapping threshold. |
+| `READ_VALIDATION_TRUNCATION_MIN_BREADTH` | `0.70` | Lower breadth threshold for possible truncation. |
+| `READ_VALIDATION_DIVERGENT_MIN_BREADTH` | `0.90` | Minimum divergent-variant breadth. |
+| `READ_VALIDATION_DIVERGENT_MIN_IDENTITY` | `0.90` | Minimum divergent-variant identity. |
+| `READ_VALIDATION_ARBITRATION_MAX_CASES` | `20` | Maximum reconstruction cases per isolate. |
+| `READ_VALIDATION_ARBITRATION_MAX_READS` | `100000` | Maximum recruited read names per reconstruction. |
+| `READ_VALIDATION_ARBITRATION_MEMORY_GB` | `12` | SPAdes memory cap for reconstruction. |
+| `READ_VALIDATION_FLANK_LENGTH` | `500` | Flanking bases used for locus investigation. |
+| `READ_VALIDATION_DELETION_MIN_IDENTITY` | `0.95` | Minimum junction sequence identity. |
+| `READ_VALIDATION_DELETION_MIN_ANCHOR` | `50` | Contiguous aligned bases on each side of the junction. |
+
+Use `SLURM_PREPROCESS_MAX_INFLIGHT`, `SLURM_VALIDATION_MAX_INFLIGHT`, and
+`SLURM_ARBITRATION_MAX_INFLIGHT` to control concurrency. Stage-specific CPU,
+memory, and time requests are available in the
+[Slurm configuration template](config/cleangene.arc.env). The
+[example config](config/cleangene.example.env) and
+[default settings](src/cleangene/defaults.py) list additional controls, including
+QC thresholds and database management.
+
+## Outputs
+
+Each run is stored beneath `<analysis-root>/runs/<run-id>/`.
+
+| Location within a run | Contents |
+| --- | --- |
+| `results/groups/<group>/cleaned_pangenome.tsv` | Final binary gene presence/absence matrix. |
+| `results/groups/<group>/03_read_validation/gene_call_evidence.long.tsv` | Initial/final calls, evidence states, resolution, and arbitration details. |
+| `results/groups/<group>/03_read_validation/read_validation_metrics.tsv` | Coverage, depth, normalized depth, identity, reconstruction lengths, mappings, and CDS coordinates. |
+| `results/sample_data/<isolate>/` | Per-isolate QC and processing artifacts. |
+| `results/cohort/` | Cohort QC and summaries. |
+| `provenance/` | Manifest, resolved configuration, and runtime metadata. |
+| `logs/slurm/` | Controller and stage job logs. |
+
+Keep the evidence tables with the binary matrix. They identify provisional calls,
+family-only evidence, partial homologs, and supported deletions that a binary value
+cannot express.
+
+## Resume and monitor
 
 ```bash
 cleangene resume \
-    --run-dir /path/to/cleangene-output/runs/<run-id> \
-    --config config/cleangene.arc.local.env
+  --run-dir /data/cleangene-analysis/runs/<run-id> \
+  --config config/cleangene.arc.local.env
 ```
 
-Alternatively, use `cleangene run --analysis-root ... --resume <run-id>`.
-Completed state markers, resolved database paths, and the resolved CheckM2
-executable are retained.
+Completed work is reused where its completion checks pass. Resume reconciles
+preprocessing outputs and reruns incomplete or invalidated stages. For local
+resumption, use `cleangene run --profile local --analysis-root ... --resume <run-id>`.
+Use a new run when changing biological thresholds.
 
-Monitor jobs with `squeue -j <job-id>`. Controller and stage logs are under
-`<run>/logs/slurm/`; per-isolate Slurm logs are grouped in
-`logs/slurm/preprocess/` and `logs/slurm/validate/`. CheckM2 stdout, stderr, and
-elapsed prediction time are recorded with each isolate's preprocess logs.
-
-On resume, CleanGene reconciles missing preprocess markers against terminal
-`results/sample_data/*/qc.tsv` outputs before submitting work. Ambiguous,
-malformed, or incomplete evidence fails closed. Audit or repair markers with:
+Monitor Slurm jobs with `squeue -j <job-id>` and inspect the run's controller and
+stage logs. To audit missing preprocessing completion markers:
 
 ```bash
-cleangene reconcile-preprocess --run-dir /path/to/run
-cleangene reconcile-preprocess --run-dir /path/to/run --apply --require-all
+cleangene reconcile-preprocess --run-dir /data/cleangene-analysis/runs/<run-id>
 ```
 
-Before downstream pangenome work starts, exclude isolates without changing
-manifest row indices:
+## Downstream analysis
+
+`cleangene utils` provides sample selection, differential gene analysis, operon
+analysis, read-backed variants, iTOL exports, and post-hoc CheckM2 assessment.
+See the [utilities guide](docs/UTILS.md) for commands and output descriptions.
+
+## Interpretation and scope
+
+Local reconstruction is limited to discordant cases. Exact allele resolution
+among highly similar homologs can remain unresolved, and automatic transfer of
+flanking loci from other isolates is not currently implemented. ORF checks are
+basic; normalized depth uses an assembly-based chromosomal proxy. Cohort-scale
+performance depends on reference complexity, coverage, and available resources.
+
+## Testing
+
+With the CleanGene environment active:
 
 ```bash
-cleangene exclude --run-dir /path/to/run --samples-file unwanted_samples.txt
+bash tests/run_tests.sh
 ```
 
-## Scientific and QC details
+The suite covers classification, local and Slurm orchestration, resume, QC, and
+storage behavior. Synthetic-read integration tests exercise mapping, recovery,
+local assembly, and deletion-junction detection when their tools are available.
 
-CleanGene classifies each isolate as `PASS`, `WARNING`, or `FAIL`. Boundary
-values belong to the less severe state.
+## License
 
-| Metric | PASS | WARNING | FAIL/exclude |
-|---|---|---|---|
-| Expected organism | Kraken top species matches | Classification unavailable | Top species differs |
-| Kraken foreign-species contamination | `<=5%` | None | `>5%` |
-| CheckM2 completeness | `>=90%` | `>=80%` and `<90%` | `<80%` |
-| CheckM2 contamination | `<=5%` | `>5%` and `<=10%` | `>10%` |
-| Assembly contigs | `<=300` | `301-1000` | `>1000` |
-| Assembly N50 | `>=25000 bp` | `5000-24999 bp` | `<5000 bp` |
-| Sequencing coverage | `>=20x` | `>=10x` and `<20x` | `<10x` |
-| Post-processing read length | `>=120 bp` | `<120 bp` | No default hard fail |
-| Post-processing mean base quality | `>=Q30` | `<Q30` | No default hard fail |
-| Internal assembly and Prokka GFF | Both produced | Not evaluated for an external pangenome | Missing or failed |
-| Explicit user exclusion | - | - | `exclude=true` or `user_excluded=true` |
-
-The canonical thresholds are:
-
-```text
-QC_MAX_CONTIGS_PASS=300
-QC_MAX_CONTIGS_FAIL=1000
-QC_MIN_N50_PASS=25000
-QC_MIN_N50_FAIL=5000
-QC_MIN_COVERAGE_PASS=20
-QC_MIN_COVERAGE_FAIL=10
-QC_MIN_READ_LENGTH_PASS=120
-QC_MIN_READ_LENGTH_FAIL=
-QC_MIN_MEAN_BASE_QUALITY_PASS=30
-QC_MIN_MEAN_BASE_QUALITY_FAIL=
-QC_MIN_COMPLETENESS_PASS=90
-QC_MIN_COMPLETENESS_FAIL=80
-QC_MAX_CHECKM2_CONTAMINATION_PASS=5
-QC_MAX_CHECKM2_CONTAMINATION_FAIL=10
-QC_MAX_KRAKEN_CONTAMINATION_FAIL=5
-QC_PROFILE_FILE=
-```
-
-Blank read-length and mean-quality fail thresholds make those criteria
-warning-only. Numeric fail thresholds enable normal PASS, WARNING, and FAIL
-bands. Every global threshold has a matching lowercase manifest override.
-Blank manifest cells inherit lower-priority values.
-
-`QC_PROFILE_FILE` accepts a TSV with `scope_type`, `scope_value`, and lowercase
-threshold columns. Precedence is per-isolate manifest override, matching group
-profile, matching organism profile, global config, then built-in default.
-Resolved thresholds are copied into run provenance.
-
-`trimmed_read_length` is the smaller mean R1/R2 length. `mean_base_quality` is
-the weighted mean Phred score across all bases. `sequencing_coverage` is total
-post-processing read bases divided by assembly length. CheckM2 values come from
-`quality_report.tsv`. WARNING isolates continue downstream; FAIL isolates are
-excluded.
-
-## Advanced configuration
-
-### Runtime architecture
-
-```text
-cleangene environment
-    ├── Shovill / SPAdes
-    ├── Prokka
-    ├── Panaroo
-    ├── BWA / samtools / bcftools
-    ├── Kraken2
-    └── CleanGene
-             |
-             └── automatically calls
-                 cleangene-checkm2/checkm2
-                         |
-                         └── shared managed CheckM2 DB
-```
-
-The CheckM2 executable is resolved inside the `cg-checkm2_db_setup` job, not on
-the login node and not inside the lightweight controller preflight. Resolution
-honors an explicit `CHECKM2_EXECUTABLE`, then `PATH`, an executable beside the
-active Python, and finally the sibling `cleangene-checkm2` environment. The
-absolute executable and version are stored in `provenance/resolved_config.json`
-and used for database download, setup smoke tests, and prediction. The version
-probe allows up to five minutes because the first TensorFlow import can be slow
-on HPC systems.
-
-With normal settings, `checkm2_db_setup` reuses
-`CheckM2_database/uniref100.KO.1.dmnd` below the managed root or downloads it
-once under an inter-process lock. Download uses the resolved companion
-executable with `--no_write_json_db`; prediction always supplies
-`--database_path` and the cleanup option supported by the installed CheckM2
-`predict --help` output. CleanGene prefers the pinned CheckM2 spelling
-`--remove_intermediates`. Before any preprocess arrays
-start, the setup job runs CheckM2's bundled `testrun` once for each executable,
-version, command schema, predict CLI capability, and database combination, then
-runs a real one-genome production-form `predict` smoke test against a bundled
-CheckM2 test genome. Successful verification is recorded beside the managed
-database and reused by later runs. An invalid explicit `CHECKM2_DB` fails
-closed.
-
-`CHECKM2_CPUS`, `CHECKM2_MEM`, and `CHECKM2_TIME` size the dedicated
-`cg-checkm2_db_setup` job, including `testrun` and the production-form smoke
-test. `KRAKEN2_DB_CPUS`, `KRAKEN2_DB_MEM`, and `KRAKEN2_DB_TIME` size the
-dedicated `cg-kraken_db_setup` job. Per-isolate CheckM2 prediction runs inside
-preprocess and uses `CHECKM2_PREDICT_CPUS`, which defaults
-to one because CleanGene already parallelizes samples.
-`CHECKM2_MAX_INFLIGHT` bounds concurrent CheckM2 processes across a run. BLAS
-and TensorFlow helper pools are also held to one thread to avoid multiplying
-the Slurm allocation. Set `CHECKM2_LOWMEM=true` explicitly on constrained-memory
-systems to add CheckM2's `--lowmem` option to setup smoke tests and per-isolate
-prediction; CleanGene does not silently retry in low-memory mode. A supplied
-`checkm2_report` remains reusable.
-`CHECKM2_MODE=off` is supported and records an informational QC note because
-completeness and CheckM2 contamination were intentionally not evaluated.
-
-The `cleangene-checkm2` environment is an internal companion environment managed
-by `scripts/install_or_update.sh`. Normal users should update from the checkout
-with:
-
-```bash
-git pull
-bash scripts/install_or_update.sh
-conda activate cleangene
-```
-
-After updating code during an interrupted ARC run, resume with the normal
-`cleangene resume --run-dir ... --config ...` command. CleanGene refreshes
-`provenance/runtime.json`, refuses to submit if old CleanGene jobs still point
-at the same run directory, preserves completed preprocess outputs, and reruns
-only incomplete preprocess tasks.
-
-### Managed Kraken2 databases
-
-With `KRAKEN2_DB=""`, CleanGene manages `kraken2_<size>` below
-`CLEANGENE_DATABASE_ROOT` or the checkout's `databases/` directory. Supported
-sizes are `standard-8`, `standard-16`, and `standard`. A valid database contains
-non-empty `hash.k2d`, `opts.k2d`, and `taxo.k2d`. Setup is locked and shared
-across runs.
-
-`KRAKEN2_DATABASE_ROOT` overrides only the Kraken2 parent. `KRAKEN2_DB` is an
-exact custom database override. `CHECKM2_DATABASE_ROOT` and `CHECKM2_DB` provide
-the corresponding CheckM2-specific overrides.
-
-### Preprocessing modes
-
-`--assembler shovill` is the default. `--assembler spades` runs direct SPAdes
-with original untrimmed paired reads and `--only-assembler`. `--assembler off`
-or legacy `--skip_shovill` performs read/Kraken QC without assembly or
-annotation. `--skip_trim` bypasses fastp while retaining assembly.
-
-Storage controls:
-
-```text
-COMPRESS_ASSEMBLY_OUTPUTS=off|intermediates|all
-COMPRESS_ANNOTATION_OUTPUTS=off|nonessential
-CLEANUP_TRIMMED_FASTQ=false|true
-```
-
-Cleanup can also be run after completion:
-
-```bash
-cleangene cleanup --run-dir /path/to/run --dry-run
-cleangene cleanup --run-dir /path/to/run
-```
-
-Original input files are never modified.
-
-### Scale and outputs
-
-The ARC template maintains rolling, capacity-aware arrays and prioritizes known
-groups from smallest to largest. New runs use an indexed isolate task store so
-workers seek directly to their manifest records. Job-count and optional CPU
-headroom controls prevent oversubmission.
-
-Final group matrices are written to
-`results/groups/<group>/cleaned_pangenome.tsv`. Sample-specific outputs live in
-`results/sample_data/<isolate>/`. `results/organisms/<organism>/<isolate>` is a
-storage-free symlink index into sample data. Cohort summaries are under
-`results/cohort/`.
-
-### Locus-aware read validation
-
-Panaroo supplies the initial binary calls. For each retained isolate, CleanGene
-maps reads once to that isolate's assembly and measures Panaroo-positive CDSs at
-their GFF coordinates. A second competitive pangenome mapping searches for
-Panaroo-negative genes and retains both unique and ambiguous alignments. The
-assembly and pangenome BAMs are reused across every gene in the isolate.
-
-Evidence is reported as `confirmed_present`, `possible_truncation`,
-`divergent_variant`, `partial_homolog`, `ambiguous_multimap`, `not_detected`, or
-`insufficient_evidence`. Discordant rows pass through the resume-safe
-`arbitrate` stage. It uses an evidence hierarchy and never treats zero unique
-mappings as proof of absence; a `confirmed_absent_locus` call is reserved for a
-read-supported deletion junction. Unresolved absence and family-only cases keep
-the initial binary call and remain explicitly flagged; partial homologs retain
-an intact-gene call of zero without claiming a demonstrated deletion.
-
-Arbitration recruits target-overlapping read names plus their retained mates
-from the existing BAM, runs a bounded local SPAdes assembly, and compares the
-result to the candidate and, when sample coordinates exist, the flank-to-flank
-deletion junction. At most `READ_VALIDATION_ARBITRATION_MAX_CASES` discordances
-are reconstructed per isolate; excess cases are marked `deferred_limit` rather
-than silently forced to a binary result.
-
-The binary result remains `cleaned_pangenome.tsv`. Rich evidence is available in
-`03_read_validation/read_validation_metrics.tsv` and
-`03_read_validation/gene_call_evidence.long.tsv`, including initial/final calls,
-evidence and sequence-resolution states, breadth, depth, normalized depth,
-consensus identity and lengths, ORF integrity, unique and ambiguous reads, CDS
-coordinates, contig-edge status, and arbitration status/reason.
-
-Thresholds are configured with `READ_VALIDATION_MIN_BREADTH`,
-`READ_VALIDATION_MIN_MEAN_DEPTH`, `READ_VALIDATION_MIN_IDENTITY`,
-`READ_VALIDATION_TRUNCATION_MIN_BREADTH`,
-`READ_VALIDATION_DIVERGENT_MIN_BREADTH`, and
-`READ_VALIDATION_DIVERGENT_MIN_IDENTITY`. Arbitration concurrency and resources
-use `SLURM_ARBITRATION_MAX_INFLIGHT` and the `ARBITRATION_*` settings.
-
-### Local debugging and utilities
-
-Small local tests can use `--profile local`. This does not replace the supported
-ARC installation and is not intended for large cohorts.
-
-Completed runs provide Slurm-native sample queries, differential gene tests,
-operon typing, read-backed variant analysis, and iTOL datasets through
-`cleangene utils`. See [docs/UTILS.md](docs/UTILS.md).
-
-The [validation audit](docs/locus-validation-audit.md) records fixes, tests,
-configuration defaults, local/ARC commands, and current limitations. CDS support
-is measured in two streamed BAM passes. Mapping signatures permit reuse after
-interruption. Daughter reconstruction is additionally bounded by
-`READ_VALIDATION_ARBITRATION_MAX_READS` and
-`READ_VALIDATION_ARBITRATION_MEMORY_GB`; deletion evidence uses
-`READ_VALIDATION_DELETION_MIN_IDENTITY` and
-`READ_VALIDATION_DELETION_MIN_ANCHOR`.
+See [LICENSE](LICENSE).
