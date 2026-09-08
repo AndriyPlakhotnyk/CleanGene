@@ -1,6 +1,6 @@
 # CleanGene
 
-**Read-supported bacterial pangenomes, from sequencing reads to gene-level evidence.**
+**From bacterial sequencing reads to pangenomes you can inspect.**
 
 CleanGene combines read and assembly quality control, annotation, Panaroo pangenome
 construction, and read-backed gene validation. It produces a binary gene
@@ -8,102 +8,16 @@ presence/absence matrix alongside evidence that distinguishes supported genes,
 partial homologs, divergent variants, ambiguous mappings, and unresolved calls.
 
 Run cohorts through Slurm or use local execution for smaller analyses. Both modes
-use the same validation and arbitration logic.
+produce the same types of gene evidence.
 
-[Installation](#installation) · [Quick start](#quick-start) · [Pipeline](#pipeline) ·
-[Gene decisions](#gene-presence-and-absence-decisions) · [Arguments](#command-line-arguments) ·
+| Start with | Analyze | Receive |
+| --- | --- | --- |
+| Paired FASTQs or unmapped BAMs | Read QC, assembly, annotation, and Panaroo | A cleaned gene presence/absence matrix |
+| Existing assemblies or Panaroo results | Locus support and targeted reconstruction | Evidence tables explaining each gene call |
+
+[Pipeline](#pipeline) · [Gene decisions](#gene-presence-and-absence-decisions) ·
+[Installation](#installation) · [Quick start](#quick-start) · [Arguments](#command-line-arguments) ·
 [Outputs](#outputs)
-
-## Installation
-
-Requirements: Linux, Git, and a working Miniforge/Mambaforge installation providing
-`mamba`. Slurm is required only for the Slurm execution profile.
-
-```bash
-git clone https://github.com/AndriyPlakhotnyk/CleanGene.git
-cd CleanGene
-bash scripts/install_or_update.sh
-conda activate cleangene
-```
-
-The installer creates or updates the bioinformatics environments, installs
-CleanGene from the checkout, and verifies its tools. CheckM2 runs through an
-automatically managed companion environment. Installing the Python package alone
-with `pip` does not install the external bioinformatics tools.
-
-To update your current branch:
-
-```bash
-git pull --ff-only
-bash scripts/install_or_update.sh
-conda activate cleangene
-```
-
-## Quick start
-
-### 1. Configure the run
-
-The installer creates `config/cleangene.arc.local.env` from the supplied Slurm
-template without overwriting an existing local file. Set `SLURM_ACCOUNT` and
-`SLURM_PARTITION` for your cluster, and adjust resource requests as needed.
-
-```bash
-cleangene doctor --config config/cleangene.arc.local.env
-```
-
-Managed databases are downloaded when needed and reused. Set
-`CLEANGENE_DATABASE_ROOT` to place them on a shared filesystem; use `KRAKEN2_DB`
-or `CHECKM2_DB` to select an existing database explicitly.
-
-### 2. Prepare a manifest
-
-Use a tab-separated file with one row per isolate. The example below contains
-paired FASTQ paths and an explicit analysis group:
-
-```tsv
-isolate_id	group_id	R1	R2
-isolate_01	species_A	/data/isolate_01_R1.fastq.gz	/data/isolate_01_R2.fastq.gz
-isolate_02	species_A	/data/isolate_02_R1.fastq.gz	/data/isolate_02_R2.fastq.gz
-```
-
-Use groups of biologically comparable isolates. Pangenome analysis requires at
-least two retained isolates per group.
-
-| Column | Purpose |
-| --- | --- |
-| `isolate_id` | Unique sample identifier. |
-| `R1`, `R2` | Paired FASTQ inputs; compressed FASTQs are supported. |
-| `raw_bam` | Alternative to `R1`/`R2`: a paired, unmapped sequencing BAM containing both mates. |
-| `group_id` | Explicit pangenome group. |
-| `organism` | Defines the group when `group_id` is absent. Without either field, Kraken2 determines grouping. |
-| `assembly`, `gff` | Reusable assembly and annotation artifacts. |
-| `pangenome_dir` | Existing Panaroo output to use instead of generating a new pangenome. |
-
-Provide either paired FASTQs or a uBAM for each isolate. Optional reuse fields
-include `reads_processed`, `fastp_json`, `kraken_report`, `protein_fasta`, and
-`checkm2_report`.
-
-### 3. Launch
-
-```bash
-cleangene run \
-  --profile slurm \
-  --manifest input/cohort.manifest.tsv \
-  --analysis-root /data/cleangene-analysis \
-  --config config/cleangene.arc.local.env \
-  --assembler spades \
-  --compress-assembly-outputs intermediates \
-  --compress-annotation-outputs nonessential
-```
-
-This submits a controller job and returns to the shell. Add `--ignore-checkm2`
-to omit CheckM2 completeness and contamination assessment. Other QC criteria
-remain active.
-
-For a small local analysis, use `--profile local`. For a Slurm submission preview,
-add `--dry-run`; it creates run metadata and prints the controller submission
-command without submitting jobs. **Dry-run is a Slurm option; do not use it to
-preview local execution.**
 
 ## Pipeline
 
@@ -197,6 +111,97 @@ alignment identity. Own-locus identity uses the sample CDS as its reference;
 recovery uses the pangenome reference. Normalized depth is gene depth divided by
 a representative sample depth estimate and is supporting evidence, not a universal
 presence threshold.
+
+## Installation
+
+Requirements: Linux, Git, and a working Miniforge/Mambaforge installation providing
+`mamba`. Slurm is required only for the Slurm execution profile.
+
+```bash
+git clone https://github.com/AndriyPlakhotnyk/CleanGene.git
+cd CleanGene
+bash scripts/install_or_update.sh
+conda activate cleangene
+```
+
+The installer creates or updates the bioinformatics environments, installs
+CleanGene from the checkout, and verifies its tools. CheckM2 runs through an
+automatically managed companion environment. Installing the Python package alone
+with `pip` does not install the external bioinformatics tools.
+
+To update your current branch:
+
+```bash
+git pull --ff-only
+bash scripts/install_or_update.sh
+conda activate cleangene
+```
+
+## Quick start
+
+### 1. Configure the run
+
+The installer creates `config/cleangene.arc.local.env` from the supplied Slurm
+template without overwriting an existing local file. Set `SLURM_ACCOUNT` and
+`SLURM_PARTITION` for your cluster, and adjust resource requests as needed.
+
+```bash
+cleangene doctor --config config/cleangene.arc.local.env
+```
+
+Managed databases are downloaded when needed and reused. Set
+`CLEANGENE_DATABASE_ROOT` to place them on a shared filesystem; use `KRAKEN2_DB`
+or `CHECKM2_DB` to select an existing database explicitly.
+
+### 2. Prepare a manifest
+
+Use a tab-separated file with one row per isolate. The example below contains
+paired FASTQ paths and an explicit analysis group:
+
+```tsv
+isolate_id	group_id	R1	R2
+isolate_01	species_A	/data/isolate_01_R1.fastq.gz	/data/isolate_01_R2.fastq.gz
+isolate_02	species_A	/data/isolate_02_R1.fastq.gz	/data/isolate_02_R2.fastq.gz
+```
+
+Use groups of biologically comparable isolates. Pangenome analysis requires at
+least two retained isolates per group.
+
+| Column | Purpose |
+| --- | --- |
+| `isolate_id` | Unique sample identifier. |
+| `R1`, `R2` | Paired FASTQ inputs; compressed FASTQs are supported. |
+| `raw_bam` | Alternative to `R1`/`R2`: a paired, unmapped sequencing BAM containing both mates. |
+| `group_id` | Explicit pangenome group. |
+| `organism` | Defines the group when `group_id` is absent. Without either field, Kraken2 determines grouping. |
+| `assembly`, `gff` | Reusable assembly and annotation artifacts. |
+| `pangenome_dir` | Existing Panaroo output to use instead of generating a new pangenome. |
+
+Provide either paired FASTQs or a uBAM for each isolate. Optional reuse fields
+include `reads_processed`, `fastp_json`, `kraken_report`, `protein_fasta`, and
+`checkm2_report`.
+
+### 3. Launch
+
+```bash
+cleangene run \
+  --profile slurm \
+  --manifest input/cohort.manifest.tsv \
+  --analysis-root /data/cleangene-analysis \
+  --config config/cleangene.arc.local.env \
+  --assembler spades \
+  --compress-assembly-outputs intermediates \
+  --compress-annotation-outputs nonessential
+```
+
+This submits a controller job and returns to the shell. Add `--ignore-checkm2`
+to omit CheckM2 completeness and contamination assessment. Other QC criteria
+remain active.
+
+For a small local analysis, use `--profile local`. For a Slurm submission preview,
+add `--dry-run`; it creates run metadata and prints the controller submission
+command without submitting jobs. **Dry-run is a Slurm option; do not use it to
+preview local execution.**
 
 ## Command-line arguments
 

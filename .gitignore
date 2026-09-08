@@ -50,3 +50,5 @@ test_data/
 
 # Local reference notes for AI agents
 /.cleangene_agent_notes.md
+/.cleangene_github_agent_notes.md
+/.cleangene_readme_before_public_cleanup.md
