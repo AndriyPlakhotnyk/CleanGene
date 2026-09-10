@@ -9,12 +9,13 @@ from .config import assembler_mode, checkm2_mode, truthy
 from .checkm2 import CheckM2DbError, CheckM2DbNotReady, bundled_test_genome, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, checkm2_runtime_is_verified, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
 from .completion import find_isolate_qc_candidates, reconcile_preprocess_outputs, validate_preprocess_completion
 from .defaults import DEFAULTS
+from .validation_summary import SUMMARY_VERSION, SUMMARY_FILES, PLOT_FILES, COHORT_FILES, write_validation_summary, combine_validation_summaries
 from .evidence import EVIDENCE_VERSION, METRIC_FIELDS, classify_gene_evidence, targeted_local_reconstruction, validate_isolate, validation_decision_logic_rows
 from .fasta import assembly_metrics, read_fasta
 from .kraken import Kraken2DbError, Kraken2DbNotReady, managed_kraken2_db_path, resolve_kraken2_db, validate_kraken2_db
 from .manifest import groups, write_resolved
 from .pangenome import cluster_locus_rows, gff_cds_loci, normalize_panaroo, recover_sequences, select_rows, write_binary
-from .plotting import plot_presence_absence
+from .plotting import plot_presence_absence, plot_decision_upset
 from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, ensure_qc_provenance, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, cancel_jobs, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .task_store import build_group_task_store, build_isolate_task_store, group_store_ready, load_group_task, load_isolate_task, migrate_group_task_store, migrate_isolate_task_store, task_store_ready
@@ -662,7 +663,7 @@ def _gzip_file(path: Path) -> Path:
     return gz
 
 def _compress_assembly_outputs(assembly_dir: Path, assembly: Path, cfg: dict[str,str]) -> Path:
-    mode=cfg.get("COMPRESS_ASSEMBLY_OUTPUTS","off").strip().lower()
+    mode=cfg.get("COMPRESS_ASSEMBLY_OUTPUTS",DEFAULTS["COMPRESS_ASSEMBLY_OUTPUTS"]).strip().lower()
     if mode not in {"off","intermediates","all"}:
         raise SystemExit("COMPRESS_ASSEMBLY_OUTPUTS must be off, intermediates, or all")
     if mode=="off" or not assembly_dir.is_dir(): return assembly
@@ -674,7 +675,7 @@ def _compress_assembly_outputs(assembly_dir: Path, assembly: Path, cfg: dict[str
     return gz_assembly if mode=="all" and gz_assembly.is_file() else assembly
 
 def _compress_annotation_outputs(annotation_dir: Path, gff: Path, cfg: dict[str,str]) -> None:
-    mode=cfg.get("COMPRESS_ANNOTATION_OUTPUTS","off").strip().lower()
+    mode=cfg.get("COMPRESS_ANNOTATION_OUTPUTS",DEFAULTS["COMPRESS_ANNOTATION_OUTPUTS"]).strip().lower()
     if mode not in {"off","nonessential"}:
         raise SystemExit("COMPRESS_ANNOTATION_OUTPUTS must be off or nonessential")
     if mode=="off" or not annotation_dir.is_dir(): return
@@ -1100,7 +1101,7 @@ def cleanup_trimmed_fastqs(run_dir: Path, dry_run: bool = False) -> dict[str,obj
 
 def compress_completed_outputs(run_dir: Path) -> dict[str,object]:
     """Compress safe run-local outputs, including preprocesses completed before resume."""
-    cfg,rows=context(run_dir); assembly_mode=cfg.get("COMPRESS_ASSEMBLY_OUTPUTS","off").strip().lower(); annotation_mode=cfg.get("COMPRESS_ANNOTATION_OUTPUTS","off").strip().lower()
+    cfg,rows=context(run_dir); assembly_mode=cfg.get("COMPRESS_ASSEMBLY_OUTPUTS",DEFAULTS["COMPRESS_ASSEMBLY_OUTPUTS"]).strip().lower(); annotation_mode=cfg.get("COMPRESS_ANNOTATION_OUTPUTS",DEFAULTS["COMPRESS_ANNOTATION_OUTPUTS"]).strip().lower()
     if assembly_mode not in {"off","intermediates","all"}: raise SystemExit("COMPRESS_ASSEMBLY_OUTPUTS must be off, intermediates, or all")
     if annotation_mode not in {"off","nonessential"}: raise SystemExit("COMPRESS_ANNOTATION_OUTPUTS must be off or nonessential")
     report=[]; reclaimed=0
@@ -1360,9 +1361,28 @@ def resume_maintenance_signature(cfg: dict[str,str]) -> dict[str,object]:
             "min_depth":cfg.get("READ_VALIDATION_MIN_MEAN_DEPTH",""),
         },
         "isolate_qc_fields":list(QC_OUTPUT_FIELDS),
+        "validation_summary_version":SUMMARY_VERSION,
     }
 
+def invalidate_missing_validation_reports(run_dir: Path) -> int:
+    """Backfill reporting on old runs without remapping or reassembling reads."""
+    invalidated=0; has_matrices=False
+    for out in (run_dir/"results"/"groups").glob("*/03_read_validation"):
+        if not (out/"validated_gene_presence_absence.binary.tsv").is_file(): continue
+        has_matrices=True; group=out.parent.name
+        missing_summary=not all((out/name).is_file() for name in SUMMARY_FILES)
+        missing_plot=not all((out/name).is_file() for name in PLOT_FILES)
+        if missing_summary: _remove_done(run_dir/"state"/"reduce"/f"{group}.done.json")
+        if missing_summary or missing_plot:
+            _remove_done(run_dir/"state"/"plot"/f"{group}.done.json")
+            _remove_done(run_dir/"state"/"summary.done.json")
+            invalidated+=1
+    if has_matrices and not all((run_dir/"results"/"cohort"/name).is_file() for name in COHORT_FILES):
+        _remove_done(run_dir/"state"/"summary.done.json")
+    return invalidated
+
 def run_resume_maintenance(run_dir: Path, cfg: dict[str,str]) -> dict[str,int]:
+    invalidate_missing_validation_reports(run_dir)
     marker=run_dir/"state"/"resume_maintenance.done.json"; signature=resume_maintenance_signature(cfg)
     if marker.is_file():
         try:
@@ -1809,7 +1829,7 @@ def arbitrate_evidence(row: dict[str,str], *, deletion_spanned: bool=False) -> d
     """Apply the evidence hierarchy; costly reconstruction adapters feed this function."""
     result=dict(row)
     if deletion_spanned:
-        result.update(evidence_state="confirmed_absent_locus",validation_state="confirmed_absent_locus",validated_call="0",sequence_resolution="deletion_spanned",final_call_source="targeted_locus_reconstruction",arbitration_status="resolved",arbitration_reason="flanking loci joined across a read-supported deletion")
+        result.update(evidence_state="confirmed_absent_locus",validation_state="confirmed_absent_locus",decision_reason="confirmed absent locus",decision_metrics="junction_identity;junction_spanning_alignment;flank_anchor_length",validated_call="0",sequence_resolution="deletion_spanned",final_call_source="targeted_locus_reconstruction",arbitration_status="resolved",arbitration_reason="flanking loci joined across a read-supported deletion")
     elif row.get("evidence_state") in {"possible_truncation","not_detected"} and row.get("initial_call")=="1":
         result.update(validated_call="1",final_call_source="initial_call_after_arbitration",arbitration_status="unresolved",arbitration_reason="no physical deletion junction demonstrated")
     elif row.get("evidence_state")=="ambiguous_multimap":
@@ -1838,7 +1858,8 @@ def arbitrate(run_dir: Path,index: int) -> None:
         try: reconstruction=targeted_local_reconstruction(bam=bam,region=region,reference_seq=reference_seq,outdir=ev/"arbitration"/safe_name(metric["Gene"]),threads=int(cfg["ARBITRATION_CPUS"]),flank_junction=junction,junction_offset=len(left) if junction else 0,max_reads=int(cfg["READ_VALIDATION_ARBITRATION_MAX_READS"]),memory_gb=int(cfg["READ_VALIDATION_ARBITRATION_MEMORY_GB"]),deletion_identity=float(cfg["READ_VALIDATION_DELETION_MIN_IDENTITY"]),deletion_anchor=int(cfg["READ_VALIDATION_DELETION_MIN_ANCHOR"]))
         except (OSError,subprocess.CalledProcessError) as error:
             results.append({**arbitrate_evidence(metric),"arbitration_reason":f"targeted reconstruction failed: {error}"}); continue
-        if reconstruction.get("deletion_spanned"): results.append(arbitrate_evidence(metric,deletion_spanned=True)); continue
+        if reconstruction.get("deletion_spanned"):
+            result=arbitrate_evidence(metric,deletion_spanned=True); result.update(junction_identity=reconstruction["deletion"]["identity"],junction_spanning_alignment=1,flank_anchor_length=reconstruction["deletion"]["flank_anchor_length"]); results.append(result); continue
         match=reconstruction.get("candidate")
         if match and metric.get("evidence_state")=="ambiguous_multimap":
             results.append({**arbitrate_evidence(metric),"arbitration_reason":"reconstruction supports family; no discriminatory comparison resolves competing clusters"}); continue
@@ -1850,7 +1871,7 @@ def arbitrate(run_dir: Path,index: int) -> None:
 
 def reduce_group(run_dir: Path, index: int) -> None:
     cfg=load_run_config(run_dir); group=task_row(run_dir,"group",index)["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); done=run_dir/"state"/"reduce"/f"{safe_name(group)}.done.json"; cleaned=root/"cleaned_pangenome.tsv"
-    if done.is_file() and cleaned.is_file(): return
+    if done.is_file() and cleaned.is_file() and all((root/"03_read_validation"/name).is_file() for name in SUMMARY_FILES): return
     retained=retained_rows(run_dir,group)
     if len(retained)<2: touch_done(done,{"status":"skipped"}); return
     isolates=[r["isolate_id"] for r in retained]; initial_path=root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv"
@@ -1888,17 +1909,20 @@ def reduce_group(run_dir: Path, index: int) -> None:
     for g in by_gene:
         a=[by_gene[g][i] for i in isolates]; b=[validated[g][i] for i in isolates]; changes.append([g,sum(a),sum(b),sum(x==0 and y==1 for x,y in zip(a,b)),sum(x==1 and y==0 for x,y in zip(a,b)),sum(x==y for x,y in zip(a,b))])
     write_tsv(out/"tested_genes.tsv",["Gene","n_initial_present","n_validated_present","n_added","n_removed","n_unchanged"],changes)
-    touch_done(done,{"n_isolates":len(isolates),"n_genes":len(by_gene),"cleaned_pangenome":str(cleaned)})
+    write_validation_summary(initial_path,validated_matrix,out/"gene_call_evidence.long.tsv",out,group)
+    touch_done(done,{"n_isolates":len(isolates),"n_genes":len(by_gene),"cleaned_pangenome":str(cleaned),"summary_version":SUMMARY_VERSION})
 
 def plot_group(run_dir: Path, index: int) -> None:
     cfg=load_run_config(run_dir); group=task_row(run_dir,"group",index)["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); done=run_dir/"state"/"plot"/f"{safe_name(group)}.done.json"
-    if done.is_file(): return
+    if done.is_file() and all((root/"03_read_validation"/name).is_file() for name in PLOT_FILES): return
     matrix=root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"; out=root/"04_summary"
     if not matrix.is_file():
         touch_done(done,{"status":"skipped","reason":"missing_validated_matrix"})
         return
     out.mkdir(parents=True,exist_ok=True)
     plot_presence_absence(matrix,out,group,int(cfg["PLOT_MAX_CLUSTER_ISOLATES"]))
+    decision_data=matrix.parent/"decision_reason_upset.tsv"
+    if decision_data.is_file(): plot_decision_upset(decision_data,matrix.parent,group)
     touch_done(done,{"matrix":str(matrix),"outdir":str(out)})
 
 def summarize(run_dir: Path) -> None:
@@ -1914,6 +1938,12 @@ def summarize(run_dir: Path) -> None:
     cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows),"storage_cleanup":storage,"organism_index":build_organism_results_index(run_dir)}
     if truthy(cfg.get("CLEANUP_TRIMMED_FASTQ","false")):
         cleanup=cleanup_trimmed_fastqs(run_dir); payload["fastq_cleanup"]={key:value for key,value in cleanup.items() if key!="rows"}
+    summary_dirs=[run_dir/"results"/"groups"/safe_name(group)/"03_read_validation" for group in groups(rows)]
+    missing_summaries=[path for path in summary_dirs if (path/"validated_gene_presence_absence.binary.tsv").is_file() and not all((path/name).is_file() for name in SUMMARY_FILES)]
+    if missing_summaries: raise RuntimeError("Validation summaries missing; resume reduction before cohort summary: "+", ".join(map(str,missing_summaries)))
+    available_summaries=[path for path in summary_dirs if all((path/name).is_file() for name in SUMMARY_FILES)]
+    combine_validation_summaries(available_summaries,cohort)
+    if available_summaries: plot_decision_upset(cohort/"decision_reason_upset.tsv",cohort,"Cohort")
     touch_done(run_dir/"state"/"summary.done.json",payload)
 
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:

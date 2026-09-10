@@ -189,9 +189,7 @@ cleangene run \
   --manifest input/cohort.manifest.tsv \
   --analysis-root /data/cleangene-analysis \
   --config config/cleangene.arc.local.env \
-  --assembler spades \
-  --compress-assembly-outputs intermediates \
-  --compress-annotation-outputs nonessential
+  --assembler spades
 ```
 
 This submits a controller job and returns to the shell. Add `--ignore-checkm2`
@@ -217,13 +215,19 @@ apply unless overridden by a command-line option.
 | `--assembler` | `shovill` (built-in default), `spades`, `off` | Assembly strategy; `off` skips assembly and annotation. |
 | `--ignore-checkm2` | Flag | Skip CheckM2 assessment during the run. |
 | `--skip-trim` | Flag | Bypass fastp trimming. |
-| `--compress-assembly-outputs` | `off`, `intermediates`, `all` | Assembly storage policy; built-in default is `off`. |
-| `--compress-annotation-outputs` | `off`, `nonessential` | Annotation storage policy; built-in default is `off`. |
+| `--compress-assembly-outputs` | `off`, `intermediates`, `all` | Assembly storage policy; built-in default is `intermediates`. |
+| `--compress-annotation-outputs` | `off`, `nonessential` | Annotation storage policy; built-in default is `nonessential`. |
 | `--cleanup-trimmed-fastq` | Flag | Enable final cleanup of retained trimmed FASTQs. |
 | `--run-id` | Identifier | Set a run name instead of the generated timestamp. |
 | `--resume` | Existing run ID | Resume a run under the analysis root. |
 | `--dry-run` | Flag, Slurm profile | Print submission command without submitting. |
 | `--cancel-active` | Flag, resume | Cancel active jobs associated with the run before resubmission. |
+
+Assembly intermediates and nonessential annotation outputs are compressed by
+default; the primary assembly and GFF remain available. Explicit `off` settings
+in existing configs still override these defaults. To adopt the new policy in
+an existing local config, set `COMPRESS_ASSEMBLY_OUTPUTS="intermediates"` and
+`COMPRESS_ANNOTATION_OUTPUTS="nonessential"`.
 
 Direct SPAdes mode uses original paired reads with `--only-assembler`. Choose
 Shovill when you want its assembly preparation workflow.
@@ -271,6 +275,38 @@ Each run is stored beneath `<analysis-root>/runs/<run-id>/`.
 | `results/cohort/` | Cohort QC and summaries. |
 | `provenance/` | Manifest, resolved configuration, and runtime metadata. |
 | `logs/slurm/` | Controller and stage job logs. |
+
+### Validation summaries
+
+Each group's `03_read_validation/` directory also contains:
+
+| File | Contents |
+| --- | --- |
+| `gene_call_summary.tsv` | Group totals: all calls, kept, changed, 0→1, 1→0, initial/final presence counts, and percentages. |
+| `gene_call_summary.per_isolate.tsv` | The same counts and percentages for every retained isolate. |
+| `summary_statistics.txt` | Reconciled final-matrix statistics, including core, soft-core, shell, cloud, and absent-in-all clusters. |
+| `decision_reason_upset.png`, `.svg` | UpSet-style plot: decision reasons across columns, change direction as color, and deciding metrics in the bottom matrix. |
+| `decision_reason_upset.tsv` | Exact counts, metric membership, and provenance used to draw the plot. |
+
+“Kept” means an unchanged call, including both 0→0 and 1→1. An isolate's percentage
+denominator is **all gene clusters in its group's matrix**, including untested
+calls carried forward. Cohort totals count gene-isolate calls across groups;
+percentages are weighted by those counts. Cohort tables and the combined plot are
+written to `results/cohort/`, including `gene_call_summary.per_group.tsv`.
+
+The text report is published only after initial/final matrices and evidence
+agree, kept + changed equals total calls, and both change directions reconcile.
+Its prevalence bins are recalculated from final calls; provisional calls remain
+part of the binary matrix. Cloud counts include clusters absent from all retained
+isolates, which are also listed separately.
+
+Plot dots mean **metrics used by the deciding rule**, not thresholds passed.
+New evidence records `decision_metrics`; older evidence uses labeled state-based
+inference. Reasons with different metric sets appear in separate columns. Reports
+with more than 30 columns have additional numbered pages; no decisions are omitted.
+A run with no changed calls receives an explicit “No gene calls changed” plot.
+Resume backfills missing reports using existing validation evidence, without
+rerunning mapping or arbitration solely for reporting.
 
 Keep the evidence tables with the binary matrix. They identify provisional calls,
 family-only evidence, partial homologs, and supported deletions that a binary value

@@ -6,7 +6,7 @@ from .util import read_tsv, run, write_tsv
 
 EVIDENCE_VERSION="2"
 
-METRIC_FIELDS=["evidence_version","family_breadth","reconstructed_coverage","reference_id","Gene","initial_call","validated_call","evidence_state","validation_state","decision_reason","sequence_resolution","final_call_source","breadth","percent_coverage","mean_depth","normalized_depth","identity","percent_identity","identity_method","reconstructed_length","identical_positions","aligned_positions","reference_length","orf_integrity","mapped_reads","unique_mapped_reads","ambiguous_mapped_reads","mean_mapping_quality","assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus","arbitration_status","arbitration_reason"]
+METRIC_FIELDS=["evidence_version","family_breadth","reconstructed_coverage","reference_id","Gene","initial_call","validated_call","evidence_state","validation_state","decision_reason","decision_metrics","junction_identity","junction_spanning_alignment","flank_anchor_length","sequence_resolution","final_call_source","breadth","percent_coverage","mean_depth","normalized_depth","identity","percent_identity","identity_method","reconstructed_length","identical_positions","aligned_positions","reference_length","orf_integrity","mapped_reads","unique_mapped_reads","ambiguous_mapped_reads","mean_mapping_quality","assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus","arbitration_status","arbitration_reason"]
 
 def map_reads(reference: Path,r1: str,r2: str,bam: Path,threads: int,min_mapq: int,log: Path,*,retain_ambiguous: bool=False) -> None:
     bam.parent.mkdir(parents=True,exist_ok=True); log.parent.mkdir(parents=True,exist_ok=True)
@@ -149,6 +149,7 @@ def targeted_local_reconstruction(*,bam: Path,region: str,reference_seq: str,out
     if not contigs.is_file() or not read_fasta(contigs): return {"status":"no_contigs"}
     match=best_sequence_match(reference_seq,contigs,outdir/"candidate_match") if reference_seq else None
     deletion=best_sequence_match(flank_junction,contigs,outdir/"deletion_match") if flank_junction else None
+    if deletion: deletion["flank_anchor_length"]=junction_anchor_length(deletion,junction_offset)
     deletion_spanned=bool(deletion and junction_offset>=deletion_anchor and len(flank_junction)-junction_offset>=deletion_anchor and deletion["identity"]>=deletion_identity and spans_junction(deletion,junction_offset,deletion_anchor))
     return {"status":"reconstructed","candidate":match,"deletion_spanned":deletion_spanned,"deletion":deletion}
 
@@ -160,7 +161,11 @@ def classify_gene_evidence(*,initial_call: int=0,mapped_reads: float,breadth: fl
     elif breadth>=divergent_breadth and divergent_identity<=identity<min_identity: state,call,source="divergent_variant",1,"read_validation"
     elif breadth>=truncation_breadth and identity>=min_identity: state,call,source="possible_truncation",1 if initial_call else "","arbitration_pending"
     else: state,call,source="partial_homolog",0,"arbitration_pending" if initial_call else "read_validation"
-    return {"evidence_state":state,"validation_state":state,"validated_call":call,"final_call_source":source,"decision_reason":state.replace("_"," ")}
+    from .validation_summary import STATE_METRICS
+    metrics=STATE_METRICS[state]
+    if state=="not_detected": metrics=("mapped_reads",) if not mapped_reads else ("breadth",)
+    elif state=="insufficient_evidence": metrics=("mean_depth",) if mean_depth<min_depth else ("identity",)
+    return {"evidence_state":state,"validation_state":state,"validated_call":call,"final_call_source":source,"decision_reason":state.replace("_"," "),"decision_metrics":";".join(metrics)}
 
 def validation_decision_logic_rows(min_breadth="0.95",min_depth="5",min_identity="0.95") -> list[list[str]]:
     return [["confirmed_present",f"breadth >= {min_breadth}; identity >= {min_identity}; depth >= {min_depth}","1","Intact sequence supported"],["possible_truncation","breadth 0.70 to confirmed threshold; high identity","initial positive: 1 pending arbitration","Possible endpoint or assembly break"],["divergent_variant","breadth >= 0.90; identity 0.90 to confirmed threshold","1","Divergent full-length allele"],["partial_homolog","breadth below 0.70 or weak similarity","0","Related sequence, not an intact gene"],["ambiguous_multimap","family mappings but no unique assignment","preserve/arbitrate","Family present; exact cluster unresolved"],["not_detected","no meaningful read evidence","initial positive: arbitrate; otherwise 0","Absence not proven without locus evidence"],["confirmed_absent_locus","flank reconstruction spans deletion","0","Physical deletion junction supported"]]
@@ -194,7 +199,7 @@ def validate_isolate(reference: Path,key_tsv: Path,locus_tsv: Path,assembly: Pat
             c=search_unique_cov.get(key["reference_id"],{})
         identity=None if not ident else ident["identity"]; decision=classify_gene_evidence(initial_call=initial,mapped_reads=float(c.get("mapped_reads",0)),breadth=float(c.get("breadth",0)),mean_depth=float(c.get("mean_depth",0)),identity=identity,min_breadth=min_breadth,min_depth=min_depth,min_identity=min_identity,truncation_breadth=truncation_breadth,divergent_breadth=divergent_breadth,divergent_identity=divergent_identity,unique_reads=unique,ambiguous_reads=ambiguous)
         if ambiguous and float(c.get("breadth",0))<min_breadth and family_breadth>=min_breadth:
-            decision.update(evidence_state="ambiguous_multimap",validation_state="ambiguous_multimap",validated_call="",final_call_source="arbitration_pending"); resolution="family_only"
+            decision.update(evidence_state="ambiguous_multimap",validation_state="ambiguous_multimap",validated_call="",final_call_source="arbitration_pending",decision_reason="ambiguous multimap",decision_metrics="ambiguous_mapped_reads;breadth;family_breadth"); resolution="family_only"
         if decision["evidence_state"]=="ambiguous_multimap": resolution="family_only"
         elif decision["evidence_state"] in {"not_detected","insufficient_evidence"}: resolution="unresolved"
         row={f:"" for f in METRIC_FIELDS}; row.update(key); row.update(decision); row.update({"evidence_version":EVIDENCE_VERSION,"family_breadth":family_breadth,"reconstructed_coverage":min(1.,sum(b in "ACGTacgt" for b in reconstructed)/len(refseq)) if refseq else 0.,"initial_call":initial,"sequence_resolution":resolution,"breadth":c.get("breadth",0),"percent_coverage":float(c.get("breadth",0))*100,"mean_depth":c.get("mean_depth",0),"normalized_depth":float(c.get("mean_depth",0))/chrom_depth if chrom_depth else "","identity":"NA" if identity is None else identity,"percent_identity":"NA" if identity is None else identity*100,"identity_method":ident.get("identity_method","") if ident else "","reconstructed_length":len(reconstructed.replace("N","")),"identical_positions":ident.get("identical_positions","") if ident else "","aligned_positions":ident.get("aligned_positions","") if ident else "","reference_length":len(refseq),"orf_integrity":orf_integrity(reconstructed),"mapped_reads":unique+ambiguous,"unique_mapped_reads":unique,"ambiguous_mapped_reads":ambiguous,"mean_mapping_quality":c.get("mean_mapping_quality","")});
@@ -254,15 +259,22 @@ def consensus_locus(seqs: dict[str,str], locus: dict[str,str], chain: Path) -> s
     return _slice(seqs,lifted)
 
 
-def spans_junction(match: dict[str,object], offset: int, anchor: int=50) -> bool:
-    """Require a contiguous aligned block on both sides; a gapped flank join is insufficient."""
+def junction_anchor_length(match: dict[str,object], offset: int) -> int:
+    """Observed minimum aligned flank length in a contiguous junction block."""
     import re
-    pos=int(match["reference_start"])
+    pos=int(match["reference_start"]); anchor=0
     for length,op in re.findall(r"(\d+)([MIDNSHP=X])",str(match.get("alignment_cigar",""))):
         length=int(length)
-        if op in "M=X" and pos<=offset-anchor and pos+length>=offset+anchor: return True
+        if op in "M=X" and pos<=offset<=pos+length:
+            anchor=max(anchor,min(offset-pos,pos+length-offset))
         if op in "MDN=X": pos+=length
-    return False
+    return anchor
+
+
+def spans_junction(match: dict[str,object], offset: int, anchor: int=50) -> bool:
+    """Require a contiguous aligned block on both sides; gaps cannot prove a join."""
+    observed=junction_anchor_length(match,offset)
+    return observed>0 and observed>=anchor
 
 
 def locus_coverage(bam: Path,loci: list[dict[str,str]],outdir: Path,min_mapq: int) -> dict[tuple,dict[str,float]]:
