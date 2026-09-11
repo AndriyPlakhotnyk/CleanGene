@@ -22,6 +22,7 @@ def main():
     parser.add_argument('--database-root',required=True,type=Path)
     parser.add_argument('--genome',type=Path)
     parser.add_argument('--threads',type=int,default=2)
+    parser.add_argument('--skip-downsampling',action='store_true')
     args=parser.parse_args()
     root=args.work_dir.resolve(); root.mkdir(parents=True,exist_ok=True)
     if (root/'runs/e2e').exists(): raise SystemExit('Use a fresh work directory; existing evidence is preserved')
@@ -49,6 +50,7 @@ def main():
     config=root/'config.env'; config.write_text(''.join(f'{key}="{value}"\n' for key,value in cfg.items()))
     command=[sys.executable,'-m','cleangene','run','--profile','local','--manifest',str(manifest_path),
              '--config',str(config),'--analysis-root',str(root),'--run-id','e2e','--assembler','shovill']
+    if args.skip_downsampling: command.append("--skip-downsampling")
     subprocess.run(command,check=True)
     run=root/'runs/e2e'; validation=run/'results/groups/e2e/03_read_validation'
     qc=read_tsv(run/'results/cohort/isolate_qc.tsv')
@@ -57,6 +59,20 @@ def main():
         assert 0<=float(row['checkm2_completeness'])<=100, row
         assert 0<=float(row['checkm2_contamination'])<=100, row
         verified_archive(validation/'evidence'/row['isolate_id'])
+    from cleangene.final_archives import pipeline_files, restore_pipeline_bams
+    assert not [p for p in pipeline_files(run) if p.name.endswith(('.bam','.bam.gz'))], 'Unarchived pipeline BAMs'
+    archives=read_tsv(run/'results/cohort/alignment_archives.tsv')
+    assert len(archives)>=4, archives
+    restored=restore_pipeline_bams(run,root/'restored')
+    assert len(restored)==len(archives)
+    if args.skip_downsampling:
+        logs=list(run.rglob('shovill.stderr'))
+        assert len(logs)==2, logs
+        for path in logs:
+            log=path.read_text()
+            assert 'kmc ' in log, 'KMC did not run'
+            assert 'No read depth reduction requested or necessary' in log, log
+            assert 'seqkit sample' not in log, 'Reads were downsampled'
     matrix=validation/'validated_gene_presence_absence.binary.tsv'
     assert read_tsv(matrix), 'Empty validated pangenome'
     assert 'Validation: PASS' in (validation/'summary_statistics.txt').read_text()
@@ -67,7 +83,7 @@ def main():
     after={str(p):p.stat().st_mtime_ns for p in (run/'state').rglob('*.done.json') if p.parent != run/'state'}
     assert before==after, 'Resume repeated completed stages'
     report={'status':'PASS','run_dir':str(run),'isolates':2,'gene_clusters':len(read_tsv(matrix)),
-            'checkm2_evaluated':2,'cram_archives_verified':2,'resume_reused_completed_stages':True,
+            'checkm2_evaluated':2,'cram_archives_verified':len(archives),'bams_restored':len(restored),'skip_downsampling':args.skip_downsampling,'resume_reused_completed_stages':True,
             'fixture':'200 kb cropped genome; completeness thresholds set to zero for execution testing'}
     (root/'e2e_report.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))

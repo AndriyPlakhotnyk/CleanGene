@@ -21,6 +21,7 @@ SCIENTIFIC_DEFAULTS = {
     "READ_VALIDATION_MIN_MAPQ": "20",
     "READ_TRIMMING_MODE": "auto",
     "SKIP_TRIM": "false",
+    "SKIP_DOWNSAMPLING": "false",
     "SKIP_SHOVILL": "false",
     "ASSEMBLER": "shovill",
     "SPADES_MEMORY_GB": "28",

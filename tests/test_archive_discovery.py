@@ -232,6 +232,8 @@ class ArchiveCLIWorkflowTests(unittest.TestCase):
             with patch('cleangene.downstream.run_request') as execute, patch('cleangene.utils_cli.submit',return_value='123') as submit:
                 self.assertEqual(main(['restore-bam','--run-dir',str(run),'--organism','g','--profile','local','--analysis-name','local']),0)
                 execute.assert_called_once(); submit.assert_not_called()
+                self.assertEqual(main(["restore-bam","--run-dir",str(run),"--all-alignments","--profile","local","--analysis-name","all"]),0)
+                self.assertTrue(__import__("json").loads(execute.call_args.args[0].read_text())["all_alignments"])
                 self.assertEqual(main(['evidence-msa','--run-dir',str(run),'--organism','g','--genes','gene','--profile','slurm','--analysis-name','slurm']),0)
                 submit.assert_called_once()
                 self.assertIn('_utils_worker', ' '.join(submit.call_args.args[0]))
@@ -272,3 +274,40 @@ class ArbitrationWorkerTests(unittest.TestCase):
             with patch('cleangene.workers.task_row',return_value={'group_id':'g','isolate_id':'i'}), patch('cleangene.workers.targeted_local_reconstruction') as reconstruct:
                 arbitrate(run,0)
                 reconstruct.assert_not_called()
+
+@unittest.skipUnless(have('cd-hit-est','cd-hit-est-2d'), 'CD-HIT required')
+class PartialParentTests(unittest.TestCase):
+    def test_clustering_cannot_reassign_discovery_to_unsupported_parent(self):
+        rng=random.Random(56); sequence=''.join(rng.choice('ACGT') for _ in range(900))
+        with tempfile.TemporaryDirectory() as d:
+            out=Path(d)
+            write_fasta(out/'evidence/a/discovered_genes.fasta',[('new',sequence)])
+            write_tsv(out/'evidence/a/discovered_genes.tsv',['candidate_id','parent_gene','discovery_reason','parent_read_breadth','parent_min_breadth'],[['new','parent','partial_homolog',.7,.95]])
+            merged,calls,sources=consolidate_discoveries(out,['a'],{'parent':sequence})
+            self.assertEqual(len(merged),1)
+            self.assertNotIn('parent',calls)
+            self.assertEqual(calls[next(iter(merged))]['a'],1)
+
+
+@unittest.skipUnless(have('samtools'), 'SAMtools required')
+class PartialArbitrationTests(unittest.TestCase):
+    def test_complete_reconstruction_keeps_low_read_breadth_parent_absent(self):
+        from cleangene.util import atomic_json
+        from cleangene.workers import arbitrate
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d); group=run/'results/groups/g'; out=group/'03_read_validation'
+            ev,ref,bam=archive_fixture(out)
+            ev.rename(out/'staging'); (out/'evidence').mkdir(); (out/'staging').rename(out/'evidence/i')
+            ev=out/'evidence/i'
+            atomic_json(run/'provenance/resolved_config.json',{})
+            write_tsv(group/'02_pangenome/initial_calls/gene_presence_absence.binary.tsv',['Gene','i'],[[f'g{n}',1] for n in range(100)])
+            write_tsv(ev/'metrics.tsv',['Gene','initial_call','validated_call','evidence_state','arbitration_status','identity','breadth','read_breadth','reference_id'],[['parent',1,0,'partial_homolog','pending',1,.7,.7,'ref']])
+            candidate={'candidate':{'breadth':1}}
+            discovery={'candidate_id':'new','parent_gene':'parent','discovery_reason':'partial_homolog','sequence':'ATGAAATAA','breadth':1,'identity':1}
+            with patch('cleangene.workers.task_row',return_value={'group_id':'g','isolate_id':'i'}),patch('cleangene.workers.retained_rows',return_value=[{'isolate_id':'i'}]),patch('cleangene.workers.targeted_local_reconstruction',return_value=candidate),patch('cleangene.workers.discover_cds',return_value=discovery):
+                arbitrate(run,0)
+            row=read_tsv(ev/'arbitrated_metrics.tsv')[0]
+            self.assertEqual(row['validated_call'],'0')
+            self.assertEqual(row['read_breadth'],'0.7')
+            self.assertEqual(row['final_call_source'],'partial_homolog_read_gate')
+            self.assertEqual(read_fasta(ev/'discovered_genes.fasta'),{'new':'ATGAAATAA'})

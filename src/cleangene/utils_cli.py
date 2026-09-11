@@ -27,6 +27,7 @@ def add_utils_parser(sub) -> None:
     for name in ("restore-bam", "inspect-reads", "evidence-msa"):
         parser=utilities.add_parser(name); _run_args(parser); _organism_args(parser)
         parser.add_argument("--profile",choices=("local","slurm"),default="slurm")
+        if name=="restore-bam": parser.add_argument("--all-alignments",action="store_true",help="restore every pipeline-generated BAM in the run")
         if name=="inspect-reads": parser.add_argument("--region")
         if name=="evidence-msa": parser.add_argument("--genes",nargs="+",required=True)
     root.set_defaults(func=utils_command)
@@ -94,6 +95,9 @@ def _resolve_result(path: Path, filename: str) -> str:
 
 def _request(args, run: Path) -> dict[str,object]:
     samples=_samples(args); kind=args.utility.replace("-","_")
+    if kind=="restore_bam" and getattr(args,"all_alignments",False):
+        if args.organism or samples: raise SystemExit("--all-alignments restores the whole run; omit --organism and --samples")
+        return {"utility":kind,"all_alignments":True}
     if kind in {"restore_bam","inspect_reads","evidence_msa"}:
         organism=resolve_organism(run,args.organism,samples)
         genes=getattr(args,"genes",[]) or []

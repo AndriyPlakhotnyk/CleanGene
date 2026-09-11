@@ -11,7 +11,12 @@ from .util import read_tsv, safe_name, write_tsv
 
 def archive_utility(request: dict) -> None:
     from .downstream import load_matrix, subset_samples
-    run = Path(request['run_dir']); out = Path(request['output_dir']); group = request['organism']
+    run = Path(request['run_dir']); out = Path(request['output_dir'])
+    if request.get('all_alignments'):
+        from .final_archives import restore_pipeline_bams
+        restore_pipeline_bams(run,out,int(request.get('cpus',1)))
+        return
+    group = request['organism']
     root = run / 'results/groups' / safe_name(group) / '03_read_validation'
     isolates, _ = load_matrix(run, group); isolates = subset_samples(isolates, request.get('samples', []))
     out.mkdir(parents=True, exist_ok=True); manifest = []; sequences = {gene: [] for gene in request.get('genes', [])}

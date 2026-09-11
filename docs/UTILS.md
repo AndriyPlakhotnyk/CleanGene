@@ -133,3 +133,18 @@ are loaded from their discovery sequences. It writes `<gene>.fasta`,
 sequences may be absent, so inspect sequence counts. Temporary BAMs are removed
 after successful consensus extraction. Retained assembly references and CRAM
 files remain available for other read viewers.
+
+### Restore every pipeline alignment
+
+```bash
+cleangene-utils restore-bam --run-dir /path/to/run --all-alignments --profile slurm
+```
+
+Use `--all-alignments` without `--organism` or `--samples` to restore own-assembly,
+competitive pangenome, arbitration, and retained assembly alignments. The output
+preserves their paths relative to `results/` and includes `restored_bams.tsv`.
+CRAM checksums and alignment records are verified before publishing each BAM;
+CRAM archives remain intact. Coordinate-sorted alignments receive BAM indexes.
+Own-assembly CRAMs use the retained exact assembly reference; other final archives
+store bases without needing an external reference. `--profile local` is also
+supported. Restored utility outputs are excluded from final pipeline archiving.

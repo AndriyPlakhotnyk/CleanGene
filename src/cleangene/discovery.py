@@ -137,6 +137,9 @@ def consolidate_discoveries(out: Path, isolates: list[str], existing: dict[str, 
     representatives, aliases = cluster_new_sequences(list(seqs.items()), out / 'consolidation', identity, coverage, threads)
     # Compare discovered representatives to the existing reference catalogue. Full
     # reciprocal coverage avoids merging a short homolog into a longer gene.
+    forbidden = {(aliases[row["candidate_id"]], row["parent_gene"]) for row in discoveries
+                 if row.get("discovery_reason") == "partial_homolog"
+                 and float(row.get("parent_read_breadth") or 0) < float(row.get("parent_min_breadth") or .95)}
     rename = {}
     if representatives and existing:
         directory = out / 'consolidation'
@@ -154,7 +157,7 @@ def consolidate_discoveries(out: Path, isolates: list[str], existing: dict[str, 
             reference = next((existing_ids[name] for name in members if name in existing_ids), None)
             if reference:
                 for name in members:
-                    if name in representatives: rename[name] = reference
+                    if name in representatives and (name, reference) not in forbidden: rename[name] = reference
         for line in Path(str(output) + '.clstr').read_text().splitlines():
             if line.startswith('>Cluster'):
                 register(cluster); cluster = []

@@ -43,7 +43,8 @@ flowchart TD
     O --> P
     P --> R["After all isolates: cluster discovered CDS at 95% similarity"]
     R --> S["Consolidate gene catalogue and calls; preserve existing gene names"]
-    S --> Q["Binary matrices, evidence tables, and cohort summaries"]
+    S --> T["Archive remaining generated BAMs as verified CRAM; remove BAMs"]
+    T --> Q["Binary matrices, evidence tables, and cohort summaries"]
 ```
 
 The diagram shows stage dependencies. Slurm may overlap independent samples and
@@ -77,7 +78,9 @@ flowchart TD
     G -->|Yes| I["Targeted reconstruction and arbitration"]
     I --> J{"Reconstruction outcome"}
     J -->|Supported deletion junction| K["Confirmed absent locus: call 0"]
-    J -->|Resolved sequence| L["Update original call with sequence evidence"]
+    J -->|Resolved sequence| R{"Partial homolog with original read breadth below threshold?"}
+    R -->|Yes| V["Keep original gene call 0; evaluate distinct CDS separately"]
+    R -->|No| L["Update original call with sequence evidence"]
     J -->|Distinct CDS or complete truncation candidate| M["Validate full CDS with recruited reads; assign provisional CGNEW name"]
     J -->|Unresolved| N["Retain provisional call; mark unresolved"]
     M --> O["After all isolates: cluster at 95%; merge equivalents; publish sequences and calls"]
@@ -245,6 +248,7 @@ apply unless overridden by a command-line option.
 | `--analysis-root` | Directory | Parent directory for `runs/<run-id>/`. Required by `run`. |
 | `--config` | Environment-style file | QC, database, and execution settings. |
 | `--profile` | `slurm` (default), `local` | Execution backend. |
+| `--skip-downsampling` | Flag; off by default | Run Shovill with `--depth 0`: retain KMC genome-size estimation and other processing, without read-depth reduction. |
 | `--assembler` | `shovill` (built-in default), `spades`, `off` | Assembly strategy; `off` skips assembly and annotation. |
 | `--ignore-checkm2` | Flag | Skip CheckM2 assessment during the run. |
 | `--skip-trim` | Flag | Bypass fastp trimming. |
@@ -383,9 +387,23 @@ Own-assembly alignments are archived automatically after validation/arbitration.
 Each isolate retains `own_assembly_reads.cram`, its `.cram.crai` index, the exact
 `own_assembly_reference.fasta`, reference/source SHA-256 metadata, and a verified
 archive manifest. BAM/BAI removal occurs only after alignment-level round-trip
-verification. Competitive `pangenome_reads.bam` remains available as gene evidence.
+verification. At final summarization, remaining generated BAMs (including competitive
+pangenome mappings, arbitration evidence, and compressed BAM intermediates) are
+also converted and verified before deletion. These CRAMs store sequence bases
+without requiring an external reference. Coordinate-sorted CRAMs receive CRAI
+indexes; other sort orders are preserved without indexes. The inventory is
+`results/cohort/alignment_archives.tsv`. Linked inputs and restored utility BAMs
+are preserved. Competitive mapping and reconstructed identity/ORF evaluation
+remain required validation steps.
+
+A partial homolog does not establish presence of its parent gene below the
+configured read-breadth threshold (default 95%), even if local reconstruction
+aligns across the full reference. A separately validated complete CDS receives a
+new gene name and is consolidated with other discoveries. Sequence clustering
+cannot merge it back into an unsupported parent call.
 
 ```bash
+cleangene-utils restore-bam --run-dir /path/to/run --all-alignments --profile slurm
 cleangene-utils restore-bam --run-dir /path/to/run --organism "Species name" --samples isolate1 --profile slurm
 cleangene-utils inspect-reads --run-dir /path/to/run --organism "Species name" --samples isolate1 --region contig1:1000-2000 --profile slurm
 cleangene-utils evidence-msa --run-dir /path/to/run --organism "Species name" --genes geneA geneB --profile slurm
@@ -426,3 +444,28 @@ Shovill/CheckM2 run and verification of completed-run reuse.
 ## License
 
 See [LICENSE](LICENSE).
+
+### ARC submission without downsampling
+
+Keep the account and partition settings in your existing ARC configuration.
+The installer updates the environment; compression defaults already retain
+assembly intermediates as compressed files and compress nonessential annotation
+outputs. `--skip-downsampling` affects Shovill only and keeps KMC enabled.
+
+```bash
+cd /path/to/CleanGene
+git pull --ff-only origin main
+bash scripts/install_or_update.sh --profile slurm
+conda activate cleangene
+cleangene doctor --profile slurm --config config/cleangene.arc.local.env
+cleangene run \
+  --profile slurm \
+  --manifest "$PWD/input/arc_GDS_test.manifest.tsv" \
+  --analysis-root "$PWD" \
+  --config "$PWD/config/cleangene.arc.local.env" \
+  --assembler shovill \
+  --skip-downsampling
+```
+
+Omit the flag for normal Shovill downsampling. To disable it when resuming, add
+`--skip-downsampling` to `cleangene resume`; already completed assemblies are reused.

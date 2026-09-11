@@ -16,6 +16,7 @@ src/cleangene/discovery.py
 src/cleangene/downstream.py
 src/cleangene/evidence.py
 src/cleangene/fasta.py
+src/cleangene/final_archives.py
 src/cleangene/kraken.py
 src/cleangene/manifest.py
 src/cleangene/pangenome.py
@@ -40,6 +41,7 @@ tests/test_checkm2.py
 tests/test_checkm2_download.py
 tests/test_completion.py
 tests/test_core.py
+tests/test_final_archives.py
 tests/test_install.py
 tests/test_kraken.py
 tests/test_locus_validation.py

@@ -928,7 +928,7 @@ def preprocess(run_dir: Path, index: int) -> None:
                 try:
                     if assembler=="shovill":
                         tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
-                        run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--ram",cfg.get("SHOVILL_MEMORY_GB","16"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
+                        run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--ram",cfg.get("SHOVILL_MEMORY_GB","16"),"--force"]+(["--depth","0"] if truthy(cfg.get("SKIP_DOWNSAMPLING","false")) else []),stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
                     else:
                         if any(shov.iterdir()): shutil.rmtree(shov)
                         run(["spades.py","--isolate","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
@@ -1126,7 +1126,7 @@ def compress_completed_outputs(run_dir: Path) -> dict[str,object]:
         if annotation_mode=="nonessential" and annotation_dir.is_dir():
             gff=Path(q.get("gff","")).expanduser(); gff=gff.absolute() if gff else gff
             for path in sorted(annotation_dir.iterdir()):
-                if not path.is_file() or path.is_symlink() or path.suffix==".gz" or path.suffix.lower()==".gff": continue
+                if not path.is_file() or path.is_symlink() or path.suffix==".gz" or path.suffix.lower() in {".gff",".cram",".crai"} or path.name.endswith((".archive.json",".archive.lock")): continue
                 if gff and path.absolute()==gff: continue
                 before=path.stat().st_size; original=str(path); gz=_gzip_file(path); saved=max(0,before-gz.stat().st_size); reclaimed += saved
                 report.append([iso,"annotation",original,str(gz),saved])
@@ -1384,6 +1384,7 @@ def invalidate_missing_validation_reports(run_dir: Path) -> int:
 
 def run_resume_maintenance(run_dir: Path, cfg: dict[str,str]) -> dict[str,int]:
     invalidate_missing_validation_reports(run_dir)
+    if not (run_dir/"results/cohort/alignment_archives.tsv").is_file(): _remove_done(run_dir/"state/summary.done.json")
     marker=run_dir/"state"/"resume_maintenance.done.json"; signature=resume_maintenance_signature(cfg)
     if marker.is_file():
         try:
@@ -1868,6 +1869,10 @@ def arbitrate(run_dir: Path,index: int) -> None:
             left=sequence[max(0,start-1-flank):start-1]; right=sequence[end:min(len(sequence),end+flank)]; junction=left+right; region=f"{scaffold}:{max(1,start-flank)}-{min(len(sequence),end+flank)}"; bam=ev/"own_assembly_reads.bam"
         else: region=metric.get("reference_id",""); bam=ev/"pangenome_reads.bam"
         if bam.name=="own_assembly_reads.bam" and not bam.is_file() and (ev/"own_assembly_reads.archive.json").is_file(): restore_own_bam(ev,bam,int(cfg["ARBITRATION_CPUS"]))
+        if bam.name=="pangenome_reads.bam" and not bam.is_file():
+            from .final_archives import archive_paths, restore_bam
+            manifest=archive_paths(bam)[1]
+            if manifest.is_file(): restore_bam(manifest,bam,int(cfg["ARBITRATION_CPUS"]))
         try: reconstruction=targeted_local_reconstruction(bam=bam,region=region,reference_seq=reference_seq,outdir=ev/"arbitration"/safe_name(metric["Gene"]),threads=int(cfg["ARBITRATION_CPUS"]),flank_junction=junction,junction_offset=len(left) if junction else 0,max_reads=int(cfg["READ_VALIDATION_ARBITRATION_MAX_READS"]),memory_gb=int(cfg["READ_VALIDATION_ARBITRATION_MEMORY_GB"]),deletion_identity=float(cfg["READ_VALIDATION_DELETION_MIN_IDENTITY"]),deletion_anchor=int(cfg["READ_VALIDATION_DELETION_MIN_ANCHOR"]))
         except (OSError,subprocess.CalledProcessError) as error:
             results.append({**arbitrate_evidence(metric),"arbitration_reason":f"targeted reconstruction failed: {error}"}); continue
@@ -1877,10 +1882,13 @@ def arbitrate(run_dir: Path,index: int) -> None:
             discovery=discover_cds(reconstruction,metric,ev/"arbitration"/safe_name(metric["Gene"]),int(cfg["ARBITRATION_CPUS"]),float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"]),int(cfg["READ_VALIDATION_MIN_MAPQ"]),int(cfg["BASEQUAL"]))
         except (OSError,subprocess.CalledProcessError) as error:
             results.append({**arbitrate_evidence(metric),"arbitration_reason":f"CDS reconstruction evaluation failed: {error}"}); continue
-        if discovery: discoveries.append(discovery)
+        if discovery: discoveries.append({**discovery,"parent_read_breadth":metric.get("read_breadth") or metric.get("breadth") or 0,"parent_min_breadth":cfg["READ_VALIDATION_MIN_BREADTH"]})
         match=reconstruction.get("candidate")
         if match and metric.get("evidence_state")=="ambiguous_multimap":
             results.append({**arbitrate_evidence(metric),"arbitration_reason":"reconstruction supports family; no discriminatory comparison resolves competing clusters"}); continue
+        if match and metric.get("evidence_state")=="partial_homolog" and float(metric.get("read_breadth") or metric.get("breadth") or 0)<float(cfg["READ_VALIDATION_MIN_BREADTH"]):
+            results.append({**metric,"validated_call":"0","final_call_source":"partial_homolog_read_gate","arbitration_status":"resolved","arbitration_reason":"distinct CDS discovery does not establish original gene presence below required read breadth","reconstructed_coverage":match["breadth"]})
+            continue
         if match:
             from .evidence import orf_integrity
             candidate_seq=read_fasta(Path(reconstruction["contigs_path"]))[match["contig"]][match["query_start"]:match["query_end"]]
@@ -1890,7 +1898,7 @@ def arbitrate(run_dir: Path,index: int) -> None:
         results.append({**arbitrate_evidence(metric),"arbitration_reason":f"targeted reconstruction unresolved: {reconstruction.get('status','unknown')}"})
     from .fasta import write_fasta
     write_fasta(ev/"discovered_genes.fasta",[(r["candidate_id"],r["sequence"]) for r in discoveries])
-    write_tsv(ev/"discovered_genes.tsv",["candidate_id","parent_gene","discovery_reason","sequence_sha256","breadth","identity","mean_depth","mapped_reads","orf_integrity"],discoveries)
+    write_tsv(ev/"discovered_genes.tsv",["candidate_id","parent_gene","discovery_reason","parent_read_breadth","parent_min_breadth","sequence_sha256","breadth","identity","mean_depth","mapped_reads","orf_integrity"],discoveries)
     write_tsv(ev/"arbitration_cases.tsv",METRIC_FIELDS,pending); write_tsv(ev/"arbitrated_metrics.tsv",METRIC_FIELDS,results)
     archive_own_alignment(ev,int(cfg["ARBITRATION_CPUS"]))
     touch_done(done,{"discordant_cases":len(pending),"panaroo_present_genes":present_count,"arbitration_cap":maximum,"processed_cases":min(len(pending),maximum),"deferred_cases":max(0,len(pending)-maximum)})
@@ -1931,10 +1939,14 @@ def reduce_group(run_dir: Path, index: int) -> None:
             validated[r["Gene"]][r["isolate_id"]]=int(r["initial_call"])
         elif str(r.get("validated_call",""))!="":
             validated[r["Gene"]][r["isolate_id"]]=int(r["validated_call"])
+    blocked_partial={(r["Gene"],r["isolate_id"]) for r in metrics if r.get("evidence_state")=="partial_homolog" and float(r.get("read_breadth") or r.get("breadth") or 0)<float(cfg["READ_VALIDATION_MIN_BREADTH"])}
+    for gene,iso in blocked_partial: validated[gene][iso]=0
+    for metric in metrics:
+        if (metric["Gene"],metric["isolate_id"]) in blocked_partial: metric["validated_call"]=0
     for gene,calls in new_calls.items():
         for iso,call in calls.items():
-            if call: validated[gene][iso]=1
-    source_index={(r["Gene"],r["isolate_id"]):r for r in new_sources}
+            if call and (gene,iso) not in blocked_partial: validated[gene][iso]=1
+    source_index={(r["Gene"],r["isolate_id"]):r for r in new_sources if (r["Gene"],r["isolate_id"]) not in blocked_partial}
     metrics=[r for r in metrics if (r["Gene"],r["isolate_id"]) not in source_index]
     for (gene,iso),source in source_index.items():
         metrics.append({**source,"Gene":gene,"isolate_id":iso,"initial_call":by_gene[gene][iso],"validated_call":1,"evidence_version":EVIDENCE_VERSION,"evidence_state":"discovered_complete_cds","validation_state":"discovered_complete_cds","decision_reason":"reconstructed complete CDS","decision_metrics":"breadth;identity;mean_depth;orf_integrity","final_call_source":"consolidated_discovery","sequence_resolution":"reconstructed","arbitration_status":"resolved","arbitration_reason":"complete CDS with direct recruited-read support"})
@@ -1976,7 +1988,8 @@ def plot_group(run_dir: Path, index: int) -> None:
     touch_done(done,{"matrix":str(matrix),"outdir":str(out)})
 
 def summarize(run_dir: Path) -> None:
-    cfg,rows=context(run_dir); storage=compress_completed_outputs(run_dir); iso_rows=[]; group_rows=[]
+    from .final_archives import archive_pipeline_bams
+    cfg,rows=context(run_dir); archives=archive_pipeline_bams(run_dir,int(cfg["SUMMARY_CPUS"])); storage=compress_completed_outputs(run_dir); iso_rows=[]; group_rows=[]
     for group in groups(rows):
         root=run_dir/"results"/"groups"/safe_name(group); retained=retained_rows(run_dir,group); val=root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"
         n_genes=max(0,len(read_tsv(val))) if val.is_file() else 0; group_rows.append([group,len([r for r in rows if r["group_id"]==group]),len(retained),n_genes])
@@ -1985,7 +1998,7 @@ def summarize(run_dir: Path) -> None:
             q=read_tsv(find_isolate_qc(run_dir,row))[0]; q={**q,"group_id":group}
             if user_excluded(row): q["excluded"]="1"; q["reason"]="user_excluded"
             iso_rows.append(q)
-    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows),"storage_cleanup":storage,"organism_index":build_organism_results_index(run_dir)}
+    cohort=run_dir/"results"/"cohort"; write_tsv(cohort/"isolate_qc.tsv",["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS],iso_rows); write_tsv(cohort/"group_summary.tsv",["group_id","input_isolates","retained_isolates","validated_gene_clusters"],group_rows); write_tsv(cohort/"validation_decision_logic.tsv",["state","criteria","final_call_behavior","biological_interpretation"],validation_decision_logic_rows(cfg["READ_VALIDATION_MIN_BREADTH"],cfg["READ_VALIDATION_MIN_MEAN_DEPTH"],cfg["READ_VALIDATION_MIN_IDENTITY"])); payload={"groups":len(group_rows),"alignment_archives":len(archives),"storage_cleanup":storage,"organism_index":build_organism_results_index(run_dir)}
     if truthy(cfg.get("CLEANUP_TRIMMED_FASTQ","false")):
         cleanup=cleanup_trimmed_fastqs(run_dir); payload["fastq_cleanup"]={key:value for key,value in cleanup.items() if key!="rows"}
     summary_dirs=[run_dir/"results"/"groups"/safe_name(group)/"03_read_validation" for group in groups(rows)]

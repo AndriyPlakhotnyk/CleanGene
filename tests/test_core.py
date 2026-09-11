@@ -389,12 +389,15 @@ class CleanGeneCoreTests(unittest.TestCase):
             root=Path(d); sequence="A"*120; quality="I"*120; r1=root/"r1.fastq.gz"; r2=root/"r2.fastq.gz"
             r1.write_text(f"@r\n{sequence}\n+\n{quality}\n"); r2.write_text(f"@r\n{sequence}\n+\n{quality}\n")
             manifest=root/"manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tR1\tR2\niso1\tg\t{r1}\t{r2}\n")
-            run_dir=make_run(manifest,root,{"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","CHECKM2_MODE":"off","QC_MIN_COVERAGE_PASS":"0","QC_MIN_COVERAGE_FAIL":"0","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false"},"r"); commands=[]
+            run_dir=make_run(manifest,root,{"TAXONOMY_MODE":"off","READ_TRIMMING_MODE":"off","CHECKM2_MODE":"off","QC_MIN_COVERAGE_PASS":"0","QC_MIN_COVERAGE_FAIL":"0","PREPROCESS_USE_NODE_LOCAL_SCRATCH":"false","SKIP_DOWNSAMPLING":"true"},"r"); commands=[]
             def fake_run(command,**kwargs):
                 commands.append(command)
                 if command[0]=="shovill":
                     out=Path(command[command.index("--outdir")+1]); out.mkdir(parents=True,exist_ok=True); (out/"contigs.fa").write_text(">c\nACGT\n")
             with patch("cleangene.workers.run",side_effect=fake_run): preprocess(run_dir,0)
+            shovill=next(command for command in commands if command[0]=="shovill")
+            self.assertEqual(shovill[shovill.index("--depth")+1],"0")
+            self.assertNotIn("--gsize",shovill)
             self.assertFalse(any(command[0]=="prokka" for command in commands))
             qc=read_tsv(run_dir/"results"/"sample_data"/"iso1"/"qc.tsv")[0]
             self.assertEqual(qc["PASS/FAIL"],"FAIL"); self.assertIn("n50_low",qc["reason"]); self.assertIn("gff_missing",qc["reason"])

@@ -39,9 +39,10 @@ def retain_reference(source: Path, evidence: Path) -> Path:
     return target
 
 
-def alignment_digest(path: Path, reference: Path) -> tuple[str, int]:
+def alignment_digest(path: Path, reference: Path | None) -> tuple[str, int]:
     """Compare every alignment, quality and optional tag, ignoring tag ordering."""
-    command = ['samtools', 'view', '--no-PG', '-T', str(reference)]
+    command = ['samtools', 'view', '--no-PG']
+    if reference is not None: command += ['-T', str(reference)]
     if path.suffix == '.cram': command += ['--input-fmt-option', 'decode_md=0']
     command += [str(path)]
     digest = hashlib.sha256(); count = 0
