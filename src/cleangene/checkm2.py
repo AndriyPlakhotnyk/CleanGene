@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import fcntl
 import math
+import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -14,7 +16,7 @@ from .util import atomic_json, load_json, read_tsv, safe_name
 
 EXPECTED_CHECKM2_DB_NAME = "uniref100.KO.1.dmnd"
 RUNTIME_VERIFICATION_MARKER = ".cleangene-runtime-verified.json"
-CHECKM2_COMMAND_SCHEMA_VERSION = 4
+CHECKM2_COMMAND_SCHEMA_VERSION = 5
 
 
 class CheckM2DbError(RuntimeError):
@@ -36,6 +38,16 @@ class CheckM2DbResolution:
 class CheckM2PredictCapabilities:
     cleanup_option: str
     help_sha256: str
+
+
+def checkm2_subprocess_environment(executable: Path | str | None = None) -> dict[str,str]:
+    """Use companion DIAMOND/Prodigal and constrain nested numerical threads."""
+    env=os.environ.copy()
+    if executable:
+        env["PATH"]=str(Path(executable).expanduser().resolve().parent)+os.pathsep+env.get("PATH","")
+    for key in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS","TF_NUM_INTRAOP_THREADS","TF_NUM_INTEROP_THREADS"):
+        env[key]="1"
+    return env
 
 
 def _sha256_text(text: str) -> str:
@@ -75,7 +87,7 @@ def checkm2_predict_capabilities(executable: Path | str, help_text: str | None =
 
 
 def checkm2_database_download_command(executable: Path | str, root: Path | str) -> list[str]:
-    return [str(executable), "database", "--download", "--path", str(root), "--no_write_json_db"]
+    return [sys.executable, "-m", "cleangene.checkm2_download", "--executable", str(executable), "--path", str(root), "--no_write_json_db"]
 
 
 def checkm2_testrun_command(executable: Path | str, database: Path | str, threads: int | str = 1, *, lowmem: bool = False) -> list[str]:
@@ -145,7 +157,7 @@ def bundled_test_genome(executable: Path | str) -> Path:
     script = (
         "import checkm2, pathlib\n"
         "root = pathlib.Path(checkm2.__file__).resolve().parent\n"
-        "suffixes = ('.fna', '.fa', '.fasta', '.fna.gz', '.fa.gz', '.fasta.gz')\n"
+        "suffixes = ('.tst', '.fna', '.fa', '.fasta', '.fna.gz', '.fa.gz', '.fasta.gz')\n"
         "candidates = [p for p in root.rglob('*') if p.is_file() and any(str(p).lower().endswith(s) for s in suffixes)]\n"
         "tests = [p for p in candidates if 'test' in str(p).lower()]\n"
         "pool = tests or candidates\n"
@@ -262,7 +274,7 @@ def find_managed_checkm2_db(root: Path) -> Path | None:
     flat = root / EXPECTED_CHECKM2_DB_NAME
     if checkm2_db_is_valid(flat):
         return flat.resolve()
-    candidates = [p.resolve() for p in root.rglob(EXPECTED_CHECKM2_DB_NAME) if checkm2_db_is_valid(p)] if root.is_dir() else []
+    candidates = [p.resolve() for p in root.rglob(EXPECTED_CHECKM2_DB_NAME) if ".download" not in p.relative_to(root).parts and checkm2_db_is_valid(p)] if root.is_dir() else []
     unique = sorted(set(candidates))
     if len(unique) == 1:
         return unique[0]
@@ -335,7 +347,10 @@ def resolve_checkm2_db(
             executable = resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE", ""))
         except ToolResolutionError as error:
             raise CheckM2DbError(f"CheckM2 database download cannot start: {error}") from error
-        runner(checkm2_database_download_command(executable, root))
+        try:
+            runner(checkm2_database_download_command(executable, root))
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise CheckM2DbError(f"CheckM2 database download failed; resumable files are retained under {root / '.download'}. Resume the run to retry: {error}") from error
         downloaded = find_managed_checkm2_db(root)
         if not downloaded:
             raise CheckM2DbError(f"CheckM2 download completed but {EXPECTED_CHECKM2_DB_NAME} was not found under {root}")

@@ -151,7 +151,7 @@ class CheckM2DatabaseTests(unittest.TestCase):
 
             result = resolve_checkm2_db(cfg, allow_download=True, runner=runner)
             self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0][0], str(exe.resolve()))
+            self.assertEqual(calls[0][calls[0].index("--executable")+1], str(exe.resolve()))
             self.assertIn("--no_write_json_db", calls[0])
             self.assertEqual(result.source, "auto_download")
             validate_checkm2_db(result.path)
@@ -263,6 +263,7 @@ class CheckM2PreprocessTests(unittest.TestCase):
 
             def fake_run(command, **kwargs):
                 if command[0] == "shovill":
+                    self.assertEqual(command[command.index("--ram")+1],"16")
                     out = Path(command[command.index("--outdir") + 1]); out.mkdir(parents=True, exist_ok=True); (out / "contigs.fa").write_text(">c\n" + "A"*120 + "\n")
                 elif Path(command[0]).name == "checkm2":
                     out = Path(command[command.index("--output-directory") + 1]); out.mkdir(parents=True, exist_ok=True)
@@ -323,7 +324,8 @@ class RealCheckM2IntegrationTests(unittest.TestCase):
             input_path=checkm2_named_input_link(genome,root/"input","cleangene_checkm2_smoke")
             out=root/"predict"
             command=checkm2_predict_command(exe,input_path,out,resolution.path,1,checkm2_predict_capabilities(exe))
-            env=__import__("os").environ.copy()
+            from cleangene.checkm2 import checkm2_subprocess_environment
+            env=checkm2_subprocess_environment(exe)
             for key in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS","TF_NUM_INTRAOP_THREADS","TF_NUM_INTEROP_THREADS"):
                 env[key]="1"
             completed=__import__("subprocess").run(command,capture_output=True,text=True,env=env,timeout=600)

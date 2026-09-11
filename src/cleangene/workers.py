@@ -204,12 +204,10 @@ def _log_tail(path: Path, lines: int = 40, limit: int = 8000) -> str:
         return ""
     return text[-limit:].strip()
 
-def _checkm2_environment() -> dict[str,str]:
-    env=os.environ.copy()
-    for key in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS",
-                "TF_NUM_INTRAOP_THREADS","TF_NUM_INTEROP_THREADS"):
-        env[key]="1"
-    return env
+def _checkm2_environment(executable: str | Path | None = None) -> dict[str,str]:
+    from .checkm2 import checkm2_subprocess_environment
+    return checkm2_subprocess_environment(executable)
+
 
 def _checkm2_threads(cfg: dict[str,str]) -> str:
     requested=max(1,int(cfg.get("CHECKM2_PREDICT_CPUS","1")))
@@ -257,7 +255,7 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
         capabilities=checkm2_predict_capabilities(executable)
         command=checkm2_predict_command(executable,link,result_dir,cfg["CHECKM2_DB"],threads,capabilities,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false")))
         with _checkm2_prediction_slot(logs,cfg,isolate):
-            run(command,stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr",env=_checkm2_environment())
+            run(command,stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr",env=_checkm2_environment(executable))
         report=result_dir/"quality_report.tsv"
         parse_checkm2_quality_report(report,isolate)
         status="complete"
@@ -348,11 +346,11 @@ def _verify_checkm2_runtime(run_dir: Path, cfg: dict[str,str], resolution) -> No
         smoke_input_dir=smoke_dir/"input"; smoke_result_dir=smoke_dir/"results"
         try:
             capabilities=checkm2_predict_capabilities(executable)
-            run(checkm2_testrun_command(executable,resolution.path,1,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false"))),stdout=stdout,stderr=stderr,env=_checkm2_environment())
+            run(checkm2_testrun_command(executable,resolution.path,1,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false"))),stdout=stdout,stderr=stderr,env=_checkm2_environment(executable))
             genome=bundled_test_genome(executable)
             smoke_input=checkm2_named_input_link(genome,smoke_input_dir,"cleangene_checkm2_smoke")
             smoke_cmd=checkm2_predict_command(executable,smoke_input,smoke_result_dir,resolution.path,1,capabilities,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false")))
-            run(smoke_cmd,stdout=run_dir/"logs"/"checkm2-production-smoke.stdout",stderr=run_dir/"logs"/"checkm2-production-smoke.stderr",env=_checkm2_environment())
+            run(smoke_cmd,stdout=run_dir/"logs"/"checkm2-production-smoke.stdout",stderr=run_dir/"logs"/"checkm2-production-smoke.stderr",env=_checkm2_environment(executable))
             parse_checkm2_quality_report(smoke_result_dir/"quality_report.tsv","cleangene_checkm2_smoke")
             marker=record_checkm2_runtime_verified(cfg,resolution.path,executable,version)
         except (subprocess.CalledProcessError,OSError,ValueError) as error:
@@ -930,7 +928,7 @@ def preprocess(run_dir: Path, index: int) -> None:
                 try:
                     if assembler=="shovill":
                         tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
-                        run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
+                        run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--ram",cfg.get("SHOVILL_MEMORY_GB","16"),"--force"],stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
                     else:
                         if any(shov.iterdir()): shutil.rmtree(shov)
                         run(["spades.py","--isolate","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")

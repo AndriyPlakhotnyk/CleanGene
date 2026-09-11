@@ -47,34 +47,41 @@ class InstallerTests(unittest.TestCase):
                 "MAMBA_ENVS":environments,
                 "MAMBA_FAIL_DOCTOR":"true" if fail_doctor else "false",
             }
+            if "--profile" not in arguments: arguments=(*arguments,"--profile","local")
             result = subprocess.run(["bash", "scripts/install_or_update.sh", *arguments], cwd=root, env=env, capture_output=True, text=True)
             return result, log.read_text().splitlines(), local.read_text()
 
     def test_create_mode_creates_both_environments_and_local_config(self):
         result, commands, local = self.run_installer("")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("env create -f environment.yml", commands)
-        self.assertIn("env create -f environment.checkm2.yml", commands)
+        self.assertIn("env create -f environment.yml --yes", commands)
+        self.assertIn("env create -f environment.checkm2.yml --yes", commands)
         self.assertFalse(any("env update" in command or "env remove" in command for command in commands))
-        self.assertIn("run -n cleangene cleangene doctor --config config/cleangene.arc.local.env", commands)
+        self.assertIn("run -n cleangene cleangene doctor --config config/cleangene.arc.local.env --profile local", commands)
         self.assertTrue(any("run -n cleangene python -c" in command for command in commands))
         self.assertEqual(local, "SLURM_ACCOUNT=\n")
+        self.assertIn("run -n cleangene shovill --check", commands)
 
     def test_update_mode_updates_both_and_preserves_local_config(self):
         result, commands, local = self.run_installer("cleangene cleangene-checkm2", existing_local="PRIVATE=kept\n")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("env update -n cleangene -f environment.yml --prune", commands)
-        self.assertIn("env update -n cleangene-checkm2 -f environment.checkm2.yml --prune", commands)
+        self.assertIn("env update -n cleangene -f environment.yml --prune --yes", commands)
+        self.assertIn("env update -n cleangene-checkm2 -f environment.checkm2.yml --prune --yes", commands)
         self.assertFalse(any("env remove" in command for command in commands))
         self.assertEqual(local, "PRIVATE=kept\n")
+
+    def test_explicit_slurm_profile_keeps_scheduler_check(self):
+        result, commands, _ = self.run_installer("cleangene cleangene-checkm2", "--profile", "slurm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("run -n cleangene cleangene doctor --config config/cleangene.arc.local.env --profile slurm", commands)
 
     def test_recreate_mode_removes_and_creates_both(self):
         result, commands, _ = self.run_installer("cleangene cleangene-checkm2", "--recreate")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("env remove -n cleangene --yes", commands)
         self.assertIn("env remove -n cleangene-checkm2 --yes", commands)
-        self.assertIn("env create -f environment.yml", commands)
-        self.assertIn("env create -f environment.checkm2.yml", commands)
+        self.assertIn("env create -f environment.yml --yes", commands)
+        self.assertIn("env create -f environment.checkm2.yml --yes", commands)
         self.assertFalse(any("env update" in command for command in commands))
 
     def test_doctor_failure_reports_installation_failure(self):
@@ -83,7 +90,7 @@ class InstallerTests(unittest.TestCase):
             fail_doctor=True,
         )
         self.assertEqual(result.returncode, 17)
-        self.assertIn("run -n cleangene cleangene doctor --config config/cleangene.arc.local.env", commands)
+        self.assertIn("run -n cleangene cleangene doctor --config config/cleangene.arc.local.env --profile local", commands)
         self.assertIn("ERROR: CleanGene installation/update failed.", result.stderr)
 
 

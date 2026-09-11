@@ -6,6 +6,7 @@ src/cleangene/__main__.py
 src/cleangene/alignment_archive.py
 src/cleangene/archive_utils.py
 src/cleangene/checkm2.py
+src/cleangene/checkm2_download.py
 src/cleangene/cli.py
 src/cleangene/completion.py
 src/cleangene/config.py
@@ -36,6 +37,7 @@ src/cleangene.egg-info/entry_points.txt
 src/cleangene.egg-info/top_level.txt
 tests/test_archive_discovery.py
 tests/test_checkm2.py
+tests/test_checkm2_download.py
 tests/test_completion.py
 tests/test_core.py
 tests/test_install.py

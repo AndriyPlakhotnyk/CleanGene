@@ -18,11 +18,10 @@ from .utils_cli import add_utils_parser
 from .ux import clean_gene_banner, submitted, spinner, waiting
 from .workers import cleanup_trimmed_fastqs, compress_completed_outputs, dispatch, global_preflight, invalidate_legacy_identity_metrics as _invalidate_legacy_identity_metrics, invalidate_legacy_isolate_qc as _invalidate_legacy_isolate_qc, needs_checkm2, needs_kraken, run_resume_maintenance
 
-def _checkm2_limited_env() -> dict[str,str]:
-    env=os.environ.copy()
-    for key in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS","TF_NUM_INTRAOP_THREADS","TF_NUM_INTEROP_THREADS"):
-        env[key]="1"
-    return env
+def _checkm2_limited_env(executable: str | Path | None = None) -> dict[str,str]:
+    from .checkm2 import checkm2_subprocess_environment
+    return checkm2_subprocess_environment(executable)
+
 
 class LauncherTiming:
     def __init__(self):
@@ -223,7 +222,7 @@ def doctor(args) -> int:
         print("CleanGene editable/runtime match: READY")
     else:
         failures+=1; print(f"CleanGene editable/runtime match: ERROR package={package_path} expected={checkout/'src'/'cleangene'}")
-    if env_name=="cleangene" and prefix is not None and prefix in python.parents: print("CleanGene Python environment: OK")
+    if Path(env_name).name=="cleangene" and prefix is not None and prefix in python.parents: print("CleanGene Python environment: OK")
     else:
         failures+=1; print(f"CleanGene Python environment: ERROR expected cleangene Python under its active Conda prefix, found environment={env_name or '<unknown>'} python={python}. Fix: conda activate cleangene")
     config_errors=_doctor_config_errors(cfg)
@@ -260,7 +259,7 @@ def doctor(args) -> int:
             print(f"CheckM2 database: READY {resolution.path}")
             if getattr(args,"deep_checkm2",False) and executable is not None:
                 with tempfile.TemporaryDirectory() as tmp:
-                    tmpdir=Path(tmp); env=_checkm2_limited_env()
+                    tmpdir=Path(tmp); env=_checkm2_limited_env(executable)
                     if not os.environ.get("SLURM_JOB_ID") and command_exists("sbatch"):
                         raise CheckM2DbError(
                             "deep runtime verification must run inside a SLURM allocation. "
@@ -304,7 +303,8 @@ def doctor(args) -> int:
                 failures+=1; print(f"Kraken2 configuration: ERROR {error}. Fix: set CLEANGENE_DATABASE_ROOT in {args.config or 'the config'} to a writable shared directory")
         except Exception as error:
             failures+=1; print(f"Kraken2 configuration: ERROR {error}")
-    if command_exists("sbatch"): print("SLURM: READY")
+    if getattr(args,"profile","slurm")=="local": print("Execution profile: LOCAL; Slurm is not required")
+    elif command_exists("sbatch"): print("SLURM: READY")
     else:
         failures+=1; print("Slurm sbatch: ERROR not found. Fix: run setup and CleanGene from an ARC login node with Slurm commands available")
     return 0 if failures==0 else 2
@@ -481,7 +481,7 @@ def main(argv=None) -> int:
     p=argparse.ArgumentParser(prog="cleangene"); sub=p.add_subparsers(dest="cmd",required=True)
     c=sub.add_parser("check"); c.add_argument("--manifest",type=Path,required=True); c.add_argument("--config",type=Path); c.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); c.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); c.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); c.add_argument("--assembler",choices=("shovill","spades","off")); c.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); c.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); c.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); c.set_defaults(func=check)
     e=sub.add_parser("estimate"); e.add_argument("--manifest",type=Path,required=True); e.set_defaults(func=estimate)
-    d=sub.add_parser("doctor"); d.add_argument("--config",type=Path); d.add_argument("--manifest",type=Path); d.add_argument("--deep-checkm2",action="store_true"); d.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); d.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); d.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); d.add_argument("--assembler",choices=("shovill","spades","off")); d.set_defaults(func=doctor)
+    d=sub.add_parser("doctor"); d.add_argument("--profile",choices=("local","slurm"),default="slurm"); d.add_argument("--config",type=Path); d.add_argument("--manifest",type=Path); d.add_argument("--deep-checkm2",action="store_true"); d.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); d.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); d.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); d.add_argument("--assembler",choices=("shovill","spades","off")); d.set_defaults(func=doctor)
     r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.add_argument("--cancel-active",action="store_true"); r.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); r.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); r.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); r.add_argument("--assembler",choices=("shovill","spades","off")); r.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); r.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); r.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); r.set_defaults(func=run_command)
     rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--config",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.add_argument("--cancel-active",action="store_true"); rs.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); rs.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); rs.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); rs.add_argument("--assembler",choices=("shovill","spades","off")); rs.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); rs.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); rs.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); rs.set_defaults(func=resume_command)
     cl=sub.add_parser("cleanup",help="replace retained trimmed FASTQs with links to original FASTQ inputs"); cl.add_argument("--run-dir",type=Path,required=True); cl.add_argument("--dry-run",action="store_true"); cl.set_defaults(func=cleanup_command)

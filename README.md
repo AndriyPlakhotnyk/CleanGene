@@ -146,6 +146,12 @@ CleanGene from the checkout, and verifies its tools. CheckM2 runs through an
 automatically managed companion environment. Installing the Python package alone
 with `pip` does not install the external bioinformatics tools.
 
+The installer checks Shovill dependencies and CheckM2 bundled test genomes. It
+automatically selects local deployment checks when `sbatch` is unavailable; use
+`--profile slurm` on ARC or `--profile local` on a workstation to select explicitly.
+For an isolated installation, add `--env-root /path/to/environments`; both Conda
+environments will be placed there. `cleangene doctor` also accepts `--profile local`.
+
 To update your current branch:
 
 ```bash
@@ -169,6 +175,16 @@ cleangene doctor --config config/cleangene.arc.local.env
 Managed databases are downloaded when needed and reused. Set
 `CLEANGENE_DATABASE_ROOT` to place them on a shared filesystem; use `KRAKEN2_DB`
 or `CHECKM2_DB` to select an existing database explicitly.
+
+CheckM2 downloads the database version declared compatible by its installed
+release. Interrupted downloads resume from `.download/`; the archive checksum and
+the installed CheckM2 release's database SHA-256 must pass before the database is
+published. Completed databases are reused. A one-time runtime test verifies the
+models, database and production prediction command before preprocessing. CheckM2
+uses its companion environment's DIAMOND and Prodigal executables. The pinned
+[CheckM2 1.1.0 release](https://github.com/chklovski/CheckM2/releases/tag/1.1.0)
+requires database version 3. Updating an environment does not repeatedly download
+an already compatible database.
 
 ### 2. Prepare a manifest
 
@@ -247,7 +263,10 @@ an existing local config, set `COMPRESS_ASSEMBLY_OUTPUTS="intermediates"` and
 `COMPRESS_ANNOTATION_OUTPUTS="nonessential"`.
 
 Direct SPAdes mode uses original paired reads with `--only-assembler`. Choose
-Shovill when you want its assembly preparation workflow.
+Shovill when you want its assembly preparation workflow. `SHOVILL_MEMORY_GB`
+(default `16`, minimum `8` for the pinned release) is passed as Shovill's `--ram`
+limit; keep it within the preprocessing job's memory allocation. The environment
+pins tested Shovill 1.4.2 and SPAdes 3.x compatibility.
 
 ### Validation settings
 
@@ -401,6 +420,8 @@ bash tests/run_tests.sh
 The suite covers classification, local and Slurm orchestration, resume, QC, and
 storage behavior. Synthetic-read integration tests exercise mapping, recovery,
 local assembly, and deletion-junction detection when their tools are available.
+The [end-to-end testing guide](docs/TESTING.md) covers a real two-isolate
+Shovill/CheckM2 run and verification of completed-run reuse.
 
 ## License
 

@@ -24,6 +24,7 @@ SCIENTIFIC_DEFAULTS = {
     "SKIP_SHOVILL": "false",
     "ASSEMBLER": "shovill",
     "SPADES_MEMORY_GB": "28",
+    "SHOVILL_MEMORY_GB": "16",
     "COMPRESS_ASSEMBLY_OUTPUTS": "intermediates",
     "COMPRESS_ANNOTATION_OUTPUTS": "nonessential",
     "BASEQUAL": "30",

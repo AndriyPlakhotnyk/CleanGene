@@ -132,6 +132,15 @@ class RuntimeResolutionTests(unittest.TestCase):
                 self.assertEqual(main(["doctor","--config",str(cfg),"--ignore-checkm2"]),0)
             self.assertIn("CheckM2: DISABLED by user",output.getvalue())
 
+    def test_local_doctor_accepts_prefix_environment_without_slurm(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); cfg=root/"cfg.env"; cfg.write_text("CHECKM2_MODE=off\nTAXONOMY_MODE=off\n")
+            prefix=root/"cleangene"; output=StringIO()
+            with patch.dict(os.environ,{"CONDA_DEFAULT_ENV":str(prefix),"CONDA_PREFIX":str(prefix)}), patch("cleangene.cli.sys.executable",str(prefix/"bin/python")), patch("cleangene.cli.command_exists",side_effect=lambda name:name!="sbatch"), contextlib.redirect_stdout(output):
+                self.assertEqual(main(["doctor","--config",str(cfg),"--profile","local"]),0)
+                self.assertEqual(main(["doctor","--config",str(cfg),"--profile","slurm"]),2)
+            self.assertIn("Slurm is not required",output.getvalue())
+
     def test_doctor_reports_automatic_missing_checkm2_database(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
