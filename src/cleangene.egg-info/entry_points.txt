@@ -1,2 +1,3 @@
 [console_scripts]
 cleangene = cleangene.cli:main
+cleangene-utils = cleangene.utils_cli:main
