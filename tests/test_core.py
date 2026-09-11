@@ -183,7 +183,7 @@ class CleanGeneCoreTests(unittest.TestCase):
         d=classify_gene_evidence(mapped_reads=274,breadth=0.998255,mean_depth=59.8726,identity=None,min_breadth=0.90,min_depth=5,min_identity=0.95)
         self.assertEqual(d["validation_state"],"insufficient_evidence")
         self.assertEqual(d["validated_call"],"")
-        self.assertEqual(d["final_call_source"],"initial_call_unresolved")
+        self.assertEqual(d["final_call_source"],"arbitration_pending")
 
     def test_validation_classification_states(self):
         args=dict(min_breadth=0.90,min_depth=5,min_identity=0.95)
@@ -198,17 +198,17 @@ class CleanGeneCoreTests(unittest.TestCase):
         self.assertEqual(classify_gene_evidence(breadth=.80,identity=.98,**args)["validation_state"],"possible_truncation")
         self.assertEqual(classify_gene_evidence(breadth=.93,identity=.92,**args)["validation_state"],"divergent_variant")
         self.assertEqual(classify_gene_evidence(breadth=.60,identity=.98,**args)["validation_state"],"partial_homolog")
-        ambiguous=classify_gene_evidence(breadth=.99,identity=.99,unique_reads=0,ambiguous_reads=20,**args)
+        ambiguous=classify_gene_evidence(breadth=.99,identity=None,unique_reads=0,ambiguous_reads=20,**args)
         self.assertEqual(ambiguous["validation_state"],"ambiguous_multimap")
         self.assertEqual(ambiguous["validated_call"],"")
         recovered=classify_gene_evidence(initial_call=0,mapped_reads=30,breadth=.99,mean_depth=30,identity=.99)
         self.assertEqual((recovered["validated_call"],recovered["final_call_source"]),(1,"pangenome_read_recovery"))
         competitive_zero=classify_gene_evidence(initial_call=1,mapped_reads=0,breadth=0,mean_depth=0,identity=None)
-        self.assertEqual((competitive_zero["validated_call"],competitive_zero["final_call_source"]),("","arbitration_pending"))
+        self.assertEqual((competitive_zero["validated_call"],competitive_zero["final_call_source"]),(0,"read_validation"))
 
     def test_arbitration_requires_physical_evidence_for_absence(self):
         row={"initial_call":"1","evidence_state":"not_detected"}
-        self.assertEqual(arbitrate_evidence(row)["validated_call"],"1")
+        self.assertEqual(arbitrate_evidence(row)["validated_call"],"0")
         deleted=arbitrate_evidence(row,deletion_spanned=True)
         self.assertEqual(deleted["evidence_state"],"confirmed_absent_locus")
         self.assertEqual(deleted["sequence_resolution"],"deletion_spanned")

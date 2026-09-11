@@ -1,6 +1,6 @@
 # CleanGene downstream utilities
 
-Every `cleangene utils` command performs lightweight validation on the login node and submits one SLURM compute job. Results are written under `<run>/results/utils/<analysis-id>` and logs under `<run>/logs/slurm/utils`. Select a run with exactly one of `--run-dir`, `--run ... --analysis-root ...`, or `--latest --analysis-root ...`.
+`cleangene utils` commands submit SLURM compute jobs by default. The archive commands below also support `--profile local`. The standalone `cleangene-utils` entry point accepts the same subcommands. Results are written under `<run>/results/utils/<analysis-id>` and logs under `<run>/logs/slurm/utils`. Select a run with exactly one of `--run-dir`, `--run ... --analysis-root ...`, or `--latest --analysis-root ...`.
 
 ## Samples and gene calls
 
@@ -103,3 +103,33 @@ for them, and variant/diagnostic utilities read neighboring CDS features from
 them. The nonessential mode gzips other Prokka outputs such as `.sqn`, `.gbk`,
 `.err`, `.ffn`, and `.fna`; the final summary sweep also covers annotations
 created before a resumed controller starts.
+
+## Archived alignments and read-derived MSA
+
+```bash
+cleangene-utils restore-bam --run-dir /path/to/run --organism "Species name" --samples isolate1 --profile slurm
+cleangene-utils inspect-reads --run-dir /path/to/run --organism "Species name" --samples isolate1 --region contig1:100-900 --profile slurm
+cleangene-utils evidence-msa --run-dir /path/to/run --organism "Species name" --genes geneA geneB --profile slurm
+```
+
+Use `--profile local` for local execution. Omit `--samples` to select all retained
+isolates in the organism. `--region` uses each selected isolate's assembly contig
+names; omit it to export all alignment records. These operations require completed
+CRAM archives from the revised validation workflow. Updating code alone does not
+create archives for a completed older run; resume that run to apply current
+validation rules and generate archives.
+
+Each operation checks SHA-256 checksums for the CRAM, CRAI, and retained assembly
+reference, and writes `alignment_evidence.tsv` with their paths and the reference
+checksum. `restore-bam` writes an indexed BAM under each isolate's output directory,
+verifies its records against the original archive, and preserves the CRAM.
+`inspect-reads` exports `reads.sam` directly from CRAM, optionally by region.
+
+`evidence-msa` restores temporary BAMs, reconstructs consensus with the run's depth,
+mapping-quality and base-quality thresholds, lifts known CDS coordinates through
+indels, and aligns available gene sequences with MAFFT. Validated discovered CDS
+are loaded from their discovery sequences. It writes `<gene>.fasta`,
+`<gene>.aligned.fasta`, and `msa_summary.tsv`; unsupported or missing-coordinate
+sequences may be absent, so inspect sequence counts. Temporary BAMs are removed
+after successful consensus extraction. Retained assembly references and CRAM
+files remain available for other read viewers.

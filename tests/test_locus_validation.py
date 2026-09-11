@@ -173,7 +173,7 @@ class LocusValidationTests(unittest.TestCase):
             self.assertEqual(rows['homolog']['evidence_state'],'ambiguous_multimap')
             self.assertEqual(rows['homolog']['validated_call'],'')
             self.assertEqual(rows['missed']['validated_call'],'1')
-            self.assertEqual(rows['missed']['arbitration_status'],'pending')
+            self.assertEqual(rows['missed']['arbitration_status'],'not_required')
             reconstruction=targeted_local_reconstruction(bam=root/'evidence/pangenome_reads.bam',region='r3',reference_seq=sequence[2300:3200],outdir=root/'daughter',threads=2)
             self.assertEqual(reconstruction['status'],'reconstructed')
             self.assertGreaterEqual(reconstruction['candidate']['breadth'],.95)
@@ -183,6 +183,7 @@ class LocusValidationTests(unittest.TestCase):
                     left.write(f'@deletion{index}\n{deleted[start:start+150]}\n+\n'+('I'*150)+'\n')
                     right.write(f'@deletion{index}\n{deleted[start+250:start+400].translate(complement)[::-1]}\n+\n'+('I'*150)+'\n')
             deletion_bam=root/'deletion.bam'
+            subprocess.run(["bwa","index",str(assembly)],check=True,capture_output=True)
             map_reads(assembly,str(r1),str(r2),deletion_bam,2,20,root/'deletion.log',retain_ambiguous=True)
             reconstruction=targeted_local_reconstruction(bam=deletion_bam,region='ctg:1801-3700',reference_seq=sequence[2300:3200],outdir=root/'deletion_daughter',threads=2,flank_junction=sequence[1800:2300]+sequence[3200:3700],junction_offset=500)
             self.assertTrue(reconstruction['deletion_spanned'])

@@ -37,11 +37,13 @@ flowchart TD
     J --> K["Prepare gene references and sample CDS coordinates"]
     K --> L["Map reads to own assembly and pangenome references"]
     L --> M["Classify gene evidence"]
-    M --> N{"Discordance or unresolved assignment?"}
+    M --> N{"Unresolved or borderline evidence?"}
     N -->|Yes| O["Bounded targeted reconstruction and arbitration"]
-    N -->|No| P["Combine gene calls"]
+    N -->|No| P["Archive own-assembly BAM as verified CRAM + CRAI"]
     O --> P
-    P --> Q["Binary matrices, evidence tables, and cohort summaries"]
+    P --> R["After all isolates: cluster discovered CDS at 95% similarity"]
+    R --> S["Consolidate gene catalogue and calls; preserve existing gene names"]
+    S --> Q["Binary matrices, evidence tables, and cohort summaries"]
 ```
 
 The diagram shows stage dependencies. Slurm may overlap independent samples and
@@ -55,35 +57,30 @@ per-isolate manifest overrides.
 
 ## Gene presence and absence decisions
 
-Panaroo supplies the initial calls. Initial positives are evaluated at their
-sample-specific CDS coordinates using reads mapped to the isolate's own assembly.
-Initial negatives are searched against pangenome references to recover genes
-missed by assembly or annotation. Missing CDS coordinates also require the
-reference-search fallback.
+Panaroo supplies the initial calls. Every tested gene undergoes competitive
+mapping against Panaroo gene references and reconstructed-sequence identity/ORF
+evaluation. Initial positives also use sample-specific CDS coordinates and
+own-assembly read support. Missing coordinates or an unsupported own locus with
+competitive read evidence use the pangenome-reference fallback.
 
 ```mermaid
 flowchart TD
-    A{"Initial Panaroo call"} -->|Present| B["Own-assembly CDS support"]
-    A -->|Absent| C["Pangenome reference search"]
-    B --> D["Evaluate breadth, depth, consensus identity, and mapping ambiguity"]
-    C --> D
-    D --> E{"Family supported but exact assignment unresolved?"}
-    E -->|Yes| F["ambiguous_multimap"]
-    E -->|No| G["Classify sequence evidence using configured thresholds"]
-    G --> H["confirmed_present or divergent_variant: call 1"]
-    G --> I["possible_truncation: retain initial positive provisionally"]
-    G --> J["partial_homolog: intact-gene call 0"]
-    G --> K["not_detected or insufficient_evidence"]
-    F --> L["Arbitrate discordant and unresolved cases"]
-    I --> L
-    J -->|Initial positive| L
-    K -->|Initial positive| L
-    H -->|Recovered initial negative| L
-    L --> M{"Targeted reconstruction outcome"}
-    M -->|Supported deletion junction| N["confirmed_absent_locus: call 0"]
-    M -->|Resolved candidate sequence| O["Update call and evidence state"]
-    M -->|Unresolved or case limit reached| P["Retain evidence and mark unresolved or deferred"]
-    K -->|Initial negative with no evidence| Q["not_detected: call 0; absence not proven"]
+    A["Own-assembly and competitive Panaroo mapping"] --> B["Reconstruct sequence; evaluate identity and ORF"]
+    B --> C{"Mapped reads = 0 AND breadth = 0?"}
+    C -->|Yes| Z["Final absence: 0 to 0 or 1 to 0; no arbitration"]
+    C -->|No| D{"Depth gate passed, breadth ≥95%, identity ≥95%?"}
+    D -->|Yes| P["Final presence: 1 to 1 or 0 to 1; no arbitration"]
+    D -->|No| E["Classify borderline or unresolved evidence"]
+    E --> F["Rank by state, then descending identity or breadth"]
+    F --> G{"Within 3% of initial Panaroo-present genes?"}
+    G -->|No| H["Mark deferred; retain provisional call and evidence"]
+    G -->|Yes| I["Targeted reconstruction and arbitration"]
+    I --> J{"Reconstruction outcome"}
+    J -->|Supported deletion junction| K["Confirmed absent locus: call 0"]
+    J -->|Resolved sequence| L["Update original call with sequence evidence"]
+    J -->|Distinct CDS or complete truncation candidate| M["Validate full CDS with recruited reads; assign provisional CGNEW name"]
+    J -->|Unresolved| N["Retain provisional call; mark unresolved"]
+    M --> O["After all isolates: cluster at 95%; merge equivalents; publish sequences and calls"]
 ```
 
 The flowchart summarizes routing. The evidence table below defines the primary
@@ -96,11 +93,12 @@ states; arbitration can refine a provisional decision.
 | `possible_truncation` | Breadth ≥70% but <95%, identity ≥95%, and sufficient depth. | Initial positive remains provisionally `1`; otherwise unresolved |
 | `partial_homolog` | Partial coverage or weak sequence similarity does not support an intact gene. | `0`, with evidence retained |
 | `ambiguous_multimap` | Reads support a family but cannot resolve the exact cluster. | Unresolved; no automatic presence for every homolog |
-| `not_detected` | No meaningful read evidence. | Initial negative stays `0`; initial positive requires arbitration |
+| `not_detected` | Mapped reads = 0 and breadth = 0. | Final `0` for either initial call; no arbitration |
 | `insufficient_evidence` | Depth or reconstructed identity is insufficient for a decision. | Unresolved; preserve the initial binary call unless resolved |
 | `confirmed_absent_locus` | A local reconstruction supports a deletion junction spanning both flanks. | `0`, with physical absence evidence |
 
-**Zero unique mappings do not prove biological absence.** Unresolved validated
+**Operational absence differs from a demonstrated deletion.** Zero unique
+mappings alone do not imply absence when ambiguous mappings remain. Unresolved validated
 calls can be blank in the evidence table. When no resolved replacement exists,
 the binary matrix preserves the initial call; consult the evidence table when
 interpreting that value. `partial_homolog` and `confirmed_absent_locus` both permit
@@ -111,6 +109,25 @@ alignment identity. Own-locus identity uses the sample CDS as its reference;
 recovery uses the pangenome reference. Normalized depth is gene depth divided by
 a representative sample depth estimate and is supporting evidence, not a universal
 presence threshold.
+
+Arbitration is capped at `floor(0.03 × initial Panaroo-present genes)` per isolate,
+including Panaroo-present genes outside a restricted validation scope. This is
+zero cases below 34 present genes. Priority is `divergent_variant` (highest identity
+first), `possible_truncation`, `partial_homolog`, then `insufficient_evidence`
+(highest breadth first within each state). Ambiguous family assignments follow
+those categories. Cases beyond the cap retain explicit `deferred_limit` status.
+
+Discovery requires a complete, target-overlapping Prodigal CDS, an intact start/stop
+ORF, and recruited-read support meeting the depth gate, 95% breadth and 95% identity.
+New CDS receive content-derived `CGNEW_…` names. After all isolates finish,
+CD-HIT-EST clusters discoveries at 95% nucleotide identity and 95% reciprocal
+coverage; equivalent existing genes retain their Panaroo names. The consolidated
+catalogue and presence/absence matrix include genuinely distinct discoveries.
+This rebuilds the sequence catalogue and call matrix; the original Panaroo graph
+remains an input artifact. New genes have supported `1` calls in discovery isolates;
+other isolates have `new_gene_not_tested` evidence and binary `0` placeholders,
+which must not be interpreted as demonstrated absence. No extra all-isolate
+mapping pass is implied by consolidation.
 
 ## Installation
 
@@ -247,12 +264,17 @@ between zero and one, not percentages.
 | `READ_VALIDATION_TRUNCATION_MIN_BREADTH` | `0.70` | Lower breadth threshold for possible truncation. |
 | `READ_VALIDATION_DIVERGENT_MIN_BREADTH` | `0.90` | Minimum divergent-variant breadth. |
 | `READ_VALIDATION_DIVERGENT_MIN_IDENTITY` | `0.90` | Minimum divergent-variant identity. |
-| `READ_VALIDATION_ARBITRATION_MAX_CASES` | `20` | Maximum reconstruction cases per isolate. |
+| `READ_VALIDATION_ARBITRATION_FRACTION` | `0.03` | Fraction of initial Panaroo-present genes permitted arbitration, rounded down. |
+| `NOVEL_GENE_CLUSTER_IDENTITY` | `0.95` | Global nucleotide identity for discovery consolidation. |
+| `NOVEL_GENE_CLUSTER_COVERAGE` | `0.95` | Required alignment coverage of both sequences. |
 | `READ_VALIDATION_ARBITRATION_MAX_READS` | `100000` | Maximum recruited read names per reconstruction. |
 | `READ_VALIDATION_ARBITRATION_MEMORY_GB` | `12` | SPAdes memory cap for reconstruction. |
 | `READ_VALIDATION_FLANK_LENGTH` | `500` | Flanking bases used for locus investigation. |
 | `READ_VALIDATION_DELETION_MIN_IDENTITY` | `0.95` | Minimum junction sequence identity. |
 | `READ_VALIDATION_DELETION_MIN_ANCHOR` | `50` | Contiguous aligned bases on each side of the junction. |
+
+The legacy `READ_VALIDATION_ARBITRATION_MAX_CASES` setting is superseded by the
+fraction and no longer controls arbitration.
 
 Use `SLURM_PREPROCESS_MAX_INFLIGHT`, `SLURM_VALIDATION_MAX_INFLIGHT`, and
 `SLURM_ARBITRATION_MAX_INFLIGHT` to control concurrency. Stage-specific CPU,
@@ -338,9 +360,31 @@ cleangene reconcile-preprocess --run-dir /data/cleangene-analysis/runs/<run-id>
 analysis, read-backed variants, iTOL exports, and post-hoc CheckM2 assessment.
 See the [utilities guide](docs/UTILS.md) for commands and output descriptions.
 
+Own-assembly alignments are archived automatically after validation/arbitration.
+Each isolate retains `own_assembly_reads.cram`, its `.cram.crai` index, the exact
+`own_assembly_reference.fasta`, reference/source SHA-256 metadata, and a verified
+archive manifest. BAM/BAI removal occurs only after alignment-level round-trip
+verification. Competitive `pangenome_reads.bam` remains available as gene evidence.
+
+```bash
+cleangene-utils restore-bam --run-dir /path/to/run --organism "Species name" --samples isolate1 --profile slurm
+cleangene-utils inspect-reads --run-dir /path/to/run --organism "Species name" --samples isolate1 --region contig1:1000-2000 --profile slurm
+cleangene-utils evidence-msa --run-dir /path/to/run --organism "Species name" --genes geneA geneB --profile slurm
+```
+
+These commands also accept `--profile local`, and are available as
+`cleangene utils <command>`. Restoration preserves the archive and verifies the
+restored BAM. MSA uses archived read consensus at known CDS coordinates and
+validated discovered CDS; its summary reports how many sequences were available.
+
+Consolidated outputs in `03_read_validation/` include
+`validated_gene_sequences.fasta`, `discovered_gene_aliases.tsv`, and
+`discovered_gene_sources.tsv`. Summary counts include discovered rows, using
+`initial_calls.with_discovered_genes.tsv` as the comparison matrix.
+
 ## Interpretation and scope
 
-Local reconstruction is limited to discordant cases. Exact allele resolution
+Local reconstruction is limited to unresolved or borderline cases within the arbitration cap. Exact allele resolution
 among highly similar homologs can remain unresolved, and automatic transfer of
 flanking loci from other isolates is not currently implemented. ORF checks are
 basic; normalized depth uses an assembly-based chromosomal proxy. Cohort-scale

@@ -4,14 +4,14 @@ from pathlib import Path
 from .fasta import read_fasta, write_fasta
 from .util import read_tsv, run, write_tsv
 
-EVIDENCE_VERSION="2"
+EVIDENCE_VERSION="3"
 
-METRIC_FIELDS=["evidence_version","family_breadth","reconstructed_coverage","reference_id","Gene","initial_call","validated_call","evidence_state","validation_state","decision_reason","decision_metrics","junction_identity","junction_spanning_alignment","flank_anchor_length","sequence_resolution","final_call_source","breadth","percent_coverage","mean_depth","normalized_depth","identity","percent_identity","identity_method","reconstructed_length","identical_positions","aligned_positions","reference_length","orf_integrity","mapped_reads","unique_mapped_reads","ambiguous_mapped_reads","mean_mapping_quality","assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus","arbitration_status","arbitration_reason"]
+METRIC_FIELDS=["evidence_version","family_breadth","reconstructed_coverage","competitive_breadth","competitive_identity","competitive_orf_integrity","competitive_mapped_reads","reference_id","Gene","initial_call","validated_call","evidence_state","validation_state","decision_reason","decision_metrics","junction_identity","junction_spanning_alignment","flank_anchor_length","sequence_resolution","final_call_source","breadth","percent_coverage","mean_depth","normalized_depth","identity","percent_identity","identity_method","reconstructed_length","identical_positions","aligned_positions","reference_length","orf_integrity","mapped_reads","unique_mapped_reads","ambiguous_mapped_reads","mean_mapping_quality","assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus","arbitration_status","arbitration_reason"]
 
 def map_reads(reference: Path,r1: str,r2: str,bam: Path,threads: int,min_mapq: int,log: Path,*,retain_ambiguous: bool=False) -> None:
     bam.parent.mkdir(parents=True,exist_ok=True); log.parent.mkdir(parents=True,exist_ok=True)
     marker=bam.with_suffix(".mapping.json")
-    signature={"version":EVIDENCE_VERSION,"min_mapq":min_mapq,"retain_ambiguous":retain_ambiguous,"inputs":[[str(Path(x).resolve()),Path(x).stat().st_size,Path(x).stat().st_mtime_ns] for x in (reference,r1,r2)]}
+    signature={"version":EVIDENCE_VERSION,"min_mapq":min_mapq,"retain_ambiguous":retain_ambiguous,"inputs":[[str(Path(x).resolve()),Path(x).stat().st_size,Path(x).stat().st_mtime_ns] for x in ([reference,r1]+([r2] if r2 else []))]}
     if marker.is_file() and bam.is_file() and Path(str(bam)+".bai").is_file():
         try:
             if json.loads(marker.read_text())==signature: return
@@ -21,7 +21,7 @@ def map_reads(reference: Path,r1: str,r2: str,bam: Path,threads: int,min_mapq: i
     if not retain_ambiguous: view += ["-F","3332","-q",str(min_mapq)]
     view.append("-")
     with log.open("w") as err:
-        bwa_command=["bwa","mem"]+(["-a"] if retain_ambiguous else [])+["-t",str(threads),str(reference),r1,r2]
+        bwa_command=["bwa","mem"]+(["-a"] if retain_ambiguous else [])+["-t",str(threads),str(reference),r1]+([r2] if r2 else [])
         bwa=subprocess.Popen(bwa_command,stdout=subprocess.PIPE,stderr=err)
         sam=subprocess.Popen(view,stdin=bwa.stdout,stdout=subprocess.PIPE,stderr=err)
         assert bwa.stdout is not None and sam.stdout is not None; bwa.stdout.close()
@@ -108,7 +108,7 @@ def best_sequence_match(reference_seq: str, contigs: Path, work: Path) -> dict[s
     for line in p.stdout.splitlines():
         f=line.split("\t")
         if len(f)<12: continue
-        candidate={"identity":int(f[9])/int(f[10]) if int(f[10]) else 0,"aligned_length":int(f[10]),"identical_positions":int(f[9]),"query_aligned_length":int(f[3])-int(f[2]),"reference_length":len(reference_seq),"breadth":min(1.0,(int(f[8])-int(f[7]))/max(1,len(reference_seq))),"contig":f[0],"reference_start":int(f[7]),"reference_end":int(f[8]),"alignment_cigar":next((x[5:] for x in f[12:] if x.startswith("cg:Z:")),"")}
+        candidate={"identity":int(f[9])/int(f[10]) if int(f[10]) else 0,"aligned_length":int(f[10]),"identical_positions":int(f[9]),"query_aligned_length":int(f[3])-int(f[2]),"reference_length":len(reference_seq),"breadth":min(1.0,(int(f[8])-int(f[7]))/max(1,len(reference_seq))),"contig":f[0],"query_start":int(f[2]),"query_end":int(f[3]),"strand":f[4],"reference_start":int(f[7]),"reference_end":int(f[8]),"alignment_cigar":next((x[5:] for x in f[12:] if x.startswith("cg:Z:")),"")}
         if best is None or (candidate["breadth"],candidate["identity"])>(best["breadth"],best["identity"]): best=candidate
     return best
 
@@ -151,24 +151,37 @@ def targeted_local_reconstruction(*,bam: Path,region: str,reference_seq: str,out
     deletion=best_sequence_match(flank_junction,contigs,outdir/"deletion_match") if flank_junction else None
     if deletion: deletion["flank_anchor_length"]=junction_anchor_length(deletion,junction_offset)
     deletion_spanned=bool(deletion and junction_offset>=deletion_anchor and len(flank_junction)-junction_offset>=deletion_anchor and deletion["identity"]>=deletion_identity and spans_junction(deletion,junction_offset,deletion_anchor))
-    return {"status":"reconstructed","candidate":match,"deletion_spanned":deletion_spanned,"deletion":deletion}
+    return {"status":"reconstructed","candidate":match,"deletion_spanned":deletion_spanned,"deletion":deletion,"contigs_path":str(contigs),"recruited_reads":len(read_names)}
 
 def classify_gene_evidence(*,initial_call: int=0,mapped_reads: float,breadth: float,mean_depth: float,identity: float|None,min_breadth: float=.95,min_depth: float=5,min_identity: float=.95,truncation_breadth: float=.70,divergent_breadth: float=.90,divergent_identity: float=.90,unique_reads: float|None=None,ambiguous_reads: float=0) -> dict[str,object]:
-    if ambiguous_reads>0 and (unique_reads or 0)==0: state,call,source="ambiguous_multimap","","arbitration_pending"
-    elif not mapped_reads or not breadth: state,call,source="not_detected","" if initial_call else 0,"arbitration_pending" if initial_call else "read_validation"
-    elif mean_depth<min_depth or identity is None: state,call,source="insufficient_evidence","","initial_call_unresolved"
-    elif breadth>=min_breadth and identity>=min_identity: state,call,source="confirmed_present",1,"own_locus_read_validation" if initial_call else "pangenome_read_recovery"
-    elif breadth>=divergent_breadth and divergent_identity<=identity<min_identity: state,call,source="divergent_variant",1,"read_validation"
+    if mapped_reads==0 and breadth==0: state,call,source="not_detected",0,"read_validation"
+    elif mean_depth>=min_depth and identity is not None and breadth>=min_breadth and identity>=min_identity:
+        state,call,source="confirmed_present",1,"own_locus_read_validation" if initial_call else "pangenome_read_recovery"
+    elif ambiguous_reads>0 and (unique_reads or 0)==0: state,call,source="ambiguous_multimap","","arbitration_pending"
+    elif mean_depth<min_depth or identity is None: state,call,source="insufficient_evidence","","arbitration_pending"
+    elif breadth>=divergent_breadth and divergent_identity<=identity<min_identity: state,call,source="divergent_variant",1,"arbitration_pending"
     elif breadth>=truncation_breadth and identity>=min_identity: state,call,source="possible_truncation",1 if initial_call else "","arbitration_pending"
-    else: state,call,source="partial_homolog",0,"arbitration_pending" if initial_call else "read_validation"
+    else: state,call,source="partial_homolog",0,"arbitration_pending"
     from .validation_summary import STATE_METRICS
     metrics=STATE_METRICS[state]
-    if state=="not_detected": metrics=("mapped_reads",) if not mapped_reads else ("breadth",)
+    if state=="not_detected": metrics=("mapped_reads","breadth")
     elif state=="insufficient_evidence": metrics=("mean_depth",) if mean_depth<min_depth else ("identity",)
     return {"evidence_state":state,"validation_state":state,"validated_call":call,"final_call_source":source,"decision_reason":state.replace("_"," "),"decision_metrics":";".join(metrics)}
 
 def validation_decision_logic_rows(min_breadth="0.95",min_depth="5",min_identity="0.95") -> list[list[str]]:
-    return [["confirmed_present",f"breadth >= {min_breadth}; identity >= {min_identity}; depth >= {min_depth}","1","Intact sequence supported"],["possible_truncation","breadth 0.70 to confirmed threshold; high identity","initial positive: 1 pending arbitration","Possible endpoint or assembly break"],["divergent_variant","breadth >= 0.90; identity 0.90 to confirmed threshold","1","Divergent full-length allele"],["partial_homolog","breadth below 0.70 or weak similarity","0","Related sequence, not an intact gene"],["ambiguous_multimap","family mappings but no unique assignment","preserve/arbitrate","Family present; exact cluster unresolved"],["not_detected","no meaningful read evidence","initial positive: arbitrate; otherwise 0","Absence not proven without locus evidence"],["confirmed_absent_locus","flank reconstruction spans deletion","0","Physical deletion junction supported"]]
+    return [
+        ["confirmed_present",f"breadth >= {min_breadth}; identity >= {min_identity}; depth >= {min_depth}","1 without arbitration","Sequence presence supported; ORF evaluated separately"],
+        ["not_detected","mapped_reads = 0 AND breadth = 0","0 without arbitration","Operational absence; distinct from a demonstrated deletion"],
+        ["possible_truncation","breadth 0.70 to confirmed threshold; high identity","initial positive: 1 pending arbitration","Possible endpoint or assembly break"],
+        ["divergent_variant","breadth >= 0.90; identity 0.90 to confirmed threshold","1 pending arbitration","Divergent allele"],
+        ["partial_homolog","partial coverage or weak similarity","0 pending arbitration","Related sequence; discovery may identify a distinct CDS"],
+        ["insufficient_evidence",f"depth < {min_depth} or reconstructed identity unavailable","preserve initial call pending arbitration","Insufficient sequence support"],
+        ["ambiguous_multimap","family mappings but no unique assignment","preserve/arbitrate","Family present; exact cluster unresolved"],
+        ["confirmed_absent_locus","flank reconstruction spans deletion","0","Physical deletion junction supported"],
+        ["discovered_complete_cds","complete predicted CDS; intact ORF; recruited-read depth, breadth and identity gates","1 in supporting isolate after consolidation","New CDS or rediscovery of an existing gene"],
+        ["new_gene_not_tested","new gene discovered in another isolate; no direct test in this isolate","0 placeholder; unresolved evidence","Not demonstrated absence"],
+    ]
+
 
 def _slice(seqs: dict[str,str],row: dict[str,str]) -> str:
     seq=seqs.get(row.get("assembly_scaffold",""),"")[int(row.get("cds_start") or 1)-1:int(row.get("cds_end") or 0)]
@@ -177,34 +190,40 @@ def _slice(seqs: dict[str,str],row: dict[str,str]) -> str:
 def validate_isolate(reference: Path,key_tsv: Path,locus_tsv: Path,assembly: Path,r1: str,r2: str,outdir: Path,threads: int,min_breadth: float,min_depth: float,min_identity: float,min_mapq: int,basequal: int,*,initial_calls: dict[str,int]|None=None,truncation_breadth: float=.70,divergent_breadth: float=.90,divergent_identity: float=.90) -> None:
     outdir.mkdir(parents=True,exist_ok=True); keys=read_tsv(key_tsv); locus_rows=read_tsv(locus_tsv); loci={}; initial_calls=initial_calls or {}
     for locus_row in locus_rows: loci.setdefault(locus_row["Gene"],[]).append(locus_row)
-    if assembly.suffix==".gz":
-        uncompressed=outdir/"own_assembly.fasta"
-        if not uncompressed.is_file(): write_fasta(uncompressed,list(read_fasta(assembly).items()))
-        assembly=uncompressed
+    from .alignment_archive import retain_reference, restore_own_bam
+    assembly=retain_reference(assembly,outdir)
+    if not (outdir/"own_assembly_reads.bam").is_file() and (outdir/"own_assembly_reads.archive.json").is_file():
+        restore_own_bam(outdir,outdir/"own_assembly_reads.bam",threads)
     if not Path(str(assembly)+".bwt").is_file(): run(["bwa","index",str(assembly)],stdout=outdir/"own_assembly_bwa_index.stdout",stderr=outdir/"own_assembly_bwa_index.stderr")
     if not Path(str(assembly)+".fai").is_file(): run(["samtools","faidx",str(assembly)])
     own=outdir/"own_assembly_reads.bam"; map_reads(assembly,r1,r2,own,threads,min_mapq,outdir/"own_assembly_bwa.log",retain_ambiguous=True); own_cov=coverage(own,min_mapq); chrom_depth=representative_depth(own_cov,assembly)
     own_cons=read_fasta(consensus(assembly,own,outdir/"own_assembly_reads",min_depth,min_mapq,basequal)); assembly_seqs=read_fasta(assembly)
     locus_metrics=locus_coverage(own,locus_rows,outdir,min_mapq)
     def locus_key(row): return (row["assembly_scaffold"],int(row["cds_start"]),int(row["cds_end"]))
-    search=outdir/"pangenome_reads.bam"; map_reads(reference,r1,r2,search,threads,min_mapq,outdir/"pangenome_bwa.log",retain_ambiguous=True); search_cov=coverage(search,min_mapq,include_ambiguous=True); search_unique_cov=coverage(search,min_mapq); search_cons=read_fasta(consensus(reference,search,outdir/"pangenome_reads",min_depth,min_mapq,basequal)); refs=read_fasta(reference); rows=[]
+    search=outdir/"pangenome_reads.bam"; map_reads(reference,r1,r2,search,threads,min_mapq,outdir/"pangenome_bwa.log",retain_ambiguous=True); search_cov=coverage(search,min_mapq,include_ambiguous=True); search_unique_cov=coverage(search,min_mapq); search_cons=read_fasta(consensus(reference,search,outdir/"pangenome_reads",min_depth,min_mapq,basequal)); refs=read_fasta(reference); rows=[]; reconstructions=[]
     for key in keys:
         gene=key["Gene"]; initial=int(initial_calls.get(gene,key.get("initial_call",0))); candidates=loci.get(gene,[]) if initial else []; locus=max(candidates,key=lambda r:(locus_metrics[locus_key(r)]["breadth"],locus_metrics[locus_key(r)]["mean_depth"])) if candidates else None
-        if locus:
+        competitive=search_cov.get(key["reference_id"],{})
+        competitive_sequence=search_cons.get(key["reference_id"],"")
+        competitive_identity=sequence_identity(refs.get(key["reference_id"],""),competitive_sequence) if competitive_sequence else None
+        use_locus=bool(locus and (locus_metrics[locus_key(locus)]["mapped_reads"] or locus_metrics[locus_key(locus)]["ambiguous_mapped_reads"] or not competitive.get("mapped_reads")))
+        if use_locus:
             c=locus_metrics[locus_key(locus)]; refseq=_slice(assembly_seqs,locus); reconstructed=consensus_locus(own_cons,locus,outdir/"own_assembly_reads.chain"); ident=sequence_identity(refseq,reconstructed); unique=int(c["mapped_reads"]); ambiguous=int(c["ambiguous_mapped_reads"]); resolution="exact"
         else:
             c=search_cov.get(key["reference_id"],{}); refseq=refs.get(key["reference_id"],""); reconstructed=search_cons.get(key["reference_id"],"") if c.get("breadth",0) else ""; ident=sequence_identity(refseq,reconstructed) if reconstructed else None; total=int(c.get("mapped_reads",0)); unique=int(search_unique_cov.get(key["reference_id"],{}).get("mapped_reads",0)); ambiguous=max(0,total-unique); resolution="reconstructed" if unique else "family_only" if ambiguous else "unresolved"
         family_breadth=float(c.get("breadth",0))
-        if not locus and unique:
+        if not use_locus and unique:
             c=search_unique_cov.get(key["reference_id"],{})
-        identity=None if not ident else ident["identity"]; decision=classify_gene_evidence(initial_call=initial,mapped_reads=float(c.get("mapped_reads",0)),breadth=float(c.get("breadth",0)),mean_depth=float(c.get("mean_depth",0)),identity=identity,min_breadth=min_breadth,min_depth=min_depth,min_identity=min_identity,truncation_breadth=truncation_breadth,divergent_breadth=divergent_breadth,divergent_identity=divergent_identity,unique_reads=unique,ambiguous_reads=ambiguous)
+        identity=None if not ident else ident["identity"]; decision=classify_gene_evidence(initial_call=initial,mapped_reads=unique+ambiguous,breadth=float(c.get("breadth",0)),mean_depth=float(c.get("mean_depth",0)),identity=identity,min_breadth=min_breadth,min_depth=min_depth,min_identity=min_identity,truncation_breadth=truncation_breadth,divergent_breadth=divergent_breadth,divergent_identity=divergent_identity,unique_reads=unique,ambiguous_reads=ambiguous)
         if ambiguous and float(c.get("breadth",0))<min_breadth and family_breadth>=min_breadth:
             decision.update(evidence_state="ambiguous_multimap",validation_state="ambiguous_multimap",validated_call="",final_call_source="arbitration_pending",decision_reason="ambiguous multimap",decision_metrics="ambiguous_mapped_reads;breadth;family_breadth"); resolution="family_only"
         if decision["evidence_state"]=="ambiguous_multimap": resolution="family_only"
         elif decision["evidence_state"] in {"not_detected","insufficient_evidence"}: resolution="unresolved"
-        row={f:"" for f in METRIC_FIELDS}; row.update(key); row.update(decision); row.update({"evidence_version":EVIDENCE_VERSION,"family_breadth":family_breadth,"reconstructed_coverage":min(1.,sum(b in "ACGTacgt" for b in reconstructed)/len(refseq)) if refseq else 0.,"initial_call":initial,"sequence_resolution":resolution,"breadth":c.get("breadth",0),"percent_coverage":float(c.get("breadth",0))*100,"mean_depth":c.get("mean_depth",0),"normalized_depth":float(c.get("mean_depth",0))/chrom_depth if chrom_depth else "","identity":"NA" if identity is None else identity,"percent_identity":"NA" if identity is None else identity*100,"identity_method":ident.get("identity_method","") if ident else "","reconstructed_length":len(reconstructed.replace("N","")),"identical_positions":ident.get("identical_positions","") if ident else "","aligned_positions":ident.get("aligned_positions","") if ident else "","reference_length":len(refseq),"orf_integrity":orf_integrity(reconstructed),"mapped_reads":unique+ambiguous,"unique_mapped_reads":unique,"ambiguous_mapped_reads":ambiguous,"mean_mapping_quality":c.get("mean_mapping_quality","")});
+        row={f:"" for f in METRIC_FIELDS}; row.update(key); row.update(decision); row.update({"evidence_version":EVIDENCE_VERSION,"competitive_breadth":competitive.get("breadth",0),"competitive_identity":competitive_identity["identity"] if competitive_identity else "NA","competitive_orf_integrity":orf_integrity(competitive_sequence),"competitive_mapped_reads":competitive.get("mapped_reads",0),"family_breadth":family_breadth,"reconstructed_coverage":min(1.,sum(b in "ACGTacgt" for b in reconstructed)/len(refseq)) if refseq else 0.,"initial_call":initial,"sequence_resolution":resolution,"breadth":c.get("breadth",0),"percent_coverage":float(c.get("breadth",0))*100,"mean_depth":c.get("mean_depth",0),"normalized_depth":float(c.get("mean_depth",0))/chrom_depth if chrom_depth else "","identity":"NA" if identity is None else identity,"percent_identity":"NA" if identity is None else identity*100,"identity_method":ident.get("identity_method","") if ident else "","reconstructed_length":len(reconstructed.replace("N","")),"identical_positions":ident.get("identical_positions","") if ident else "","aligned_positions":ident.get("aligned_positions","") if ident else "","reference_length":len(refseq),"orf_integrity":orf_integrity(reconstructed),"mapped_reads":unique+ambiguous,"unique_mapped_reads":unique,"ambiguous_mapped_reads":ambiguous,"mean_mapping_quality":c.get("mean_mapping_quality","")});
         if locus: row.update({k:locus.get(k,"") for k in ("assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus")})
-        row["arbitration_status"]="pending" if row["final_call_source"]=="arbitration_pending" or (not initial and row["validated_call"]==1) or (initial and row["evidence_state"]=="insufficient_evidence") else "not_required"; rows.append(row)
+        row["arbitration_status"]="pending" if row["final_call_source"]=="arbitration_pending" else "not_required"; rows.append(row)
+        if reconstructed: reconstructions.append((key["reference_id"],reconstructed))
+    write_fasta(outdir/"validated_sequences.fasta",reconstructions)
     write_tsv(outdir/"metrics.tsv",METRIC_FIELDS,rows)
 
 

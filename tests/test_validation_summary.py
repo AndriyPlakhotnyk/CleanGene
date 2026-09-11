@@ -79,7 +79,7 @@ class ValidationSummaryTests(unittest.TestCase):
         metrics,source=decision_metric_membership({'decision_reason':'unknown old decision'})
         self.assertEqual(source,'unavailable'); self.assertEqual(metrics,('unrecorded_evidence',))
         result=classify_gene_evidence(mapped_reads=0,breadth=0,mean_depth=0,identity=None)
-        self.assertEqual(result['decision_metrics'],'mapped_reads')
+        self.assertEqual(result['decision_metrics'],'mapped_reads;breadth')
         self.assertEqual(decision_metric_membership(result)[1],'recorded')
 
     def test_cohort_percentages_are_weighted_by_calls(self):

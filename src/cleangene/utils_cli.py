@@ -24,6 +24,11 @@ def add_utils_parser(sub) -> None:
     diagnostic=utilities.add_parser("diagnose-call",aliases=["diagnose_call"]); _run_args(diagnostic); _organism_args(diagnostic); diagnostic.add_argument("--genes",nargs="+",required=True); diagnostic.add_argument("--max-samples",type=int,default=20); diagnostic.add_argument("--skip-assembly-replay",action="store_true")
     itol=utilities.add_parser("itol",aliases=["get_itol"]); _run_args(itol); _organism_args(itol); itol.add_argument("--genes",nargs="*",default=[]); itol.add_argument("--operon",type=Path); itol.add_argument("--variants",type=Path); itol.add_argument("--color-scheme",choices=("classic","muted","custom"),default="classic"); itol.add_argument("--custom-colors",type=Path)
     checkm2=utilities.add_parser("checkm2",aliases=["checkm2-posthoc","checkm2_posthoc"]); _run_args(checkm2); _organism_args(checkm2); checkm2.add_argument("--force",action="store_true")
+    for name in ("restore-bam", "inspect-reads", "evidence-msa"):
+        parser=utilities.add_parser(name); _run_args(parser); _organism_args(parser)
+        parser.add_argument("--profile",choices=("local","slurm"),default="slurm")
+        if name=="inspect-reads": parser.add_argument("--region")
+        if name=="evidence-msa": parser.add_argument("--genes",nargs="+",required=True)
     root.set_defaults(func=utils_command)
 
 def locate_run(args) -> Path:
@@ -89,6 +94,11 @@ def _resolve_result(path: Path, filename: str) -> str:
 
 def _request(args, run: Path) -> dict[str,object]:
     samples=_samples(args); kind=args.utility.replace("-","_")
+    if kind in {"restore_bam","inspect_reads","evidence_msa"}:
+        organism=resolve_organism(run,args.organism,samples)
+        genes=getattr(args,"genes",[]) or []
+        validate_matrix_selection(run,organism,genes,samples)
+        return {"utility":kind,"organism":organism,"samples":samples,"genes":genes,"region":getattr(args,"region",None)}
     if kind=="get_samples":
         organism=resolve_organism(run,args.organism,samples); validate_matrix_selection(run,organism,args.genes,samples)
         return {"utility":kind,"organism":organism,"genes":args.genes,"samples":samples,"status":args.status,"match":args.match}
@@ -174,8 +184,21 @@ def utils_command(args) -> int:
         resource="DIAGNOSTIC" if request["utility"]=="diagnose_call" else "VARIANT" if request["utility"]=="get_variants" else ""
         cpus=cfg.get(f"UTILS_{resource}_CPUS" if resource else "UTILS_CPUS","8"); mem=cfg.get(f"UTILS_{resource}_MEM" if resource else "UTILS_MEM","32G"); limit=cfg.get(f"UTILS_{resource}_TIME" if resource else "UTILS_TIME","12:00:00")
         request.update({"run_dir":str(run),"output_dir":str(out),"analysis_id":analysis_id,"submitted":datetime.now().isoformat(),"cpus":int(cpus),"min_mapq":int(cfg.get("READ_VALIDATION_MIN_MAPQ","20")),"min_depth":float(cfg.get("READ_VALIDATION_MIN_MEAN_DEPTH","5")),"basequal":int(cfg.get("BASEQUAL","30"))}); request_path=out/"request.json"; atomic_json(request_path,request)
+        if getattr(args,"profile","slurm")=="local":
+            if args.dry_run: print(f"Would run {request['utility']} locally: {request_path}")
+            else:
+                from .downstream import run_request
+                run_request(request_path)
+                print(completed(f"Analysis complete: {out}"))
+            return 0
         wrap=f"{shlex.quote(sys.executable)} -m cleangene _utils_worker --request {shlex.quote(str(request_path))}"
         command=sbatch_cmd(name=f"cg-util-{safe_name(str(request['utility']))[:20]}",wrap=wrap,cpus=cpus,mem=mem,time=limit,account=cfg.get("SLURM_ACCOUNT",""),partition=cfg.get("SLURM_PARTITION",""),log=logs/f"{analysis_id}.%j.log")
         job_id=submit(command,args.dry_run); request["slurm_job_id"]=job_id; atomic_json(request_path,request)
     print(submitted(f"Analysis submitted. Please find logs in {logs}"))
     return 0
+
+
+def main(argv=None) -> int:
+    """Standalone cleangene-utils entry point, sharing the established CLI."""
+    from .cli import main as cli_main
+    return cli_main(["utils", *(sys.argv[1:] if argv is None else argv)])

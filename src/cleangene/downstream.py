@@ -247,6 +247,12 @@ def _plot_variant_alignment(out: Path, records: list[tuple[str,str]], counts: di
 def _gene_references(run_dir: Path, organism: str, genes: list[str]) -> tuple[list[tuple[str,str]],list[dict[str,str]]]:
     isolates,matrix=load_matrix(run_dir,organism); genes=select_genes(matrix,genes)
     root=run_dir/"results"/"groups"/safe_name(organism)
+    consolidated=root/"03_read_validation"/"validated_gene_sequences.fasta"
+    if consolidated.is_file():
+        catalogue=read_fasta(consolidated)
+        if all(gene in catalogue for gene in genes):
+            records=[(f"CGUTIL{i:08d}",catalogue[gene]) for i,gene in enumerate(genes)]
+            return records,[{"reference_id":record[0],"Gene":gene,"feature_type":"target","parent_gene":"","flank_offset":"","annotation":gene} for record,gene in zip(records,genes)]
     from .workers import prepared_pangenome_dir
     panaroo=prepared_pangenome_dir(run_dir,organism,root)
     records,sources=recover_sequences([{"Gene":g} for g in genes],panaroo)
@@ -418,7 +424,10 @@ def checkm2_posthoc_merge(request: dict[str,object]) -> None:
 def run_request(request_path: Path, index: int = -1) -> None:
     request=load_json(request_path); out=Path(str(request["output_dir"])); out.mkdir(parents=True,exist_ok=True)
     kind=str(request["utility"])
-    if kind=="get_samples": get_samples(request)
+    if kind in {"restore_bam","inspect_reads","evidence_msa"}:
+        from .archive_utils import archive_utility
+        archive_utility(request)
+    elif kind=="get_samples": get_samples(request)
     elif kind=="get_differential_genes": differential_genes(request)
     elif kind=="get_operon": get_operon(request)
     elif kind=="get_variants": get_variants(request)

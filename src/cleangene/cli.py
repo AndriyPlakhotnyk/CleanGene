@@ -131,7 +131,7 @@ def check(args) -> int:
     if assembler=="off":
         if any(r.get("raw_bam") for r in rows): required.append("samtools")
     else:
-        required=["shovill" if assembler=="shovill" else "spades.py","prokka","panaroo","bwa","samtools","bcftools","minimap2"]
+        required=["shovill" if assembler=="shovill" else "spades.py","prokka","panaroo","bwa","samtools","bcftools","minimap2","prodigal","cd-hit-est","cd-hit-est-2d"]
     needs_kraken=cfg["TAXONOMY_MODE"] not in {"off","auto"} or any(r.get("grouping_source")=="kraken_pending" for r in rows)
     if needs_kraken: required.append("kraken2")
     mode=checkm2_mode(cfg)
@@ -233,7 +233,7 @@ def doctor(args) -> int:
         target=args.config or Path("config/cleangene.arc.local.env")
         print(f"Configuration fix: edit {target}, then run mamba run -n cleangene cleangene doctor --config {target}")
     else: print("Configuration: OK")
-    for tool in ("shovill","spades.py","prokka","panaroo","bwa","samtools","bcftools","minimap2","fastp","kraken2"):
+    for tool in ("shovill","spades.py","prokka","panaroo","bwa","samtools","bcftools","minimap2","prodigal","cd-hit-est","cd-hit-est-2d","fastp","kraken2"):
         if command_exists(tool): print(f"Primary tool {tool}: OK")
         else:
             failures+=1; print(f"Primary tool {tool}: ERROR missing. Fix: bash scripts/install_or_update.sh --recreate")
