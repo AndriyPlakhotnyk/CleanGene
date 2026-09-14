@@ -829,9 +829,10 @@ class CleanGeneCoreTests(unittest.TestCase):
             write_tsv(run/"provenance"/"manifest.tsv",["isolate_id","group_id"],[["i",group]])
             write_tsv(run/"state"/"group_tasks.tsv",["group_id","n_isolates","group_size_class"],[[group,1,"small"]])
             write_tsv(root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv",["Gene","i"],[["g1",1]])
-            with patch("cleangene.workers.plot_presence_absence") as plot:
-                plot_group(run,0)
-            plot.assert_called_once()
+            write_tsv(root/"02_pangenome/initial_calls/gene_presence_absence.binary.tsv",["Gene","i"],[["g1",0]])
+            plot_group(run,0)
+            self.assertTrue((root/"04_summary/pangenome_presence_absence_before_validation.png").is_file())
+            self.assertTrue((root/"04_summary/pangenome_presence_absence_after_validation.png").is_file())
             self.assertTrue((run/"state"/"plot"/"g.done.json").is_file())
 
     def test_resume_invalidates_legacy_zero_identity_metrics(self):

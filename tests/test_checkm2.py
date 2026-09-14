@@ -203,12 +203,17 @@ class CheckM2DatabaseTests(unittest.TestCase):
 
 
 class CheckM2PreprocessTests(unittest.TestCase):
-    def test_direct_spades_required_checkm2_then_prokka_records_sample_data(self):
+    def test_scratch_preprocess_uses_run_scoped_checkm2_locks(self):
+        self.test_direct_spades_required_checkm2_then_prokka_records_sample_data(scratch=True)
+
+    def test_direct_spades_required_checkm2_then_prokka_records_sample_data(self, scratch=False):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d); r1 = root / "r1.fq"; r2 = root / "r2.fq"; db = root / EXPECTED_CHECKM2_DB_NAME; exe=_write_executable(root/"bin"/"checkm2")
             r1.write_text("@r\n" + "A"*120 + "\n+\n" + "I"*120 + "\n"); r2.write_text(r1.read_text()); _write_db(db)
             manifest = root / "manifest.tsv"; manifest.write_text(f"isolate_id\tgroup_id\tR1\tR2\niso1\tg\t{r1}\t{r2}\n")
             cfg = {"TAXONOMY_MODE": "off", "ASSEMBLER": "spades", "SKIP_TRIM": "true", "CHECKM2_MODE": "required", "CHECKM2_EXECUTABLE": str(exe), "CHECKM2_DB": str(db), "READ_TRIMMING_MODE": "off", "QC_MIN_N50_PASS": "0", "QC_MIN_N50_FAIL": "0", "QC_MIN_COVERAGE_PASS": "0", "QC_MIN_COVERAGE_FAIL": "0", "PREPROCESS_USE_NODE_LOCAL_SCRATCH": "false", "COMPRESS_ASSEMBLY_OUTPUTS": "intermediates", "COMPRESS_ANNOTATION_OUTPUTS": "nonessential"}
+            cfg["PREPROCESS_USE_NODE_LOCAL_SCRATCH"]="true" if scratch else "false"
+            cfg["PREPROCESS_SCRATCH_DIR"]=str(root/"scratch")
             run = make_run(manifest, root, cfg, "r"); commands = []
 
             def fake_run(command, **kwargs):
@@ -234,7 +239,11 @@ class CheckM2PreprocessTests(unittest.TestCase):
             self.assertIn(str(exe.resolve()), [c[0] for c in commands])
             checkm2_call=next(call for call in runner.call_args_list if Path(call.args[0][0]).name=="checkm2")
             self.assertEqual(checkm2_call.args[0][checkm2_call.args[0].index("--threads")+1],"1")
-            self.assertEqual(checkm2_call.args[0][checkm2_call.args[0].index("--input")+1],str(sample/"checkm2"/"input"/"iso1.fasta"))
+            input_path=Path(checkm2_call.args[0][checkm2_call.args[0].index("--input")+1])
+            if scratch:
+                self.assertTrue(input_path.is_relative_to(root/"scratch"))
+                self.assertTrue((run/"state/checkm2_predict_slots/slot-0.lock").is_file())
+            else: self.assertEqual(input_path,sample/"checkm2/input/iso1.fasta")
             self.assertIn("--remove_intermediates",checkm2_call.args[0])
             self.assertNotIn("--remove-intermediates",checkm2_call.args[0])
             self.assertEqual(checkm2_call.kwargs["env"]["TF_NUM_INTEROP_THREADS"],"1")
@@ -321,16 +330,13 @@ class RealCheckM2IntegrationTests(unittest.TestCase):
             self.skipTest(f"real CheckM2 runtime/database unavailable: {error}")
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
-            input_path=checkm2_named_input_link(genome,root/"input","cleangene_checkm2_smoke")
-            out=root/"predict"
-            command=checkm2_predict_command(exe,input_path,out,resolution.path,1,checkm2_predict_capabilities(exe))
-            from cleangene.checkm2 import checkm2_subprocess_environment
-            env=checkm2_subprocess_environment(exe)
-            for key in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS","TF_NUM_INTRAOP_THREADS","TF_NUM_INTEROP_THREADS"):
-                env[key]="1"
-            completed=__import__("subprocess").run(command,capture_output=True,text=True,env=env,timeout=600)
-            self.assertEqual(completed.returncode,0,completed.stderr[-2000:])
-            completeness,contamination=parse_checkm2_quality_report(out/"quality_report.tsv","cleangene_checkm2_smoke")
+            from cleangene.workers import _run_checkm2
+            logs=root/"scratch/output/logs"; logs.mkdir(parents=True)
+            run_dir=root/"run"
+            cfg={**DEFAULTS,"CHECKM2_EXECUTABLE":str(exe),"CHECKM2_DB":str(resolution.path)}
+            completeness,contamination=_run_checkm2(genome,root/"scratch/output/checkm2",logs,cfg,"cleangene_checkm2_smoke",run_dir=run_dir)
+            self.assertTrue((run_dir/"state/checkm2_predict_slots/slot-0.lock").is_file())
+            self.assertEqual(read_tsv(logs/"checkm2.timing.tsv")[0]["status"],"complete")
             self.assertGreaterEqual(completeness,0)
             self.assertLessEqual(contamination,100)
 

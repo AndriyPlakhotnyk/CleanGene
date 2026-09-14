@@ -142,7 +142,7 @@ class CleanGeneUtilsTests(unittest.TestCase):
             root=Path(d); manifest=root/"manifest.tsv"; manifest.write_text("isolate_id\torganism\tR1\tR2\ni1\tSpecies one\t/r1.fastq.gz\t/r2.fastq.gz\n")
             config=root/"off.env"; config.write_text("CHECKM2_MODE=off\n")
             stdout=StringIO()
-            with contextlib.redirect_stdout(stdout): main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","messages","--dry-run","--config",str(config)])
+            with contextlib.redirect_stdout(stdout): main(["run","--profile","slurm","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","messages","--dry-run","--config",str(config)])
             text=stdout.getvalue(); self.assertTrue(text.startswith("+")); self.assertIn("Cleanse thy pangenome, my liege!",text); self.assertIn(f"Run directory: {root/'runs'/'messages'}",text); self.assertIn("Getting ready to submit",text); self.assertIn("CleanGene run created: messages",text); self.assertIn("Controller submitted: DRYRUN",text); self.assertIn("Controller log:",text); self.assertIn("Welcome to CleanGene, Your Grace.",text); self.assertLess(text.index("Cleanse thy pangenome, my liege!"),text.index("Welcome to CleanGene, Your Grace.")); self.assertLess(text.index("Welcome to CleanGene, Your Grace."),text.index("Run directory:"))
 
     def test_resume_submits_without_login_side_legacy_scans(self):

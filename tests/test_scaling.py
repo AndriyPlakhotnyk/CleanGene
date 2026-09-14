@@ -25,7 +25,7 @@ class ScalingArchitectureTests(unittest.TestCase):
                  patch("cleangene.cli.command_exists",side_effect=AssertionError("tool check ran in launcher")), \
                  patch("cleangene.cli.slurm",return_value="123") as submit, \
                  contextlib.redirect_stdout(StringIO()) as stdout:
-                self.assertEqual(main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","thin"]),0)
+                self.assertEqual(main(["run","--profile","slurm","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","thin"]),0)
             submit.assert_called_once()
             self.assertIn("Controller submitted: 123",stdout.getvalue())
             timings=read_tsv(root/"runs"/"thin"/"logs"/"launcher_timing.tsv")

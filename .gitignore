@@ -52,3 +52,9 @@ test_data/
 /.cleangene_agent_notes.md
 /.cleangene_github_agent_notes.md
 /.cleangene_readme_before_public_cleanup.md
+
+# Local FASTQ-only test manifest
+/input/local_fastq_test.manifest.tsv
+
+# Local debugging snapshots
+*.py.before_*

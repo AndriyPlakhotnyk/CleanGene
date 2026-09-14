@@ -68,3 +68,20 @@ The two-isolate test completed Shovill 1.4.2, CheckM2, Prokka, Panaroo, read
 validation, CRAM archival, and summaries: 186 gene clusters, two evaluated
 isolates, and two verified archives. Local resume preserved the completed stage
 markers and validated matrix. The cropped-fixture limitation above applies.
+
+## Baseline audit and plot backfill — 2026-09-14
+
+The retained normal-processing and no-downsampling end-to-end reports both record
+PASS; the latter has 185 clusters, two CheckM2 evaluations, four verified CRAM
+archives, four BAM restorations and successful completed-stage reuse. See
+[CODEBASE.md](CODEBASE.md) for organization and Slurm transfer instructions.
+
+The current audit passed all 240 tests with no skips, including real CheckM2
+production prediction. The subsequent fixed binary plotting scale passed all 12
+validation-summary tests, including its new all-present regression. Compilation
+and diff whitespace checks passed. Before/after PNG and SVG plots were backfilled
+from the completed no-downsampling run without changing its seven preprocessing,
+validation, arbitration and reduction markers. The full assembly pipeline was
+not rerun during this audit; the end-to-end baseline comes from retained reports.
+A sandbox initially blocked CheckM2 multiprocessing sockets; the real-tool test
+passed with those execution restrictions lifted.

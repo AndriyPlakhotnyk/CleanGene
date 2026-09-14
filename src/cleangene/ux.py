@@ -1,5 +1,6 @@
 from __future__ import annotations
 import itertools, sys, threading
+from contextvars import ContextVar
 from contextlib import contextmanager
 from datetime import datetime
 import os
@@ -89,23 +90,70 @@ def clean_gene_banner() -> str:
     ])
     return "\n".join(rows)
 
+_active_spinner = ContextVar("cleangene_spinner", default=None)
+
+
+class _SpinnerDisplay:
+    def __init__(self, message):
+        self.message = message
+        self.stream = sys.stdout
+        self.tty = self.stream.isatty()
+        self.lock = threading.RLock()
+        self.stop = threading.Event()
+        self.width = 0
+        self.worker = None
+
+    def clear(self):
+        if self.tty:
+            self.stream.write("\r" + " " * self.width + "\r")
+            self.width = 0
+
+    def set_message(self, message, announce=True):
+        with self.lock:
+            self.clear()
+            self.message = message
+            if not self.tty and announce:
+                print(message + " | Started", file=self.stream, flush=True)
+
+    def status(self, message, failed):
+        with self.lock:
+            self.clear()
+            text = message + (" | Failed" if failed else " | Complete")
+            print(waiting(text) if failed else completed(text), file=self.stream, flush=True)
+
+    def animate(self):
+        for mark in itertools.cycle("|/-\\"):
+            with self.lock:
+                self.clear()
+                text = self.message + " " + mark
+                self.width = len(text)
+                print(waiting(text), end="", file=self.stream, flush=True)
+            if self.stop.wait(0.12): break
+
+
 @contextmanager
 def spinner(message: str):
-    stop=threading.Event()
-    display=waiting(message)
-    if not sys.stdout.isatty():
-        print(display,flush=True)
+    """One terminal animation, with nested sample/process labels and completion logs."""
+    display = _active_spinner.get()
+    owner = display is None
+    if owner:
+        display = _SpinnerDisplay(message)
+        token = _active_spinner.set(display)
+    previous = display.message
+    display.set_message(message)
+    if owner and display.tty:
+        display.worker = threading.Thread(target=display.animate, daemon=True)
+        display.worker.start()
+    failed = False
+    try:
         yield
-        return
-    def animate() -> None:
-        for mark in itertools.cycle("|/-\\"):
-            print(f"\r{display} {waiting(mark)}",end="",flush=True)
-            if stop.wait(0.12): break
-    worker=threading.Thread(target=animate,daemon=True); worker.start()
-    failed=False
-    try: yield
     except BaseException:
-        failed=True
+        failed = True
         raise
     finally:
-        stop.set(); worker.join(); status="failed" if failed else "done"; print(f"\r{display} {waiting(status)}",flush=True)
+        if owner:
+            display.stop.set()
+            if display.worker: display.worker.join()
+        display.status(message, failed)
+        if owner: _active_spinner.reset(token)
+        else: display.set_message(previous, announce=False)

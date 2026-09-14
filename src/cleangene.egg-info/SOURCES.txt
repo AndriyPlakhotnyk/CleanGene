@@ -44,6 +44,7 @@ tests/test_core.py
 tests/test_final_archives.py
 tests/test_install.py
 tests/test_kraken.py
+tests/test_launcher_defaults.py
 tests/test_locus_validation.py
 tests/test_qc.py
 tests/test_runtime.py

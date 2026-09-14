@@ -17,13 +17,13 @@ from .fasta import assembly_metrics, read_fasta
 from .kraken import Kraken2DbError, Kraken2DbNotReady, managed_kraken2_db_path, resolve_kraken2_db, validate_kraken2_db
 from .manifest import groups, write_resolved
 from .pangenome import cluster_locus_rows, gff_cds_loci, normalize_panaroo, recover_sequences, select_rows, write_binary
-from .plotting import plot_presence_absence, plot_decision_upset
+from .plotting import PRESENCE_ABSENCE_FILES, plot_presence_absence, plot_decision_upset
 from .qc import QC_OUTPUT_FIELDS, classify_isolate_qc, ensure_qc_provenance, isolate_thresholds, parse_checkm2_report, qc_value, read_metrics
 from .slurm import array_task_count, assert_jobs_succeeded, available_slots, cancel_jobs, job_active, sbatch_cmd, submit_with_qos_retry, user_job_count, user_queue_snapshot
 from .task_store import build_group_task_store, build_isolate_task_store, group_store_ready, load_group_task, load_isolate_task, migrate_group_task_store, migrate_isolate_task_store, task_store_ready
 from .tools import executable_version, resolve_checkm2_executable, ToolResolutionError
 from .util import atomic_json, command_exists, load_json, read_tsv, run, safe_name, touch_done, write_tsv
-from .ux import completed, log_line, waiting
+from .ux import completed, log_line, waiting, spinner
 from .runtime import verify_worker_runtime
 
 STAGE_DESCRIPTIONS = (
@@ -220,9 +220,9 @@ def _run_root_for_sample_logs(logs: Path) -> Path:
     raise OSError(f"Could not resolve the CleanGene run root from sample log directory: {logs}")
 
 @contextmanager
-def _checkm2_prediction_slot(logs: Path, cfg: dict[str,str], isolate: str):
+def _checkm2_prediction_slot(logs: Path, cfg: dict[str,str], isolate: str, *, run_dir: Path | None = None):
     slots=max(1,int(cfg.get("CHECKM2_MAX_INFLIGHT","8")))
-    lock_dir=_run_root_for_sample_logs(logs)/"state"/"checkm2_predict_slots"
+    lock_dir=(run_dir if run_dir is not None else _run_root_for_sample_logs(logs))/"state"/"checkm2_predict_slots"
     lock_dir.mkdir(parents=True,exist_ok=True)
     announced=False
     while True:
@@ -244,7 +244,7 @@ def _checkm2_prediction_slot(logs: Path, cfg: dict[str,str], isolate: str):
             announced=True
         time.sleep(5)
 
-def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isolate: str) -> tuple[float,float]:
+def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isolate: str, *, run_dir: Path | None = None) -> tuple[float,float]:
     try: validate_checkm2_db(cfg.get("CHECKM2_DB",""))
     except CheckM2DbError as error: raise SystemExit(f"Preprocessing infrastructure failure: CheckM2 database is not ready: {error}")
     input_dir=out/"input"; result_dir=out/"results"; input_dir.mkdir(parents=True,exist_ok=True); result_dir.mkdir(parents=True,exist_ok=True)
@@ -254,7 +254,7 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
     try:
         capabilities=checkm2_predict_capabilities(executable)
         command=checkm2_predict_command(executable,link,result_dir,cfg["CHECKM2_DB"],threads,capabilities,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false")))
-        with _checkm2_prediction_slot(logs,cfg,isolate):
+        with _checkm2_prediction_slot(logs,cfg,isolate,run_dir=run_dir):
             run(command,stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr",env=_checkm2_environment(executable))
         report=result_dir/"quality_report.tsv"
         parse_checkm2_quality_report(report,isolate)
@@ -897,7 +897,8 @@ def preprocess(run_dir: Path, index: int) -> None:
             metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
             result=assessment(excluded=True)
             finish({"isolate_id":iso,"group_id":group,"top_species":"","contamination_pct":"","R1":row.get("R1",""),"R2":row.get("R2",""),"raw_bam":row.get("raw_bam",""),"read_preprocessing":"skipped_user_excluded","read_processing_decision":"skipped_user_excluded","adapter_trimmed":0,"assembly":"","gff":"",**metrics,**qc_columns(result,None,metrics,None,None)},{"excluded":True,"reason":result["reason"],"qc_status":result["PASS/FAIL"]}); return
-        r1,r2,read_method,adapter_trimmed,read_decision=prepare_read_inputs(row,work_out,logs,cfg)
+        with spinner(f"Sample {iso} | Read preparation and fastp"):
+            r1,r2,read_method,adapter_trimmed,read_decision=prepare_read_inputs(row,work_out,logs,cfg)
         read_errors=[]
         try: read_qc=read_metrics(Path(r1),Path(r2),work_out/"reads"/"fastp.json")
         except (OSError,ValueError,SystemExit) as error: read_qc=None; read_errors.append(("read_metrics_failed",str(error)))
@@ -911,7 +912,8 @@ def preprocess(run_dir: Path, index: int) -> None:
             command=["kraken2","--db",worker_db,"--threads",cfg.get("CPUS","4")]
             if memory_map: command.append("--memory-mapping")
             command += ["--paired","--report",str(report),"--output",output,r1,r2]
-            run(command,stdout=logs/"kraken2.stdout",stderr=logs/"kraken2.stderr")
+            with spinner(f"Sample {iso} | Kraken2 classification"):
+                run(command,stdout=logs/"kraken2.stdout",stderr=logs/"kraken2.stderr")
             top,contam,_=parse_kraken_report(report,expected)
         assembly=row.get("assembly","").strip()
         if assembly: provenance.append(_artifact_provenance(assembly,"assembly"))
@@ -926,12 +928,13 @@ def preprocess(run_dir: Path, index: int) -> None:
             generated_assembly=True
             if not Path(assembly).is_file():
                 try:
-                    if assembler=="shovill":
-                        tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
-                        run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--ram",cfg.get("SHOVILL_MEMORY_GB","16"),"--force"]+(["--depth","0"] if truthy(cfg.get("SKIP_DOWNSAMPLING","false")) else []),stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
-                    else:
-                        if any(shov.iterdir()): shutil.rmtree(shov)
-                        run(["spades.py","--isolate","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
+                    with spinner(f"Sample {iso} | {assembler.capitalize()} assembly"):
+                        if assembler=="shovill":
+                            tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
+                            run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--ram",cfg.get("SHOVILL_MEMORY_GB","16"),"--force"]+(["--depth","0"] if truthy(cfg.get("SKIP_DOWNSAMPLING","false")) else []),stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
+                        else:
+                            if any(shov.iterdir()): shutil.rmtree(shov)
+                            run(["spades.py","--isolate","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
                 except subprocess.CalledProcessError as error:
                     errors.append(("assembly_failed",f"{assembler} assembly failed with exit status {error.returncode}")); assembly=""
         if assembler=="off" and not assembly: warnings.append(("shovill_skipped","assembly and annotation were not evaluated because assembly mode is off"))
@@ -945,7 +948,8 @@ def preprocess(run_dir: Path, index: int) -> None:
             try: completeness,check_contamination=parse_checkm2_report(Path(supplied_checkm2).expanduser())
             except (ValueError,OSError) as error: errors.append(("checkm2_report_invalid",f"Supplied CheckM2 report could not be parsed: {error}"))
         elif mode=="required" and assembly:
-            completeness,check_contamination=_run_checkm2(Path(assembly),work_out/"checkm2",logs,cfg,iso)
+            with spinner(f"Sample {iso} | CheckM2 quality assessment"):
+                completeness,check_contamination=_run_checkm2(Path(assembly),work_out/"checkm2",logs,cfg,iso,run_dir=run_dir)
         pre=assessment(expected=expected,top=top,contamination=contam,reads=read_qc,metrics=metrics,
             completeness=completeness,checkm2_contamination=check_contamination,internal=internal_pangenome,
             external=external_pangenome,assembly=assembly,gff_present=None,warnings=warnings,errors=errors)
@@ -971,7 +975,9 @@ def preprocess(run_dir: Path, index: int) -> None:
             provenance.append(_artifact_provenance(supplied_gff,"gff"))
         elif not gff.is_file():
             if ann.exists(): shutil.rmtree(ann)
-            try: run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
+            try:
+                with spinner(f"Sample {iso} | Prokka annotation"):
+                    run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
             except subprocess.CalledProcessError as error: prokka_errors.append(("prokka_failed",f"Prokka failed with exit status {error.returncode}")); gff_present=None
         if gff_present is not None: gff_present=gff.is_file()
         final=assessment(expected=expected,top=top,contamination=contam,reads=read_qc,metrics=metrics,
@@ -1372,7 +1378,8 @@ def invalidate_missing_validation_reports(run_dir: Path) -> int:
         if not (out/"validated_gene_presence_absence.binary.tsv").is_file(): continue
         has_matrices=True; group=out.parent.name
         missing_summary=not all((out/name).is_file() for name in SUMMARY_FILES)
-        missing_plot=not all((out/name).is_file() for name in PLOT_FILES)
+        missing_plot=(not all((out/name).is_file() for name in PLOT_FILES)
+                      or not all((out.parent/"04_summary"/name).is_file() for name in PRESENCE_ABSENCE_FILES))
         if missing_summary: _remove_done(run_dir/"state"/"reduce"/f"{group}.done.json")
         if missing_summary or missing_plot:
             _remove_done(run_dir/"state"/"plot"/f"{group}.done.json")
@@ -1976,20 +1983,33 @@ def reduce_group(run_dir: Path, index: int) -> None:
 
 def plot_group(run_dir: Path, index: int) -> None:
     cfg=load_run_config(run_dir); group=task_row(run_dir,"group",index)["group_id"]; root=run_dir/"results"/"groups"/safe_name(group); done=run_dir/"state"/"plot"/f"{safe_name(group)}.done.json"
-    if done.is_file() and all((root/"03_read_validation"/name).is_file() for name in PLOT_FILES): return
+    if (done.is_file() and all((root/"03_read_validation"/name).is_file() for name in PLOT_FILES)
+            and all((root/"04_summary"/name).is_file() for name in PRESENCE_ABSENCE_FILES)): return
     matrix=root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"; out=root/"04_summary"
     if not matrix.is_file():
         touch_done(done,{"status":"skipped","reason":"missing_validated_matrix"})
         return
     out.mkdir(parents=True,exist_ok=True)
-    plot_presence_absence(matrix,out,group,int(cfg["PLOT_MAX_CLUSTER_ISOLATES"]))
+    initial=root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv"
+    plot_presence_absence(initial,out,f"{group} — before validation",int(cfg["PLOT_MAX_CLUSTER_ISOLATES"]),
+                          stem="pangenome_presence_absence_before_validation")
+    plot_presence_absence(matrix,out,f"{group} — after validation",int(cfg["PLOT_MAX_CLUSTER_ISOLATES"]),
+                          stem="pangenome_presence_absence_after_validation")
+    for suffix in ("png", "svg"):
+        shutil.copy2(out/f"pangenome_presence_absence_after_validation.{suffix}",
+                     out/f"pangenome_presence_absence.{suffix}")
     decision_data=matrix.parent/"decision_reason_upset.tsv"
     if decision_data.is_file(): plot_decision_upset(decision_data,matrix.parent,group)
     touch_done(done,{"matrix":str(matrix),"outdir":str(out)})
 
 def summarize(run_dir: Path) -> None:
     from .final_archives import archive_pipeline_bams
-    cfg,rows=context(run_dir); archives=archive_pipeline_bams(run_dir,int(cfg["SUMMARY_CPUS"])); storage=compress_completed_outputs(run_dir); iso_rows=[]; group_rows=[]
+    cfg,rows=context(run_dir)
+    with spinner("Cohort | CRAM archiving and verification"):
+        archives=archive_pipeline_bams(run_dir,int(cfg["SUMMARY_CPUS"]))
+    with spinner("Cohort | Output compression"):
+        storage=compress_completed_outputs(run_dir)
+    iso_rows=[]; group_rows=[]
     for group in groups(rows):
         root=run_dir/"results"/"groups"/safe_name(group); retained=retained_rows(run_dir,group); val=root/"03_read_validation"/"validated_gene_presence_absence.binary.tsv"
         n_genes=max(0,len(read_tsv(val))) if val.is_file() else 0; group_rows.append([group,len([r for r in rows if r["group_id"]==group]),len(retained),n_genes])

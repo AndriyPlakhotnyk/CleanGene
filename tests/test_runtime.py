@@ -104,7 +104,7 @@ class RuntimeResolutionTests(unittest.TestCase):
             manifest.write_text("isolate_id\tgroup_id\tR1\tR2\ni1\tg\t/r1.fastq.gz\t/r2.fastq.gz\n")
             with patch("cleangene.cli.resolve_checkm2_executable", side_effect=ToolResolutionError("missing checkm2")), patch("cleangene.cli.slurm") as submit:
                 with contextlib.redirect_stdout(StringIO()):
-                    self.assertEqual(main(["run", "--manifest", str(manifest), "--analysis-root", str(root), "--run-id", "r", "--dry-run"]),0)
+                    self.assertEqual(main(["run", "--profile", "slurm", "--manifest", str(manifest), "--analysis-root", str(root), "--run-id", "r", "--dry-run"]),0)
             submit.assert_called_once()
 
     def test_ignore_checkm2_overrides_config_and_skips_resolution(self):
@@ -115,7 +115,7 @@ class RuntimeResolutionTests(unittest.TestCase):
                  patch("cleangene.cli.executable_version",side_effect=AssertionError("checkm2 --version ran")), \
                  patch("cleangene.cli.slurm",return_value="123"), \
                  contextlib.redirect_stdout(StringIO()):
-                self.assertEqual(main(["run","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","off","--config",str(cfg),"--ignore-checkm2"]),0)
+                self.assertEqual(main(["run","--profile","slurm","--manifest",str(manifest),"--analysis-root",str(root),"--run-id","off","--config",str(cfg),"--ignore-checkm2"]),0)
             resolved=__import__("cleangene.util",fromlist=["load_json"]).load_json(root/"runs"/"off"/"provenance"/"resolved_config.json")
             self.assertEqual(resolved["CHECKM2_MODE"],"off")
             self.assertEqual(resolved["CHECKM2_DISABLED_BY_USER"],"true")

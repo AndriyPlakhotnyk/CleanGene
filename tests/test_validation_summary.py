@@ -104,6 +104,9 @@ class ValidationSummaryTests(unittest.TestCase):
             for stage in ('validate','arbitrate'): self.assertTrue((root/f'state/{stage}/g.done.json').exists())
             for stage in ('reduce','plot'): self.assertFalse((root/f'state/{stage}/g.done.json').exists())
             for name in (*SUMMARY_FILES,*PLOT_FILES): (out/name).touch()
+            from cleangene.plotting import PRESENCE_ABSENCE_FILES
+            plots=out.parent/'04_summary'; plots.mkdir()
+            for name in PRESENCE_ABSENCE_FILES: (plots/name).touch()
             self.assertEqual(invalidate_missing_validation_reports(root),0)
 
     def test_compression_defaults_and_explicit_off(self):
@@ -146,6 +149,18 @@ class ValidationSummaryTests(unittest.TestCase):
                 summary=read_tsv(out/'gene_call_summary.tsv')[0]
                 self.assertEqual(summary['changed'],'2');self.assertEqual(summary['kept'],'2')
                 self.assertEqual(read_tsv(root/'cleaned_pangenome.tsv')[0]['b'],'1')
+                from cleangene.plotting import PRESENCE_ABSENCE_FILES
+                plots=root/'04_summary'
+                self.assertTrue(all((plots/name).stat().st_size for name in PRESENCE_ABSENCE_FILES))
+                before=plots/'pangenome_presence_absence_before_validation.svg'
+                self.assertIn('before validation',before.read_text())
+                before.unlink()
+                self.assertEqual(invalidate_missing_validation_reports(run),1)
+                self.assertTrue((run/'state/reduce/g.done.json').is_file())
+                plot_group(run,0)
+                self.assertTrue(before.is_file())
+                self.assertEqual((plots/'pangenome_presence_absence.png').read_bytes(),
+                                 (plots/'pangenome_presence_absence_after_validation.png').read_bytes())
                 modified=(out/'summary_statistics.txt').stat().st_mtime_ns
                 reduce_group(run,0)
                 self.assertEqual(modified,(out/'summary_statistics.txt').stat().st_mtime_ns)
@@ -153,3 +168,19 @@ class ValidationSummaryTests(unittest.TestCase):
                 self.assertEqual(invalidate_missing_validation_reports(run),1)
                 reduce_group(run,0); plot_group(run,0)
                 self.assertEqual(read_tsv(out/'gene_call_summary.tsv')[0],summary)
+
+    def test_all_present_matrix_uses_binary_color_scale(self):
+        from cleangene.plotting import plot_presence_absence
+        from matplotlib.axes import Axes
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); matrix=root/'matrix.tsv'
+            matrix.write_text('Gene\ti\ng\t1\n')
+            original=Axes.imshow
+            limits=[]
+            def capture(ax, *args, **kwargs):
+                result=original(ax,*args,**kwargs)
+                limits.append(result.get_clim())
+                return result
+            with patch.object(Axes,'imshow',capture):
+                plot_presence_absence(matrix,root,'all present')
+            self.assertEqual(limits,[(0,1)])

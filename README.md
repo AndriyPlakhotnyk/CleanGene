@@ -234,10 +234,17 @@ remain active.
 
 For a small local analysis, use `--profile local`. For a Slurm submission preview,
 add `--dry-run`; it creates run metadata and prints the controller submission
-command without submitting jobs. **Dry-run is a Slurm option; do not use it to
-preview local execution.**
+command without submitting jobs. Local `--dry-run` prints the planned stage sequence and returns before
+preflight or processing.
 
 ## Command-line arguments
+
+Local runs default to the active CleanGene checkout for outputs. To use all
+processing defaults except downsampling:
+
+```bash
+cleangene run --manifest input/example.manifest.tsv --skip-downsampling
+```
 
 Run `cleangene run --help` for the complete CLI reference. Configuration values
 apply unless overridden by a command-line option.
@@ -245,9 +252,9 @@ apply unless overridden by a command-line option.
 | Argument | Values / default | Purpose |
 | --- | --- | --- |
 | `--manifest` | TSV path | Sample inputs; required for a new run. |
-| `--analysis-root` | Directory | Parent directory for `runs/<run-id>/`. Required by `run`. |
+| `--analysis-root` | Active CleanGene checkout | Parent directory for `runs/<run-id>/`; standalone installations without a checkout use the current directory. |
 | `--config` | Environment-style file | QC, database, and execution settings. |
-| `--profile` | `slurm` (default), `local` | Execution backend. |
+| `--profile` | `local` (default), `slurm` | Execution backend for `run` and `doctor`; ARC submissions must specify `--profile slurm`. |
 | `--skip-downsampling` | Flag; off by default | Run Shovill with `--depth 0`: retain KMC genome-size estimation and other processing, without read-depth reduction. |
 | `--assembler` | `shovill` (built-in default), `spades`, `off` | Assembly strategy; `off` skips assembly and annotation. |
 | `--ignore-checkm2` | Flag | Skip CheckM2 assessment during the run. |
@@ -257,7 +264,7 @@ apply unless overridden by a command-line option.
 | `--cleanup-trimmed-fastq` | Flag | Enable final cleanup of retained trimmed FASTQs. |
 | `--run-id` | Identifier | Set a run name instead of the generated timestamp. |
 | `--resume` | Existing run ID | Resume a run under the analysis root. |
-| `--dry-run` | Flag, Slurm profile | Print submission command without submitting. |
+| `--dry-run` | Flag | Preview local stages or Slurm submission without execution. |
 | `--cancel-active` | Flag, resume | Cancel active jobs associated with the run before resubmission. |
 
 Assembly intermediates and nonessential annotation outputs are compressed by
@@ -271,6 +278,41 @@ Shovill when you want its assembly preparation workflow. `SHOVILL_MEMORY_GB`
 (default `16`, minimum `8` for the pinned release) is passed as Shovill's `--ram`
 limit; keep it within the preprocessing job's memory allocation. The environment
 pins tested Shovill 1.4.2 and SPAdes 3.x compatibility.
+
+### Validation decision flow
+
+The flow below follows the first matching read-evidence rule in
+[`classify_gene_evidence`](src/cleangene/evidence.py). Values shown are defaults;
+configured thresholds apply. Breadth is the fraction of reference bases covered,
+identity comes from reconstructed sequence, and mean depth is measured in reads.
+
+```mermaid
+flowchart TD
+    A[Own-locus mapping for initial positives; competitive pangenome recovery for negatives] --> B{Mapped reads = 0 and breadth = 0?}
+    B -->|Yes| N[not_detected: 0]
+    B -->|No| C{Depth ≥ 5, breadth ≥ 95%, identity ≥ 95%?}
+    C -->|Yes| P[confirmed_present: 1]
+    C -->|No| D{Ambiguous reads present and no unique reads?}
+    D -->|Yes| AM[ambiguous_multimap: unresolved]
+    D -->|No| E{Depth below 5 or identity unavailable?}
+    E -->|Yes| IE[insufficient_evidence: unresolved]
+    E -->|No| F{Breadth ≥ 90% and 90% ≤ identity < 95%?}
+    F -->|Yes| DV[divergent_variant: provisional 1]
+    F -->|No| G{Breadth ≥ 70% and identity ≥ 95%?}
+    G -->|Yes| PT[possible_truncation: initial positive 1; otherwise unresolved]
+    G -->|No| PH[partial_homolog: 0]
+    AM & IE & DV & PT & PH --> H[Prioritized local reconstruction; cap = floor of 3% of initial present genes]
+    H --> I[Evaluate reconstructed breadth and identity, read depth, ORF and deletion junction]
+    I --> J[Resolve supported calls; retain explicit unresolved or deferred evidence otherwise]
+    J --> K[Consolidate discovered complete CDS; publish final matrix and evidence]
+    N & P --> K
+```
+
+A supported deletion junction requires ≥95% identity and ≥50 aligned bases on
+both flanks. New complete CDS require an intact ORF plus ≥95% read breadth,
+≥95% identity and the depth gate. Unresolved calls without a replacement retain
+the initial binary value. Normalized depth is supporting context, not a universal
+presence gate. See the evidence states above for interpretation and exceptions.
 
 ### Validation settings
 
@@ -320,6 +362,15 @@ Each run is stored beneath `<analysis-root>/runs/<run-id>/`.
 | `results/cohort/` | Cohort QC and summaries. |
 | `provenance/` | Manifest, resolved configuration, and runtime metadata. |
 | `logs/slurm/` | Controller and stage job logs. |
+
+Each group's `04_summary/` contains `pangenome_presence_absence_before_validation`
+and `pangenome_presence_absence_after_validation`, both as PNG and SVG. The before
+plot uses the original Panaroo binary matrix; the after plot uses final validated
+calls, including discovered genes and provisional values. Each plot independently
+sorts genes by prevalence and clusters isolates, so positions are not paired
+between panels. The original `pangenome_presence_absence.png`/`.svg` names remain
+copies of the after plot. Resume backfills missing plots on local and Slurm runs
+without repeating mapping or arbitration solely for these figures.
 
 ### Validation summaries
 
@@ -428,6 +479,9 @@ basic; normalized depth uses an assembly-based chromosomal proxy. Cohort-scale
 performance depends on reference complexity, coverage, and available resources.
 
 ## Testing
+
+See the [codebase and verified execution baseline](docs/CODEBASE.md) for the
+local end-to-end record, module organization and Slurm deployment procedure.
 
 With the CleanGene environment active:
 

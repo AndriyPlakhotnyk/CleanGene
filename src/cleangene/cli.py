@@ -9,7 +9,7 @@ from .completion import reconcile_preprocess_outputs
 from .defaults import DEFAULTS, SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
 from .qc import ensure_qc_provenance, resolve_threshold_rows
-from .runtime import assert_config_matches_runtime, print_runtime_identity, record_runtime_provenance
+from .runtime import cleangene_project_root, assert_config_matches_runtime, print_runtime_identity, record_runtime_provenance
 from .slurm import active_cleangene_jobs_for_run, cancel_jobs, sbatch_cmd, submit, user_queue_snapshot
 from .task_store import build_isolate_task_store
 from .tools import ToolResolutionError, executable_version, resolve_checkm2_executable
@@ -316,20 +316,32 @@ def estimate(args) -> int:
 
 def local(run: Path) -> None:
     cfg,rows={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")},read_tsv(run/"provenance"/"manifest.tsv")
-    if needs_kraken(rows,cfg): dispatch("kraken_db_setup",run,None)
+    def step(stage, index=None):
+        names={"kraken_db_setup":"Kraken2 database setup", "checkm2_db_setup":"CheckM2 database and runtime verification",
+               "preprocess":"Preprocessing", "resolve_groups":"Organism grouping", "panaroo":"Panaroo pangenome",
+               "prepare_validation":"Prepare gene validation", "validate":"Read mapping and gene validation",
+               "arbitrate":"Gene arbitration", "reduce":"Consolidate validated gene calls", "plot":"Plots", "summary":"Final summaries"}
+        subject="Cohort"
+        if stage in {"preprocess","validate","arbitrate"}:
+            subject=f"Sample {rows[index]['isolate_id']} ({index+1}/{len(rows)})"
+        elif index is not None:
+            subject=f"Organism {read_tsv(run/'state/group_tasks.tsv')[index]['group_id']}"
+        with spinner(f"{subject} | {names.get(stage,stage)}"):
+            dispatch(stage,run,index)
+    if needs_kraken(rows,cfg): step("kraken_db_setup",None)
     cfg,rows={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")},read_tsv(run/"provenance"/"manifest.tsv")
-    if needs_checkm2(rows,cfg): dispatch("checkm2_db_setup",run,None)
+    if needs_checkm2(rows,cfg): step("checkm2_db_setup",None)
     ni=len((run/"state"/"isolate_tasks.tsv").read_text().splitlines())-1
-    for i in range(ni): dispatch("preprocess",run,i)
-    dispatch("resolve_groups",run,None)
+    for i in range(ni): step("preprocess",i)
+    step("resolve_groups",None)
     ng=len((run/"state"/"group_tasks.tsv").read_text().splitlines())-1
-    for i in range(ng): dispatch("panaroo",run,i)
-    for i in range(ng): dispatch("prepare_validation",run,i)
-    for i in range(ni): dispatch("validate",run,i)
-    for i in range(ni): dispatch("arbitrate",run,i)
-    for i in range(ng): dispatch("reduce",run,i)
-    for i in range(ng): dispatch("plot",run,i)
-    dispatch("summary",run,None)
+    for i in range(ng): step("panaroo",i)
+    for i in range(ng): step("prepare_validation",i)
+    for i in range(ni): step("validate",i)
+    for i in range(ni): step("arbitrate",i)
+    for i in range(ng): step("reduce",i)
+    for i in range(ng): step("plot",i)
+    step("summary",None)
 
 def slurm(run: Path, cfg: dict[str,str], dry: bool) -> str:
     exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
@@ -371,16 +383,19 @@ def run_command(args) -> int:
     else:
         run_id=args.run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=root/"runs"/run_id
     print(f"Run directory: {run}")
-    with spinner("Getting ready to submit"):
+    with spinner("Running local pipeline" if args.profile=="local" else "Getting ready to submit"):
         if not args.resume:
             run=timing.timed("create_run",lambda: make_run(args.manifest,root,cfg,run_id)); timing.set_run(run)
         else: print(waiting("step=resume: submitting controller; legacy checks will run inside the controller job"),flush=True)
         cfg={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")}
         record_runtime_provenance(run,cfg)
         if args.profile=="local":
-            global_preflight(run)
-            if args.resume: run_resume_maintenance(run,cfg)
-            local(run)
+            if args.dry_run: print(f"Would run pipeline locally: {run}")
+            else:
+                with spinner("Cohort | Input preflight"):
+                    global_preflight(run)
+                if args.resume: run_resume_maintenance(run,cfg)
+                local(run)
         else:
             if args.resume: _guard_resume_active_jobs(run,cancel_active=getattr(args,"cancel_active",False))
             controller_job_id=timing.timed("submit_controller",lambda: slurm(run,cfg,args.dry_run))
@@ -482,8 +497,8 @@ def main(argv=None) -> int:
     p=argparse.ArgumentParser(prog="cleangene"); sub=p.add_subparsers(dest="cmd",required=True)
     c=sub.add_parser("check"); c.add_argument("--manifest",type=Path,required=True); c.add_argument("--config",type=Path); c.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); c.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); c.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); c.add_argument("--assembler",choices=("shovill","spades","off")); c.add_argument("--skip-downsampling","--skip_downsampling",action="store_true",help="disable Shovill read-depth reduction; retain KMC and other processing"); c.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); c.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); c.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); c.set_defaults(func=check)
     e=sub.add_parser("estimate"); e.add_argument("--manifest",type=Path,required=True); e.set_defaults(func=estimate)
-    d=sub.add_parser("doctor"); d.add_argument("--profile",choices=("local","slurm"),default="slurm"); d.add_argument("--config",type=Path); d.add_argument("--manifest",type=Path); d.add_argument("--deep-checkm2",action="store_true"); d.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); d.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); d.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); d.add_argument("--assembler",choices=("shovill","spades","off")); d.add_argument("--skip-downsampling","--skip_downsampling",action="store_true",help="disable Shovill read-depth reduction; retain KMC and other processing"); d.set_defaults(func=doctor)
-    r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,required=True); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="slurm"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.add_argument("--cancel-active",action="store_true"); r.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); r.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); r.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); r.add_argument("--assembler",choices=("shovill","spades","off")); r.add_argument("--skip-downsampling","--skip_downsampling",action="store_true",help="disable Shovill read-depth reduction; retain KMC and other processing"); r.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); r.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); r.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); r.set_defaults(func=run_command)
+    d=sub.add_parser("doctor"); d.add_argument("--profile",choices=("local","slurm"),default="local"); d.add_argument("--config",type=Path); d.add_argument("--manifest",type=Path); d.add_argument("--deep-checkm2",action="store_true"); d.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); d.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); d.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); d.add_argument("--assembler",choices=("shovill","spades","off")); d.add_argument("--skip-downsampling","--skip_downsampling",action="store_true",help="disable Shovill read-depth reduction; retain KMC and other processing"); d.set_defaults(func=doctor)
+    r=sub.add_parser("run"); r.add_argument("--manifest",type=Path); r.add_argument("--analysis-root",type=Path,default=cleangene_project_root() or Path.cwd(),help="parent of runs/ (default: active CleanGene checkout; current directory for standalone installations)"); r.add_argument("--config",type=Path); r.add_argument("--profile",choices=("local","slurm"),default="local"); r.add_argument("--dry-run",action="store_true"); r.add_argument("--run-id"); r.add_argument("--resume"); r.add_argument("--cancel-active",action="store_true"); r.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); r.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); r.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); r.add_argument("--assembler",choices=("shovill","spades","off")); r.add_argument("--skip-downsampling","--skip_downsampling",action="store_true",help="disable Shovill read-depth reduction; retain KMC and other processing"); r.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); r.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); r.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); r.set_defaults(func=run_command)
     rs=sub.add_parser("resume"); rs.add_argument("--run"); rs.add_argument("--run-dir",type=Path); rs.add_argument("--latest",action="store_true"); rs.add_argument("--analysis-root",type=Path); rs.add_argument("--config",type=Path); rs.add_argument("--dry-run",action="store_true"); rs.add_argument("--cancel-active",action="store_true"); rs.add_argument("--ignore-checkm2","--ignore_checkm2",dest="ignore_checkm2",action="store_true"); rs.add_argument("--skip-trim","--skip_trim",dest="skip_trim",action="store_true"); rs.add_argument("--skip-shovill","--skip_shovill",dest="skip_shovill",action="store_true"); rs.add_argument("--assembler",choices=("shovill","spades","off")); rs.add_argument("--skip-downsampling","--skip_downsampling",action="store_true",help="disable Shovill read-depth reduction; retain KMC and other processing"); rs.add_argument("--compress-assembly-outputs","--compress_assembly_outputs",dest="compress_assembly_outputs",choices=("off","intermediates","all")); rs.add_argument("--compress-annotation-outputs","--compress_annotation_outputs",dest="compress_annotation_outputs",choices=("off","nonessential")); rs.add_argument("--cleanup-trimmed-fastq","--cleanup_trimmed_fastq",dest="cleanup_trimmed_fastq",action="store_true"); rs.set_defaults(func=resume_command)
     cl=sub.add_parser("cleanup",help="replace retained trimmed FASTQs with links to original FASTQ inputs"); cl.add_argument("--run-dir",type=Path,required=True); cl.add_argument("--dry-run",action="store_true"); cl.set_defaults(func=cleanup_command)
     rp=sub.add_parser("reconcile-preprocess",help="audit or repair missing preprocess markers from existing qc.tsv outputs"); rp.add_argument("--run-dir",type=Path,required=True); rp.add_argument("--dry-run",action="store_true",default=True); rp.add_argument("--apply",action="store_true"); rp.add_argument("--compress-safe",action="store_true"); rp.add_argument("--require-all",action="store_true"); rp.set_defaults(func=reconcile_preprocess_command)
