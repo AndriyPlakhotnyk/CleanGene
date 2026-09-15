@@ -360,7 +360,16 @@ def _guard_resume_active_jobs(run: Path, *, cancel_active: bool = False) -> None
     if cancel_active:
         cancel_jobs(job_ids)
         print(waiting(f"Canceled active CleanGene jobs for this run: {' '.join(job_ids)}"),flush=True)
-        return
+        deadline=time.monotonic()+300
+        while True:
+            remaining=active_cleangene_jobs_for_run(run)
+            if not remaining:
+                return
+            if time.monotonic() >= deadline:
+                ids=sorted({str(entry["job_id"]) for entry in remaining})
+                raise SystemExit("Canceled jobs are still visible in Slurm after 300 seconds; refusing to submit a replacement controller: " + ", ".join(ids))
+            print(waiting(f"Waiting for canceled CleanGene jobs to leave Slurm: {len(remaining)} remaining"),flush=True)
+            time.sleep(5)
     raise SystemExit(
         "Refusing to resume while active CleanGene jobs reference this run directory.\n"
         f"Run directory: {run}\n"
