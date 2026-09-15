@@ -86,6 +86,22 @@ def checkm2_predict_capabilities(executable: Path | str, help_text: str | None =
     return CheckM2PredictCapabilities(cleanup, _sha256_text(help_text))
 
 
+def checkm2_predict_capabilities_for_config(executable: Path | str, cfg: dict[str, str]) -> CheckM2PredictCapabilities:
+    """Reuse the controller's capability probe in array workers."""
+    cleanup = cfg.get("CHECKM2_PREDICT_CLEANUP_OPTION", "").strip()
+    help_sha = cfg.get("CHECKM2_PREDICT_HELP_SHA256", "").strip()
+    if not (cleanup and help_sha):
+        try:
+            runtime = load_json(checkm2_runtime_marker(cfg))
+            cleanup = str(runtime.get("CHECKM2_PREDICT_CLEANUP_OPTION", "")).strip()
+            help_sha = str(runtime.get("CHECKM2_PREDICT_HELP_SHA256", "")).strip()
+        except (OSError, ValueError):
+            pass
+    if cleanup == "--remove_intermediates" and help_sha:
+        return CheckM2PredictCapabilities(cleanup, help_sha)
+    return checkm2_predict_capabilities(executable)
+
+
 def checkm2_database_download_command(executable: Path | str, root: Path | str) -> list[str]:
     return [sys.executable, "-m", "cleangene.checkm2_download", "--executable", str(executable), "--path", str(root), "--no_write_json_db"]
 

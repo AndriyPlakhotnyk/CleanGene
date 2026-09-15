@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, CHECKM2_COMMAND_SCHEMA_VERSION, bundled_test_genome, checkm2_database_root, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
+from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, CHECKM2_COMMAND_SCHEMA_VERSION, bundled_test_genome, checkm2_database_root, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_capabilities_for_config, checkm2_predict_command, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
 from cleangene.defaults import DEFAULTS
 from cleangene.tools import ToolResolutionError, resolve_checkm2_executable
 from cleangene.cli import make_run
@@ -57,6 +57,11 @@ def _concurrent_checkm2_worker(root: str, calls_dir: str, results_dir: str, erro
 
 
 class CheckM2DatabaseTests(unittest.TestCase):
+    def test_cached_predict_capabilities_avoid_help_probe(self):
+        cached=checkm2_predict_capabilities_for_config("/does/not/run", {"CHECKM2_PREDICT_CLEANUP_OPTION":"--remove_intermediates", "CHECKM2_PREDICT_HELP_SHA256":"cached"})
+        self.assertEqual(cached.cleanup_option,"--remove_intermediates")
+        self.assertEqual(cached.help_sha256,"cached")
+
     def test_existing_shared_db_is_reused_and_recorded(self):
         with tempfile.TemporaryDirectory() as d:
             exe=_write_executable(Path(d)/"bin"/"checkm2")

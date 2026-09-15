@@ -3,7 +3,7 @@ import csv, hashlib, math, os, subprocess
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from .checkm2 import checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, parse_checkm2_quality_report
+from .checkm2 import checkm2_named_input_link, checkm2_predict_capabilities_for_config, checkm2_predict_command, parse_checkm2_quality_report
 from .defaults import DEFAULTS
 from .fasta import read_fasta, write_fasta
 from .pangenome import recover_sequences
@@ -373,7 +373,7 @@ def checkm2_posthoc_task(request: dict[str,object], index: int) -> None:
         return
     cfg={**DEFAULTS,**load_json(run_dir/"provenance"/"resolved_config.json")}
     executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_checkm2_executable())
-    capabilities=checkm2_predict_capabilities(executable)
+    capabilities=checkm2_predict_capabilities_for_config(executable,cfg)
     link=checkm2_named_input_link(assembly,root/"input",iso)
     command=checkm2_predict_command(executable,link,result_dir,cfg["CHECKM2_DB"],cfg["CHECKM2_POSTHOC_CPUS"],capabilities,lowmem=str(cfg.get("CHECKM2_LOWMEM","false")).lower() in {"1","true","yes","on"})
     fields=["isolate_id","group_id","assembly","checkm2_completeness","checkm2_contamination","checkm2_status","checkm2_notes"]

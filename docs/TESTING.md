@@ -85,3 +85,12 @@ validation, arbitration and reduction markers. The full assembly pipeline was
 not rerun during this audit; the end-to-end baseline comes from retained reports.
 A sandbox initially blocked CheckM2 multiprocessing sockets; the real-tool test
 passed with those execution restrictions lifted.
+
+## CheckM2 array timeout incident — 2026-09-15
+
+An ARC run reached successful shared CheckM2 database and runtime verification,
+then preprocess array elements timed out while probing `checkm2 predict --help`
+individually. The controller correctly stopped on the failed array while other
+elements remained in Slurm. Workers now reuse the cleanup option and help hash
+recorded by the controller, avoiding that repeated probe; older runs without the
+cached fields fall back to the probe once per worker.

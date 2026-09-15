@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, truthy
-from .checkm2 import CheckM2DbError, CheckM2DbNotReady, bundled_test_genome, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, checkm2_runtime_is_verified, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
+from .checkm2 import CheckM2DbError, CheckM2DbNotReady, bundled_test_genome, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_capabilities_for_config, checkm2_predict_command, checkm2_runtime_is_verified, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
 from .completion import find_isolate_qc_candidates, reconcile_preprocess_outputs, validate_preprocess_completion
 from .alignment_archive import archive_own_alignment, restore_own_bam
 from .discovery import arbitration_cases, discover_cds, consolidate_discoveries
@@ -252,7 +252,7 @@ def _run_checkm2(assembly: Path, out: Path, logs: Path, cfg: dict[str,str], isol
     started=time.monotonic(); status="failed"
     command=[]; executable=cfg.get("CHECKM2_EXECUTABLE","").strip() or str(resolve_checkm2_executable()); threads=_checkm2_threads(cfg)
     try:
-        capabilities=checkm2_predict_capabilities(executable)
+        capabilities=checkm2_predict_capabilities_for_config(executable,cfg)
         command=checkm2_predict_command(executable,link,result_dir,cfg["CHECKM2_DB"],threads,capabilities,lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false")))
         with _checkm2_prediction_slot(logs,cfg,isolate,run_dir=run_dir):
             run(command,stdout=logs/"checkm2.stdout",stderr=logs/"checkm2.stderr",env=_checkm2_environment(executable))
@@ -318,6 +318,12 @@ def _kraken2_setup_marker(run_dir: Path, resolution, status: str = "complete") -
 def _write_resolved_checkm2_config(run_dir: Path, cfg: dict[str,str], resolution) -> dict[str,str]:
     from .util import atomic_json
     updated=dict(cfg); updated["CHECKM2_DB"]=str(resolution.path)
+    try:
+        runtime=load_json(checkm2_runtime_marker(updated))
+        for key in ("CHECKM2_PREDICT_CLEANUP_OPTION", "CHECKM2_PREDICT_HELP_SHA256"):
+            if runtime.get(key): updated[key]=str(runtime[key])
+    except (OSError, ValueError):
+        pass
     atomic_json(run_dir/"provenance"/"resolved_config.json",updated)
     return updated
 
