@@ -341,6 +341,18 @@ between zero and one, not percentages.
 The legacy `READ_VALIDATION_ARBITRATION_MAX_CASES` setting is superseded by the
 fraction and no longer controls arbitration.
 
+### Developer diagnostics
+
+`DEVELOPER_MODE=true` is enabled by default. Each preprocess worker records
+start/end timestamps for read preparation, Kraken2, assembly, CheckM2, and
+Prokka in `logs/developer_preprocess.tsv`, and stores total elapsed seconds in
+its completion marker. The Slurm controller reports marker-based completed,
+running, pending, and not-yet-submitted counts; every 30 minutes it also emits
+the average completed preprocess duration and the number of timed markers. Set
+`DEVELOPER_MODE=false` to suppress per-step timing files and periodic developer
+reports. `DEVELOPER_REPORT_INTERVAL_SECONDS` controls the interval (default
+1800 seconds).
+
 Use `SLURM_PREPROCESS_MAX_INFLIGHT`, `SLURM_VALIDATION_MAX_INFLIGHT`, and
 `SLURM_ARBITRATION_MAX_INFLIGHT` to control concurrency. Stage-specific CPU,
 memory, and time requests are available in the

@@ -46,6 +46,27 @@ def _controller_log(message: str, *, ok: bool = False) -> None:
     color=completed if ok else waiting
     print(color(log_line(message)),flush=True)
 
+@contextmanager
+def _developer_preprocess_step(logs: Path, isolate: str, step: str, cfg: dict[str, str]):
+    """Record wall time for each major preprocess operation when enabled."""
+    enabled=truthy(cfg.get("DEVELOPER_MODE", "true")); started=time.time()
+    if enabled:
+        logs.mkdir(parents=True,exist_ok=True)
+        with (logs/"developer_preprocess.tsv").open("a") as handle:
+            if handle.tell()==0: handle.write("isolate_id\tstep\tstatus\telapsed_seconds\ttimestamp\n")
+            handle.write(f"{isolate}\t{step}\tstarted\t\t{started:.3f}\n")
+    failed=False
+    try:
+        yield
+    except BaseException:
+        failed=True
+        raise
+    finally:
+        if enabled:
+            elapsed=time.time()-started
+            with (logs/"developer_preprocess.tsv").open("a") as handle:
+                handle.write(f"{isolate}\t{step}\t{'failed' if failed else 'complete'}\t{elapsed:.3f}\t{time.time():.3f}\n")
+
 def context(run_dir: Path):
     cfg={**DEFAULTS,**load_json(run_dir/"provenance"/"resolved_config.json")}; rows=read_tsv(run_dir/"provenance"/"manifest.tsv"); return cfg, rows
 
@@ -825,6 +846,7 @@ def preprocess(run_dir: Path, index: int) -> None:
         _release_preprocess_lock(lock_handle)
         raise SystemExit(f"Inconsistent preprocess output for isolate {iso}: {guard.reason}. Remove/repair the output or set RESUME_REPROCESS_INCONSISTENT_PREPROCESS=true.")
     out.mkdir(parents=True,exist_ok=True); scratch=_preprocess_scratch(cfg,run_dir,iso); work_out=(scratch/"output") if scratch else out; work_out.mkdir(parents=True,exist_ok=True); logs=work_out/"logs"; logs.mkdir(exist_ok=True)
+    preprocess_started=time.time()
     fields=["isolate_id","group_id","excluded","reason","top_species","contamination_pct","R1","R2","raw_bam","read_preprocessing","read_processing_decision","adapter_trimmed","assembly","assembly_length","contigs","n50","l50","ambiguous_bases","gc_fraction","gff",*QC_OUTPUT_FIELDS]
     thresholds=dict(record.get("qc_thresholds_resolved") or {})
     profile_source=str(record.get("qc_profile_source","global")); mode=checkm2_mode(cfg)
@@ -873,6 +895,7 @@ def preprocess(run_dir: Path, index: int) -> None:
         if validation.state!="complete":
             raise SystemExit(f"Preprocess output validation failed for isolate {iso}: {validation.reason}")
         payload={**payload,**(validation.marker_payload or {})}
+        payload={**payload,"preprocess_elapsed_seconds":round(time.time()-preprocess_started,3),"preprocess_completed_at":time.time()}
         touch_done(done,payload); finished=True
     def assessment(*, expected: str = "", top: str = "", contamination: float | None = None,
                    reads: dict[str,float] | None = None, metrics: dict[str,object] | None = None,
@@ -903,8 +926,9 @@ def preprocess(run_dir: Path, index: int) -> None:
             metrics={"assembly_length":"","contigs":"","n50":"","l50":"","ambiguous_bases":"","gc_fraction":""}
             result=assessment(excluded=True)
             finish({"isolate_id":iso,"group_id":group,"top_species":"","contamination_pct":"","R1":row.get("R1",""),"R2":row.get("R2",""),"raw_bam":row.get("raw_bam",""),"read_preprocessing":"skipped_user_excluded","read_processing_decision":"skipped_user_excluded","adapter_trimmed":0,"assembly":"","gff":"",**metrics,**qc_columns(result,None,metrics,None,None)},{"excluded":True,"reason":result["reason"],"qc_status":result["PASS/FAIL"]}); return
-        with spinner(f"Sample {iso} | Read preparation and fastp"):
-            r1,r2,read_method,adapter_trimmed,read_decision=prepare_read_inputs(row,work_out,logs,cfg)
+        with _developer_preprocess_step(logs,iso,"read_preparation",cfg):
+            with spinner(f"Sample {iso} | Read preparation and fastp"):
+                r1,r2,read_method,adapter_trimmed,read_decision=prepare_read_inputs(row,work_out,logs,cfg)
         read_errors=[]
         try: read_qc=read_metrics(Path(r1),Path(r2),work_out/"reads"/"fastp.json")
         except (OSError,ValueError,SystemExit) as error: read_qc=None; read_errors.append(("read_metrics_failed",str(error)))
@@ -918,8 +942,9 @@ def preprocess(run_dir: Path, index: int) -> None:
             command=["kraken2","--db",worker_db,"--threads",cfg.get("CPUS","4")]
             if memory_map: command.append("--memory-mapping")
             command += ["--paired","--report",str(report),"--output",output,r1,r2]
-            with spinner(f"Sample {iso} | Kraken2 classification"):
-                run(command,stdout=logs/"kraken2.stdout",stderr=logs/"kraken2.stderr")
+            with _developer_preprocess_step(logs,iso,"kraken2",cfg):
+                with spinner(f"Sample {iso} | Kraken2 classification"):
+                    run(command,stdout=logs/"kraken2.stdout",stderr=logs/"kraken2.stderr")
             top,contam,_=parse_kraken_report(report,expected)
         assembly=row.get("assembly","").strip()
         if assembly: provenance.append(_artifact_provenance(assembly,"assembly"))
@@ -934,13 +959,14 @@ def preprocess(run_dir: Path, index: int) -> None:
             generated_assembly=True
             if not Path(assembly).is_file():
                 try:
-                    with spinner(f"Sample {iso} | {assembler.capitalize()} assembly"):
-                        if assembler=="shovill":
-                            tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
-                            run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--ram",cfg.get("SHOVILL_MEMORY_GB","16"),"--force"]+(["--depth","0"] if truthy(cfg.get("SKIP_DOWNSAMPLING","false")) else []),stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
-                        else:
-                            if any(shov.iterdir()): shutil.rmtree(shov)
-                            run(["spades.py","--isolate","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
+                    with _developer_preprocess_step(logs,iso,"assembly",cfg):
+                        with spinner(f"Sample {iso} | {assembler.capitalize()} assembly"):
+                            if assembler=="shovill":
+                                tmp=(scratch/"tmp"/"shovill") if scratch else out/"tmp"/"shovill"; tmp.mkdir(parents=True,exist_ok=True)
+                                run(["shovill","--R1",r1,"--R2",r2,"--outdir",str(shov),"--tmpdir",str(tmp),"--cpus",cfg.get("CPUS","4"),"--ram",cfg.get("SHOVILL_MEMORY_GB","16"),"--force"]+(["--depth","0"] if truthy(cfg.get("SKIP_DOWNSAMPLING","false")) else []),stdout=logs/"shovill.stdout",stderr=logs/"shovill.stderr")
+                            else:
+                                if any(shov.iterdir()): shutil.rmtree(shov)
+                                run(["spades.py","--isolate","--only-assembler","-1",r1,"-2",r2,"-o",str(shov),"-t",cfg.get("CPUS","4"),"-m",cfg.get("SPADES_MEMORY_GB","28")],stdout=logs/"spades.stdout",stderr=logs/"spades.stderr")
                 except subprocess.CalledProcessError as error:
                     errors.append(("assembly_failed",f"{assembler} assembly failed with exit status {error.returncode}")); assembly=""
         if assembler=="off" and not assembly: warnings.append(("shovill_skipped","assembly and annotation were not evaluated because assembly mode is off"))
@@ -954,8 +980,9 @@ def preprocess(run_dir: Path, index: int) -> None:
             try: completeness,check_contamination=parse_checkm2_report(Path(supplied_checkm2).expanduser())
             except (ValueError,OSError) as error: errors.append(("checkm2_report_invalid",f"Supplied CheckM2 report could not be parsed: {error}"))
         elif mode=="required" and assembly:
-            with spinner(f"Sample {iso} | CheckM2 quality assessment"):
-                completeness,check_contamination=_run_checkm2(Path(assembly),work_out/"checkm2",logs,cfg,iso,run_dir=run_dir)
+            with _developer_preprocess_step(logs,iso,"checkm2",cfg):
+                with spinner(f"Sample {iso} | CheckM2 quality assessment"):
+                    completeness,check_contamination=_run_checkm2(Path(assembly),work_out/"checkm2",logs,cfg,iso,run_dir=run_dir)
         pre=assessment(expected=expected,top=top,contamination=contam,reads=read_qc,metrics=metrics,
             completeness=completeness,checkm2_contamination=check_contamination,internal=internal_pangenome,
             external=external_pangenome,assembly=assembly,gff_present=None,warnings=warnings,errors=errors)
@@ -982,8 +1009,9 @@ def preprocess(run_dir: Path, index: int) -> None:
         elif not gff.is_file():
             if ann.exists(): shutil.rmtree(ann)
             try:
-                with spinner(f"Sample {iso} | Prokka annotation"):
-                    run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
+                with _developer_preprocess_step(logs,iso,"prokka",cfg):
+                    with spinner(f"Sample {iso} | Prokka annotation"):
+                        run(["prokka","--outdir",str(ann),"--prefix",safe,"--locustag",safe,"--cpus",cfg.get("CPUS","4"),"--force",assembly],stdout=logs/"prokka.stdout",stderr=logs/"prokka.stderr")
             except subprocess.CalledProcessError as error: prokka_errors.append(("prokka_failed",f"Prokka failed with exit status {error.returncode}")); gff_present=None
         if gff_present is not None: gff_present=gff.is_file()
         final=assessment(expected=expected,top=top,contamination=contam,reads=read_qc,metrics=metrics,
@@ -1419,7 +1447,8 @@ def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str
         active=job_active(job_ids)
         current=user_job_count()
         avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
-        _controller_log(f"step={label} | user_jobs={current}/{cfg['SLURM_USER_JOB_LIMIT']} | available_slots={avail} | total_submitted={len(job_ids)} | total_completed=0 | current_step_completed={complete} | waiting_for_jobs")
+        finished=not active
+        _controller_log(f"step={label} | user_jobs={current}/{cfg['SLURM_USER_JOB_LIMIT']} | available_slots={avail} | total_submitted={len(job_ids)} | total_completed={len(job_ids) if finished else 0} | current_step_completed={'1/1' if finished else complete} | waiting_for_jobs")
         if not active:
             assert_jobs_succeeded(job_ids,details)
             return
@@ -1487,7 +1516,7 @@ def _failed_stage_log_excerpt(run_dir: Path, stage: str, job_id: str) -> str:
 
 class _RollingScheduler:
     def __init__(self,run_dir: Path,cfg: dict[str,str]):
-        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.done: dict[str,set[int]]={}; self.failed: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}
+        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.done: dict[str,set[int]]={}; self.failed: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}; self.last_developer_report=0.0
 
     def seed_done(self,stage: str,indices: list[int]) -> set[int]:
         if stage not in self.done:
@@ -1606,6 +1635,20 @@ class _RollingScheduler:
             f"running={running} | slurm_pending={pending} | not_submitted_yet={not_submitted} | failed={failed}"
         )
         _controller_log(message)
+        if truthy(self.cfg.get("DEVELOPER_MODE", "true")) and (not self.last_developer_report or time.monotonic()-self.last_developer_report >= float(self.cfg.get("DEVELOPER_REPORT_INTERVAL_SECONDS", "1800"))):
+            durations=[]
+            if stage=="preprocess":
+                rows=read_tsv(self.run_dir/"state"/"isolate_tasks.tsv")
+                for i in total_indices:
+                    if i>=len(rows): continue
+                    marker=self.run_dir/"state"/"preprocess"/f"{safe_name(rows[i]['isolate_id'])}.done.json"
+                    try:
+                        value=load_json(marker).get("preprocess_elapsed_seconds")
+                        if value is not None: durations.append(float(value))
+                    except (OSError,ValueError,TypeError): pass
+            average=sum(durations)/len(durations) if durations else 0.0
+            _controller_log(f"developer_report | step={label} | average_completed_job_seconds={average:.3f} | samples_with_timing={len(durations)} | running={running} | done={complete} | total={total}")
+            self.last_developer_report=time.monotonic()
 
     def wait_tick(self) -> None: time.sleep(int(self.cfg["SLURM_POLL_SECONDS"]))
 

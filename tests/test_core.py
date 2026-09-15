@@ -650,8 +650,8 @@ class CleanGeneCoreTests(unittest.TestCase):
     def test_progress_counts_done_markers_not_submitted_boundary(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10"}
         with tempfile.TemporaryDirectory() as d:
-            run=Path(d); write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],(("g",f"i{i}") for i in range(3))); atomic_json(run/"state"/"preprocess"/"i0.done.json",{}); atomic_json(run/"state"/"preprocess"/"i1.done.json",{"status":"failed"})
-            scheduler=_RollingScheduler(run,cfg); scheduler.snapshot={"total":2,"jobs":{}}; scheduler.submitted={"preprocess":{0,1,2}}
+            run=Path(d); write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],(("g",f"i{i}") for i in range(3))); atomic_json(run/"state"/"preprocess"/"i0.done.json",{"preprocess_elapsed_seconds":10}); atomic_json(run/"state"/"preprocess"/"i1.done.json",{"status":"failed"})
+            scheduler=_RollingScheduler(run,{**cfg,"DEVELOPER_MODE":"true","DEVELOPER_REPORT_INTERVAL_SECONDS":"1800"}); scheduler.snapshot={"total":2,"jobs":{}}; scheduler.submitted={"preprocess":{0,1,2}}
             output=StringIO()
             with contextlib.redirect_stdout(output): scheduler.progress("preprocess",[0,1,2],"CleanGene preprocess")
             text=output.getvalue()
@@ -661,6 +661,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertIn("total_submitted=3",text)
             self.assertIn("not_submitted_yet=0",text)
             self.assertIn("failed=1",text)
+            self.assertIn("average_completed_job_seconds=10.000",text)
 
     def test_wait_jobs_sleep_branch_has_time_import(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0"}
