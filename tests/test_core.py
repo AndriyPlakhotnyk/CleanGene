@@ -581,6 +581,7 @@ class CleanGeneCoreTests(unittest.TestCase):
         self.assertEqual(snapshot["jobs"]["123"]["RUNNING"],1)
         self.assertEqual(snapshot["jobs"]["123"]["PENDING"],1)
         self.assertEqual(snapshot["entries"][0]["task_id"],"7")
+        self.assertEqual(snapshot["entries"][0]["job_key"],"123_7")
         self.assertEqual(snapshot["entries"][0]["cpus"],8)
 
     def test_active_cleangene_jobs_for_run_matches_exact_run(self):

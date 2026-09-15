@@ -9,3 +9,9 @@ For known organism assignments, the controller orders preprocessing by increasin
 ARC preprocessing uses node-local scratch for generated reads, Kraken reports, Shovill work, assembly, annotation, and logs, then copies final artifacts into the run. Kraken2 uses all allocated CPUs, suppresses per-read classifications unless `KRAKEN2_KEEP_CLASSIFICATIONS=true`, and in `auto` access mode copies the database once per compute node under a lock. If node-local capacity is insufficient, it falls back to memory mapping the shared database.
 
 Worker outputs are checkpointed with JSON completion records. Resubmission is safe after technical failures because workers verify their required final outputs before skipping.
+
+Slurm array tasks share one parent job ID in `squeue`; this is expected. CleanGene
+keeps the parent ID for capacity accounting and cancellation, tracks each task ID
+separately, and exposes a unique `job_key` such as `48542613_577` in queue
+snapshots. Failure messages report the parent ID, task range, and task log pattern
+so an array element cannot be mistaken for a duplicate submission.

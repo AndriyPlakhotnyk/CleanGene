@@ -65,7 +65,7 @@ def user_queue_snapshot(user: str | None = None) -> dict[str,object]:
         elif len(fields)>4:
             command=fields[4].strip()
         jobs.setdefault(job_id,Counter())[state] += 1
-        entries.append({"job_id":job_id,"task_id":task_id,"state":state,"name":name,"cpus":cpus,"command":command})
+        entries.append({"job_id":job_id,"task_id":task_id,"job_key":f"{job_id}_{task_id}" if task_id not in {"", "N/A"} else job_id,"state":state,"name":name,"cpus":cpus,"command":command})
         total += 1
     return {"total":total,"jobs":jobs,"entries":entries}
 

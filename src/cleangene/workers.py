@@ -1574,7 +1574,7 @@ class _RollingScheduler:
                 continue
             batch.missing_polls += 1
             if batch.missing_polls<2: continue
-            details=f"job_id={jid} stage={batch.stage} index={batch.array} log={_stage_log_pattern(self.run_dir,batch.stage)}"
+            details=f"job_id={jid} task_range={batch.array} stage={batch.stage} log={_stage_log_pattern(self.run_dir,batch.stage)}"
             try:
                 assert_jobs_succeeded([jid],details)
             except RuntimeError as error:
