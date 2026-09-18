@@ -9,7 +9,7 @@ from cleangene.pangenome import cluster_locus_rows, gff_cds_loci, normalize_pana
 from cleangene.slurm import active_cleangene_jobs_for_run, array_task_count, available_slots, submit_with_qos_retry, user_job_count, user_queue_snapshot, sbatch_cmd, submit
 from cleangene.task_store import build_isolate_task_store, load_isolate_task, migrate_isolate_task_store
 from cleangene.util import atomic_json, read_tsv, write_tsv
-from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, arbitrate_evidence, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, invalidate_failed_panaroo_downstream, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, preprocess, reduce_group, slurm_controller, task_row
+from cleangene.workers import _RollingScheduler, _controller_cmd, _controller_pipeline, _index_done, _preprocess_scratch, _wait_jobs, arbitrate_evidence, build_organism_results_index, cleanup_trimmed_fastqs, compress_completed_outputs, controller_downstream, ensure_kraken2_db, invalidate_failed_panaroo_downstream, kraken_db_for_worker, manifest_pangenome_dir, manifest_row_for_task, panaroo, parse_kraken_report, plot_group, prepare_read_inputs, preprocess, reduce_group, slurm_controller, task_row, write_final_developer_report
 from cleangene.cli import apply_cli_overrides, exclude_command, invalidate_legacy_identity_metrics, local, make_run, refresh_resume_config, slurm
 from unittest.mock import patch
 import subprocess
@@ -668,6 +668,20 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertIn("avg_completion=00:00:10",text)
             self.assertIn("n_samples=1",text)
             self.assertIn("sources=",text)
+
+    def test_final_developer_report_aggregates_stage_and_process_timings(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)
+            atomic_json(run/"provenance"/"resolved_config.json",{"DEVELOPER_MODE":"true"})
+            write_tsv(run/"state"/"isolate_tasks.tsv",["group_id","isolate_id"],[["g","i1"]])
+            atomic_json(run/"logs"/"developer_stage_tasks"/"preprocess.0.json",{"stage":"preprocess","status":"complete","elapsed_seconds":12.5,"started_at":10,"completed_at":22.5})
+            write_tsv(run/"logs"/"developer_preprocess.tsv",["isolate_id","step","status","elapsed_seconds","timestamp","source"],[["i1","assembly","complete",12.5,22.5,"worker_wall_clock"]])
+            report=write_final_developer_report(run)
+            stages={row["stage"]:row for row in read_tsv(report/"stage_runtime.tsv")}
+            self.assertEqual(stages["preprocess"]["stage_wall_seconds"],"12.500")
+            process=read_tsv(report/"process_runtime.tsv")
+            self.assertEqual(process[0]["process"],"assembly")
+            self.assertTrue((report/"README.txt").is_file())
 
     def test_wait_jobs_sleep_branch_has_time_import(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0"}

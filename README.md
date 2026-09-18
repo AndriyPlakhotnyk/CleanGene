@@ -385,6 +385,13 @@ Set `DEVELOPER_MODE=false` to suppress per-step timing files and periodic
 developer reports. `DEVELOPER_REPORT_INTERVAL_SECONDS` controls the developer
 report interval (default 1800 seconds).
 
+After the summary stage, developer mode writes `logs/developer_final_report/`.
+`stage_runtime.tsv` reports observed task counts, cumulative worker time, task
+min/mean/max, and the elapsed span for each stage. `process_runtime.tsv` groups
+preprocessing substeps and smaller preflight, launcher, and CheckM2 timing files.
+`README.txt` records the run sample count and controller wall-clock time. Array
+stage cumulative worker time can exceed wall-clock time because tasks overlap.
+
 Use `SLURM_PREPROCESS_MAX_INFLIGHT`, `SLURM_VALIDATION_MAX_INFLIGHT`, and
 `SLURM_ARBITRATION_MAX_INFLIGHT` to control concurrency. Stage-specific CPU,
 memory, and time requests are available in the

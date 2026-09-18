@@ -1535,6 +1535,97 @@ def _format_duration(seconds: float) -> str:
     minutes, seconds=divmod(remainder,60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
+def _developer_stage_event_path(run_dir: Path, stage: str, index: int | None) -> Path:
+    task=safe_name("cohort" if index is None else str(index))
+    return run_dir/"logs"/"developer_stage_tasks"/f"{safe_name(stage)}.{task}.json"
+
+def _record_developer_stage_event(run_dir: Path, stage: str, index: int | None,
+                                  started_at: float, elapsed_seconds: float, status: str) -> None:
+    try:
+        cfg=load_run_config(run_dir)
+        if not truthy(cfg.get("DEVELOPER_MODE", "true")): return
+        atomic_json(_developer_stage_event_path(run_dir,stage,index),{
+            "stage":stage,
+            "index":index,
+            "status":status,
+            "started_at":started_at,
+            "completed_at":time.time(),
+            "elapsed_seconds":round(elapsed_seconds,3),
+            "job_id":os.environ.get("SLURM_JOB_ID","local"),
+            "array_task_id":os.environ.get("SLURM_ARRAY_TASK_ID",""),
+            "source":"worker_wall_clock",
+        })
+    except (OSError,ValueError,TypeError):
+        pass
+
+def _read_timing_rows(path: Path) -> list[dict[str,str]]:
+    try:
+        return read_tsv(path) if path.is_file() else []
+    except (OSError,ValueError):
+        return []
+
+def _numeric_timing(value: object) -> float | None:
+    try: return float(value)
+    except (TypeError,ValueError): return None
+
+def write_final_developer_report(run_dir: Path) -> Path | None:
+    """Aggregate stage and subprocess timings after a completed run."""
+    cfg=load_run_config(run_dir)
+    if not truthy(cfg.get("DEVELOPER_MODE", "true")): return None
+    report_dir=run_dir/"logs"/"developer_final_report"; report_dir.mkdir(parents=True,exist_ok=True)
+    stage_values: dict[str,list[float]]={}; stage_spans: dict[str,list[tuple[float,float]]]={}; stage_status: dict[str,dict[str,int]]={}
+    for path in sorted((run_dir/"logs"/"developer_stage_tasks").glob("*.json")):
+        try: event=load_json(path)
+        except (OSError,ValueError): continue
+        stage=str(event.get("stage",path.stem)); elapsed=_numeric_timing(event.get("elapsed_seconds"))
+        if elapsed is None: continue
+        stage_values.setdefault(stage,[]).append(elapsed)
+        started=_numeric_timing(event.get("started_at")); completed=_numeric_timing(event.get("completed_at"))
+        if started is not None and completed is not None: stage_spans.setdefault(stage,[]).append((started,completed))
+        status=str(event.get("status","complete")); stage_status.setdefault(stage,{"complete":0,"failed":0})["failed" if status=="failed" else "complete"] += 1
+    stage_rows=[]
+    stage_names=sorted(set(stage_values) | {name for name,_ in STAGE_DESCRIPTIONS})
+    for stage in stage_names:
+        values=stage_values.get(stage,[]); counts=stage_status.get(stage,{"complete":0,"failed":0})
+        spans=stage_spans.get(stage,[]); wall=(max(end for _,end in spans)-min(start for start,_ in spans)) if spans else None
+        stage_rows.append([stage,len(values),counts["complete"],counts["failed"],f"{sum(values):.3f}" if values else "",f"{sum(values)/len(values):.3f}" if values else "",f"{min(values):.3f}" if values else "",f"{max(values):.3f}" if values else "",f"{wall:.3f}" if wall is not None else ""])
+    write_tsv(report_dir/"stage_runtime.tsv",["stage","tasks_observed","tasks_complete","tasks_failed","cumulative_worker_seconds","average_task_seconds","minimum_task_seconds","maximum_task_seconds","stage_wall_seconds"],stage_rows)
+
+    process_values: dict[tuple[str,str],list[float]]={}
+    for row in _read_timing_rows(run_dir/"logs"/"developer_preprocess.tsv"):
+        if row.get("status")!="complete": continue
+        value=_numeric_timing(row.get("elapsed_seconds")); name=row.get("step","")
+        if value is not None and name: process_values.setdefault(("preprocess_step",name),[]).append(value)
+    for source,path in (("preflight",run_dir/"logs"/"preflight_timing.tsv"),("launcher",run_dir/"logs"/"launcher_timing.tsv")):
+        for row in _read_timing_rows(path):
+            value=_numeric_timing(row.get("seconds")); name=row.get("phase","")
+            if value is not None and name: process_values.setdefault((source,name),[]).append(value)
+    for path in sorted((run_dir/"results").glob("**/logs/checkm2.timing.tsv")):
+        for row in _read_timing_rows(path):
+            value=_numeric_timing(row.get("elapsed_seconds")); status=row.get("status","")
+            if value is not None and status: process_values.setdefault(("checkm2",status),[]).append(value)
+    process_rows=[]
+    for (source,name),values in sorted(process_values.items()):
+        process_rows.append([source,name,len(values),f"{sum(values):.3f}",f"{sum(values)/len(values):.3f}",f"{min(values):.3f}",f"{max(values):.3f}"])
+    write_tsv(report_dir/"process_runtime.tsv",["source","process","observations","total_seconds","average_seconds","minimum_seconds","maximum_seconds"],process_rows)
+
+    status_path=run_dir/"state"/"controller_status.json"; controller_elapsed=None
+    try:
+        status=load_json(status_path); started=_numeric_timing(status.get("started_at"))
+        if started is not None: controller_elapsed=max(0.0,time.time()-started)
+    except (OSError,ValueError): pass
+    manifest_count=len(_read_timing_rows(run_dir/"state"/"isolate_tasks.tsv"))
+    report=report_dir/"README.txt"
+    report.write_text(
+        "CleanGene final developer report\n"
+        f"generated_at={time.time():.3f}\n"
+        f"total_samples={manifest_count}\n"
+        f"controller_wall_seconds={'' if controller_elapsed is None else f'{controller_elapsed:.3f}'}\n"
+        "stage_runtime.tsv contains cumulative worker time; overlapping Slurm tasks are intentionally summed.\n"
+        "process_runtime.tsv contains preprocessing substeps and smaller controller/CheckM2 timing observations.\n"
+    )
+    return report_dir
+
 class _RollingScheduler:
     def __init__(self,run_dir: Path,cfg: dict[str,str]):
         self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.done: dict[str,set[int]]={}; self.failed: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}; self.last_controller_report=0.0; self.last_developer_report=0.0
@@ -1798,6 +1889,8 @@ def slurm_controller(run_dir: Path, index: int | None = None) -> None:
                 controller_downstream(run_dir)
             else:
                 _controller_pipeline(run_dir,True)
+            report=write_final_developer_report(run_dir)
+            if report: _developer_controller_log(f"final_report={report}")
         except BaseException as error:
             reason=str(error) or error.__class__.__name__
             atomic_json(status_path,{"status":"failed","job_id":os.environ.get("SLURM_JOB_ID","local"),"reason":reason,"failed_at":time.time()})
@@ -2105,18 +2198,29 @@ def summarize(run_dir: Path) -> None:
 
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
     verify_worker_runtime(run_dir)
-    if stage=="slurm_controller": slurm_controller(run_dir,index)
-    elif stage=="kraken_db_setup": kraken_db_setup(run_dir,index)
-    elif stage=="checkm2_db_setup": checkm2_db_setup(run_dir,index)
-    elif stage=="checkm2_posthoc_setup": checkm2_posthoc_setup(run_dir,index)
-    elif stage=="preprocess": preprocess(run_dir,int(index))
-    elif stage=="resolve_groups": resolve_groups(run_dir,index)
-    elif stage=="orchestrate_downstream": orchestrate_downstream(run_dir,index)
-    elif stage=="panaroo": panaroo(run_dir,int(index))
-    elif stage=="prepare_validation": prepare_validation(run_dir,int(index))
-    elif stage=="validate": validate(run_dir,int(index))
-    elif stage=="arbitrate": arbitrate(run_dir,int(index))
-    elif stage=="reduce": reduce_group(run_dir,int(index))
-    elif stage=="plot": plot_group(run_dir,int(index))
-    elif stage=="summary": summarize(run_dir)
-    else: raise SystemExit(f"Unknown worker stage: {stage}")
+    started_at=time.time(); started=time.monotonic(); status="complete"
+    try:
+        if stage=="slurm_controller": slurm_controller(run_dir,index)
+        elif stage=="kraken_db_setup": kraken_db_setup(run_dir,index)
+        elif stage=="checkm2_db_setup": checkm2_db_setup(run_dir,index)
+        elif stage=="checkm2_posthoc_setup": checkm2_posthoc_setup(run_dir,index)
+        elif stage=="preprocess": preprocess(run_dir,int(index))
+        elif stage=="resolve_groups": resolve_groups(run_dir,index)
+        elif stage=="orchestrate_downstream": orchestrate_downstream(run_dir,index)
+        elif stage=="panaroo": panaroo(run_dir,int(index))
+        elif stage=="prepare_validation": prepare_validation(run_dir,int(index))
+        elif stage=="validate": validate(run_dir,int(index))
+        elif stage=="arbitrate": arbitrate(run_dir,int(index))
+        elif stage=="reduce": reduce_group(run_dir,int(index))
+        elif stage=="plot": plot_group(run_dir,int(index))
+        elif stage=="summary": summarize(run_dir)
+        else: raise SystemExit(f"Unknown worker stage: {stage}")
+    except BaseException:
+        status="failed"
+        raise
+    finally:
+        if stage!="slurm_controller":
+            _record_developer_stage_event(run_dir,stage,index,started_at,time.monotonic()-started,status)
+            if stage=="summary" and status=="complete":
+                report=write_final_developer_report(run_dir)
+                if report: _developer_controller_log(f"final_report={report}")
