@@ -9,6 +9,7 @@ RESET="\033[0m"
 BURGUNDY="\033[38;2;128;0;32m"
 GREEN="\033[38;2;0;128;96m"
 OCHRE="\033[38;2;128;96;0m"
+PURPLE="\033[38;2;180;80;220m"
 BOLD="\033[1m"
 SILVER="\033[38;2;192;192;192m"
 WHITE="\033[38;2;255;255;255m"
@@ -40,6 +41,9 @@ def completed(text: str) -> str:
 
 def submitted(text: str) -> str:
     return styled(text,color=GREEN,bold=True)
+
+def developer_report(text: str) -> str:
+    return styled(text,color=PURPLE,bold=True)
 
 def clean_gene_banner() -> str:
     inner_width=78

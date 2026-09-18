@@ -359,10 +359,10 @@ Controller update fields:
 | Field | Meaning | Number source |
 | --- | --- | --- |
 | `user_jobs` | Jobs currently counted for the user, shown against the configured limit. | Slurm user queue snapshot. |
-| `available_slots` | Jobs the controller can submit without exceeding the configured headroom. | Derived from the queue count and `SLURM_USER_JOB_LIMIT`/`SLURM_JOB_HEADROOM`. |
 | `total_submitted` | Isolate or group tasks submitted or already recognized as done for this stage. | Controller submission and done sets. |
 | `total_completed` | Tasks with successful completion markers. | `state/<stage>/*.done.json`. |
-| `current_step_completed` | Completed tasks divided by the stage task count. | Successful markers and the stage task list. |
+| `samples_completed` | Samples in the run with successful preprocessing markers; this remains useful while later group stages are running. | `state/preprocess/*.done.json`. |
+| `step_completed` | Completed tasks divided by the current stage task count. | Successful markers and the stage task list. |
 | `running` | Tasks in running Slurm states for this stage. | Slurm stage job states. |
 | `slurm_pending` | Tasks waiting in pending or unknown Slurm states for this stage. | Slurm stage job states. |
 | `not_submitted_yet` | Stage tasks not yet submitted or completed. | Stage total minus controller-submitted tasks. |
@@ -372,13 +372,18 @@ Developer update fields:
 
 | Field | Meaning | Number source |
 | --- | --- | --- |
-| `average_completed_job_seconds` | Arithmetic mean of recorded total preprocess durations. | `state/preprocess/<isolate>.done.json:preprocess_elapsed_seconds`. |
-| `samples_with_timing` | Number of completed preprocess markers contributing a duration. | Same completion-marker fields. |
-| `running` / `done` / `total` | Current stage running count, completed count, and task count. | Slurm stage states, successful markers, and the stage task list. |
+| `avg_completion` | Arithmetic mean of completed preprocess durations, formatted as `HH:MM:SS`. | `state/preprocess/<isolate>.done.json:preprocess_elapsed_seconds`. |
+| `n_samples` | Number of completed preprocess samples contributing a duration. | Same completion-marker fields. |
+| `running` / `done` | Current preprocess tasks running and completed. | Slurm preprocess states and successful markers. |
+| `total` | Total samples in the run, including submitted and previously completed samples. | `state/isolate_tasks.tsv`. |
+| `samples_completed` | Successful preprocess samples in the run at report time. | `state/preprocess/*.done.json`. |
 
+Controller progress updates are emitted every two minutes by default while the
+controller continues polling and refilling work every `SLURM_POLL_SECONDS`.
+`SLURM_CONTROLLER_REPORT_INTERVAL_SECONDS` changes the reporting interval.
 Set `DEVELOPER_MODE=false` to suppress per-step timing files and periodic
-developer reports. `DEVELOPER_REPORT_INTERVAL_SECONDS` controls the interval
-(default 1800 seconds).
+developer reports. `DEVELOPER_REPORT_INTERVAL_SECONDS` controls the developer
+report interval (default 1800 seconds).
 
 Use `SLURM_PREPROCESS_MAX_INFLIGHT`, `SLURM_VALIDATION_MAX_INFLIGHT`, and
 `SLURM_ARBITRATION_MAX_INFLIGHT` to control concurrency. Stage-specific CPU,

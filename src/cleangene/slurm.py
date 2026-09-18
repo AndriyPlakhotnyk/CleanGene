@@ -93,10 +93,14 @@ def available_slots(limit: int, headroom: int, current: int) -> int:
 
 def wait_for_capacity(needed: int, cfg: dict[str,str], *, label: str = "") -> int:
     limit=int(cfg["SLURM_USER_JOB_LIMIT"]); headroom=int(cfg["SLURM_JOB_HEADROOM"]); poll=int(cfg["SLURM_POLL_SECONDS"])
+    last_report=0.0
     while True:
         current=user_job_count()
         avail=available_slots(limit,headroom,current)
-        print(waiting(log_line(f"step={label} | user_jobs={current}/{limit} | available_slots={avail} | waiting_for_capacity | needed={needed}")), flush=True)
+        now=time.monotonic()
+        if not last_report or now-last_report >= float(cfg.get("SLURM_CONTROLLER_REPORT_INTERVAL_SECONDS","120")):
+            print(waiting(log_line(f"step={label} | user_jobs={current}/{limit} | waiting_for_capacity | needed={needed}")), flush=True)
+            last_report=now
         if avail >= needed: return avail
         time.sleep(poll)
 

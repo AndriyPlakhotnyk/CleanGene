@@ -658,11 +658,15 @@ class CleanGeneCoreTests(unittest.TestCase):
             text=output.getvalue()
             self.assertRegex(text,r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| step=CleanGene preprocess")
             self.assertIn("total_completed=1",text)
-            self.assertIn("current_step_completed=1/3",text)
+            self.assertIn("step_completed=1/3",text)
             self.assertIn("total_submitted=3",text)
+            self.assertIn("samples_completed=1",text)
             self.assertIn("not_submitted_yet=0",text)
             self.assertIn("failed=1",text)
-            self.assertIn("average_completed_job_seconds=10.000",text)
+            self.assertNotIn("available_slots=",text)
+            self.assertIn("Developer Report",text)
+            self.assertIn("avg_completion=00:00:10",text)
+            self.assertIn("n_samples=1",text)
             self.assertIn("sources=",text)
 
     def test_wait_jobs_sleep_branch_has_time_import(self):
