@@ -1444,7 +1444,16 @@ def run_resume_maintenance(run_dir: Path, cfg: dict[str,str]) -> dict[str,int]:
     _controller_log("step=resume_maintenance | status=completed",ok=True)
     return {"legacy_identity_metrics":invalidated,"legacy_isolate_qc":legacy_qc}
 
-def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str, details: str = "") -> None:
+def _completed_preprocess_samples(run_dir: Path | None) -> int:
+    if run_dir is None:
+        return 0
+    try:
+        rows=read_tsv(run_dir/"state"/"isolate_tasks.tsv")
+    except (OSError,ValueError):
+        return 0
+    return sum(_successful_marker(run_dir/"state"/"preprocess"/f"{safe_name(row['isolate_id'])}.done.json") for row in rows)
+
+def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str, details: str = "", *, run_dir: Path | None = None) -> None:
     poll=int(cfg["SLURM_POLL_SECONDS"])
     last_report=0.0
     while True:
@@ -1453,7 +1462,7 @@ def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str
         finished=not active
         now=time.monotonic()
         if not last_report or now-last_report >= float(cfg.get("SLURM_CONTROLLER_REPORT_INTERVAL_SECONDS","120")):
-            _controller_log(f"step={label} | user_jobs={current}/{cfg['SLURM_USER_JOB_LIMIT']} | total_submitted={len(job_ids)} | total_completed={len(job_ids) if finished else 0} | step_completed={'1/1' if finished else complete} | waiting_for_jobs | sources=user_jobs:slurm_user_queue_snapshot,total_submitted:controller_job_ids,total_completed:job_state_query,step_completed:single_job_state")
+            _controller_log(f"step={label} | user_jobs={current}/{cfg['SLURM_USER_JOB_LIMIT']} | total_submitted={len(job_ids)} | total_completed={len(job_ids) if finished else 0} | samples_completed={_completed_preprocess_samples(run_dir)} | step_completed={'1/1' if finished else complete} | waiting_for_jobs | sources=user_jobs:slurm_user_queue_snapshot,total_submitted:controller_job_ids,total_completed:job_state_query,samples_completed:successful_preprocess_markers,step_completed:single_job_state")
             last_report=now
         if not active:
             assert_jobs_succeeded(job_ids,details)
@@ -1463,7 +1472,7 @@ def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str
 def _run_single_job(run_dir: Path, cfg: dict[str,str], stage: str, cpus: str, mem: str, time_limit: str, label: str) -> str:
     cmd=_controller_cmd(run_dir,cfg,stage,None,cpus,mem,time_limit)
     jid=submit_with_qos_retry(cmd,cfg,1,label)
-    _wait_jobs([jid],cfg,label,"single job submitted",f"job_id={jid} stage={stage} index=0 log={_stage_log_pattern(run_dir,stage)}")
+    _wait_jobs([jid],cfg,label,"single job submitted",f"job_id={jid} stage={stage} index=0 log={_stage_log_pattern(run_dir,stage)}",run_dir=run_dir)
     return jid
 
 def _run_database_setup_stages(run_dir: Path, cfg: dict[str,str], rows: list[dict[str,str]]) -> dict[str,str]:
@@ -1643,7 +1652,7 @@ class _RollingScheduler:
         total=len(total_indices); not_submitted=max(0,total-submitted)
         now=time.monotonic()
         if not self.last_controller_report or now-self.last_controller_report >= float(self.cfg.get("SLURM_CONTROLLER_REPORT_INTERVAL_SECONDS","120")):
-            samples_completed=self._completed_sample_count()
+            samples_completed=_completed_preprocess_samples(self.run_dir)
             message=(
                 f"step={label} | user_jobs={current}/{self.cfg['SLURM_USER_JOB_LIMIT']} | "
                 f"total_submitted={submitted} | total_completed={complete} | samples_completed={samples_completed} | step_completed={complete}/{total} | "
@@ -1663,15 +1672,8 @@ class _RollingScheduler:
                     if value is not None: durations.append(float(value))
                 except (OSError,ValueError,TypeError): pass
             average=sum(durations)/len(durations) if durations else 0.0
-            _developer_controller_log(f"step={label} | avg_completion={_format_duration(average)} | n_samples={len(durations)} | running={running} | done={complete} | total={len(rows)} | samples_completed={self._completed_sample_count()} | sources=avg_completion:state_preprocess_done_markers.preprocess_elapsed_seconds,n_samples:timed_done_markers,running:slurm_stage_job_states,done:successful_preprocess_markers,total:isolate_task_list,samples_completed:successful_preprocess_markers")
+            _developer_controller_log(f"step={label} | avg_completion={_format_duration(average)} | n_samples={len(durations)} | running={running} | done={complete} | total={len(rows)} | samples_completed={_completed_preprocess_samples(self.run_dir)} | sources=avg_completion:state_preprocess_done_markers.preprocess_elapsed_seconds,n_samples:timed_done_markers,running:slurm_stage_job_states,done:successful_preprocess_markers,total:isolate_task_list,samples_completed:successful_preprocess_markers")
             self.last_developer_report=time.monotonic()
-
-    def _completed_sample_count(self) -> int:
-        try:
-            rows=read_tsv(self.run_dir/"state"/"isolate_tasks.tsv")
-        except (OSError,ValueError):
-            return 0
-        return sum(_successful_marker(self.run_dir/"state"/"preprocess"/f"{safe_name(row['isolate_id'])}.done.json") for row in rows)
 
     def wait_tick(self) -> None: time.sleep(int(self.cfg["SLURM_POLL_SECONDS"]))
 
