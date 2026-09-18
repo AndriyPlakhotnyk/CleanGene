@@ -663,6 +663,7 @@ class CleanGeneCoreTests(unittest.TestCase):
             self.assertIn("not_submitted_yet=0",text)
             self.assertIn("failed=1",text)
             self.assertIn("average_completed_job_seconds=10.000",text)
+            self.assertIn("sources=",text)
 
     def test_wait_jobs_sleep_branch_has_time_import(self):
         cfg={"SLURM_USER_JOB_LIMIT":"2000","SLURM_JOB_HEADROOM":"10","SLURM_POLL_SECONDS":"0"}

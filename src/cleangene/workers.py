@@ -53,8 +53,8 @@ def _developer_preprocess_step(logs: Path, isolate: str, step: str, cfg: dict[st
     if enabled:
         logs.mkdir(parents=True,exist_ok=True)
         with (logs/"developer_preprocess.tsv").open("a") as handle:
-            if handle.tell()==0: handle.write("isolate_id\tstep\tstatus\telapsed_seconds\ttimestamp\n")
-            handle.write(f"{isolate}\t{step}\tstarted\t\t{started:.3f}\n")
+            if handle.tell()==0: handle.write("isolate_id\tstep\tstatus\telapsed_seconds\ttimestamp\tsource\n")
+            handle.write(f"{isolate}\t{step}\tstarted\t\t{started:.3f}\tworker_wall_clock\n")
     failed=False
     try:
         yield
@@ -65,7 +65,7 @@ def _developer_preprocess_step(logs: Path, isolate: str, step: str, cfg: dict[st
         if enabled:
             elapsed=time.time()-started
             with (logs/"developer_preprocess.tsv").open("a") as handle:
-                handle.write(f"{isolate}\t{step}\t{'failed' if failed else 'complete'}\t{elapsed:.3f}\t{time.time():.3f}\n")
+                handle.write(f"{isolate}\t{step}\t{'failed' if failed else 'complete'}\t{elapsed:.3f}\t{time.time():.3f}\tworker_wall_clock\n")
 
 def context(run_dir: Path):
     cfg={**DEFAULTS,**load_json(run_dir/"provenance"/"resolved_config.json")}; rows=read_tsv(run_dir/"provenance"/"manifest.tsv"); return cfg, rows
@@ -1448,7 +1448,7 @@ def _wait_jobs(job_ids: list[str], cfg: dict[str,str], label: str, complete: str
         current=user_job_count()
         avail=available_slots(int(cfg["SLURM_USER_JOB_LIMIT"]),int(cfg["SLURM_JOB_HEADROOM"]),current)
         finished=not active
-        _controller_log(f"step={label} | user_jobs={current}/{cfg['SLURM_USER_JOB_LIMIT']} | available_slots={avail} | total_submitted={len(job_ids)} | total_completed={len(job_ids) if finished else 0} | current_step_completed={'1/1' if finished else complete} | waiting_for_jobs")
+        _controller_log(f"step={label} | user_jobs={current}/{cfg['SLURM_USER_JOB_LIMIT']} | available_slots={avail} | total_submitted={len(job_ids)} | total_completed={len(job_ids) if finished else 0} | current_step_completed={'1/1' if finished else complete} | waiting_for_jobs | sources=user_jobs:slurm_user_queue_snapshot,available_slots:derived_from_queue_and_limits,total_submitted:controller_job_ids,total_completed:job_state_query,current_step_completed:single_job_state")
         if not active:
             assert_jobs_succeeded(job_ids,details)
             return
@@ -1632,7 +1632,8 @@ class _RollingScheduler:
         message=(
             f"step={label} | user_jobs={current}/{self.cfg['SLURM_USER_JOB_LIMIT']} | available_slots={avail} | "
             f"total_submitted={submitted} | total_completed={complete} | current_step_completed={complete}/{total} | "
-            f"running={running} | slurm_pending={pending} | not_submitted_yet={not_submitted} | failed={failed}"
+            f"running={running} | slurm_pending={pending} | not_submitted_yet={not_submitted} | failed={failed} | "
+            f"sources=user_jobs:slurm_user_queue_snapshot,available_slots:derived_from_queue_and_limits,total_submitted:controller_submission_and_done_sets,total_completed:successful_state_markers,current_step_completed:successful_state_markers_and_stage_task_list,running:slurm_stage_job_states,slurm_pending:slurm_stage_job_states,not_submitted_yet:stage_total_minus_submitted,failed:failed_state_markers"
         )
         _controller_log(message)
         if truthy(self.cfg.get("DEVELOPER_MODE", "true")) and (not self.last_developer_report or time.monotonic()-self.last_developer_report >= float(self.cfg.get("DEVELOPER_REPORT_INTERVAL_SECONDS", "1800"))):
@@ -1647,7 +1648,7 @@ class _RollingScheduler:
                         if value is not None: durations.append(float(value))
                     except (OSError,ValueError,TypeError): pass
             average=sum(durations)/len(durations) if durations else 0.0
-            _controller_log(f"developer_report | step={label} | average_completed_job_seconds={average:.3f} | samples_with_timing={len(durations)} | running={running} | done={complete} | total={total}")
+            _controller_log(f"developer_report | step={label} | average_completed_job_seconds={average:.3f} | samples_with_timing={len(durations)} | running={running} | done={complete} | total={total} | sources=average_completed_job_seconds:state_preprocess_done_markers.preprocess_elapsed_seconds,samples_with_timing:timed_done_markers,running:slurm_stage_job_states,done:successful_state_markers,total:stage_task_list")
             self.last_developer_report=time.monotonic()
 
     def wait_tick(self) -> None: time.sleep(int(self.cfg["SLURM_POLL_SECONDS"]))

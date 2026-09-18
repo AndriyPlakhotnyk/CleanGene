@@ -350,12 +350,35 @@ fraction and no longer controls arbitration.
 `DEVELOPER_MODE=true` is enabled by default. Each preprocess worker records
 start/end timestamps for read preparation, Kraken2, assembly, CheckM2, and
 Prokka in `logs/developer_preprocess.tsv`, and stores total elapsed seconds in
-its completion marker. The Slurm controller reports marker-based completed,
-running, pending, and not-yet-submitted counts; every 30 minutes it also emits
-the average completed preprocess duration and the number of timed markers. Set
-`DEVELOPER_MODE=false` to suppress per-step timing files and periodic developer
-reports. `DEVELOPER_REPORT_INTERVAL_SECONDS` controls the interval (default
-1800 seconds).
+its completion marker. The timing file's `source` column identifies worker
+wall-clock measurements. Controller updates include a `sources` field that
+identifies the source of every reported number.
+
+Controller update fields:
+
+| Field | Meaning | Number source |
+| --- | --- | --- |
+| `user_jobs` | Jobs currently counted for the user, shown against the configured limit. | Slurm user queue snapshot. |
+| `available_slots` | Jobs the controller can submit without exceeding the configured headroom. | Derived from the queue count and `SLURM_USER_JOB_LIMIT`/`SLURM_JOB_HEADROOM`. |
+| `total_submitted` | Isolate or group tasks submitted or already recognized as done for this stage. | Controller submission and done sets. |
+| `total_completed` | Tasks with successful completion markers. | `state/<stage>/*.done.json`. |
+| `current_step_completed` | Completed tasks divided by the stage task count. | Successful markers and the stage task list. |
+| `running` | Tasks in running Slurm states for this stage. | Slurm stage job states. |
+| `slurm_pending` | Tasks waiting in pending or unknown Slurm states for this stage. | Slurm stage job states. |
+| `not_submitted_yet` | Stage tasks not yet submitted or completed. | Stage total minus controller-submitted tasks. |
+| `failed` | Tasks with failed completion markers. | `state/<stage>/*.done.json` with `status=failed`. |
+
+Developer update fields:
+
+| Field | Meaning | Number source |
+| --- | --- | --- |
+| `average_completed_job_seconds` | Arithmetic mean of recorded total preprocess durations. | `state/preprocess/<isolate>.done.json:preprocess_elapsed_seconds`. |
+| `samples_with_timing` | Number of completed preprocess markers contributing a duration. | Same completion-marker fields. |
+| `running` / `done` / `total` | Current stage running count, completed count, and task count. | Slurm stage states, successful markers, and the stage task list. |
+
+Set `DEVELOPER_MODE=false` to suppress per-step timing files and periodic
+developer reports. `DEVELOPER_REPORT_INTERVAL_SECONDS` controls the interval
+(default 1800 seconds).
 
 Use `SLURM_PREPROCESS_MAX_INFLIGHT`, `SLURM_VALIDATION_MAX_INFLIGHT`, and
 `SLURM_ARBITRATION_MAX_INFLIGHT` to control concurrency. Stage-specific CPU,
