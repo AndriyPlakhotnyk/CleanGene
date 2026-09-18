@@ -385,7 +385,8 @@ Set `DEVELOPER_MODE=false` to suppress per-step timing files and periodic
 developer reports. `DEVELOPER_REPORT_INTERVAL_SECONDS` controls the developer
 report interval (default 1800 seconds).
 
-After the summary stage, developer mode writes `logs/developer_final_report/`.
+Developer mode creates and incrementally updates `logs/developer_final_report/`
+as major stages finish, then refreshes it after the summary stage.
 `stage_runtime.tsv` reports observed task counts, cumulative worker time, task
 min/mean/max, and the elapsed span for each stage. `process_runtime.tsv` groups
 preprocessing substeps and smaller preflight, launcher, and CheckM2 timing files.

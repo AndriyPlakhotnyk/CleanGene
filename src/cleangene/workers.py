@@ -1473,6 +1473,8 @@ def _run_single_job(run_dir: Path, cfg: dict[str,str], stage: str, cpus: str, me
     cmd=_controller_cmd(run_dir,cfg,stage,None,cpus,mem,time_limit)
     jid=submit_with_qos_retry(cmd,cfg,1,label)
     _wait_jobs([jid],cfg,label,"single job submitted",f"job_id={jid} stage={stage} index=0 log={_stage_log_pattern(run_dir,stage)}",run_dir=run_dir)
+    report=write_final_developer_report(run_dir)
+    if report: _developer_controller_log(f"stage_complete={stage} | final_report={report}")
     return jid
 
 def _run_database_setup_stages(run_dir: Path, cfg: dict[str,str], rows: list[dict[str,str]]) -> dict[str,str]:
@@ -1570,7 +1572,8 @@ def _numeric_timing(value: object) -> float | None:
 
 def write_final_developer_report(run_dir: Path) -> Path | None:
     """Aggregate stage and subprocess timings after a completed run."""
-    cfg=load_run_config(run_dir)
+    try: cfg=load_run_config(run_dir)
+    except (OSError,ValueError): return None
     if not truthy(cfg.get("DEVELOPER_MODE", "true")): return None
     report_dir=run_dir/"logs"/"developer_final_report"; report_dir.mkdir(parents=True,exist_ok=True)
     stage_values: dict[str,list[float]]={}; stage_spans: dict[str,list[tuple[float,float]]]={}; stage_status: dict[str,dict[str,int]]={}
@@ -1628,7 +1631,7 @@ def write_final_developer_report(run_dir: Path) -> Path | None:
 
 class _RollingScheduler:
     def __init__(self,run_dir: Path,cfg: dict[str,str]):
-        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.done: dict[str,set[int]]={}; self.failed: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}; self.last_controller_report=0.0; self.last_developer_report=0.0
+        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.done: dict[str,set[int]]={}; self.failed: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}; self.reported_stages:set[str]=set(); self.last_controller_report=0.0; self.last_developer_report=0.0
 
     def seed_done(self,stage: str,indices: list[int]) -> set[int]:
         if stage not in self.done:
@@ -1706,6 +1709,13 @@ class _RollingScheduler:
     def active_indices(self,stage: str) -> set[int]:
         return {i for b in self.active.values() if b.stage==stage for i in b.indices}
 
+    def report_completed_stage(self, stage: str, indices: list[int]) -> None:
+        if stage in self.reported_stages or not indices or any(not self.is_done(stage,i) for i in indices): return
+        report=write_final_developer_report(self.run_dir)
+        if report:
+            _developer_controller_log(f"stage_complete={stage} | final_report={report}")
+            self.reported_stages.add(stage)
+
     def stage_queue(self,stage: str) -> tuple[int,int]:
         running=pending=0; jobs=self.snapshot["jobs"]
         for jid,batch in self.active.items():
@@ -1780,6 +1790,7 @@ def _run_index_stage(run_dir: Path, cfg: dict[str,str], stage: str, indices: lis
     while any(not scheduler.is_done(stage,i) for i in indices):
         scheduler.refresh(); scheduler.submit_ready(stage,indices,cpus,mem,time_limit,label,_stage_limit(cfg,stage)); scheduler.progress(stage,indices,label)
         if any(not scheduler.is_done(stage,i) for i in indices): scheduler.wait_tick()
+    scheduler.report_completed_stage(stage,indices)
     return scheduler.jobs
 
 def _group_resources(cfg: dict[str,str],group_row: dict[str,str]) -> tuple[str,str,str]:
@@ -1819,6 +1830,9 @@ def _controller_pipeline(run_dir: Path,include_preprocess: bool) -> None:
         plot_ready=[i for i in all_groups if done("reduce",i)]
         scheduler.submit_ready("plot",plot_ready,cfg["PLOT_CPUS"],cfg["PLOT_MEM"],cfg["PLOT_TIME"],"CleanGene plot",_stage_limit(cfg,"plot"))
         if include_preprocess: scheduler.submit_ready("preprocess",prep_order,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess",_stage_limit(cfg,"preprocess"))
+        if hasattr(scheduler,"report_completed_stage"):
+            for stage,indices in (("preprocess",all_prep),("panaroo",all_groups),("prepare_validation",all_groups),("validate",all_validate),("arbitrate",all_validate),("reduce",all_groups),("plot",all_groups)):
+                scheduler.report_completed_stage(stage,indices)
         if include_preprocess and any(not done("preprocess",i) for i in all_prep): scheduler.progress("preprocess",all_prep,"CleanGene preprocess")
         elif any(not done("validate",i) for i in all_validate): scheduler.progress("validate",all_validate,"CleanGene validate")
         elif any(not done("plot",i) for i in all_groups): scheduler.progress("plot",all_groups,"CleanGene group completion")
