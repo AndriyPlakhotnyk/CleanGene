@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, CHECKM2_COMMAND_SCHEMA_VERSION, bundled_test_genome, checkm2_database_root, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_capabilities_for_config, checkm2_predict_command, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
+from cleangene.checkm2 import CheckM2DbError, CheckM2DbNotReady, EXPECTED_CHECKM2_DB_NAME, CHECKM2_COMMAND_SCHEMA_VERSION, bundled_test_genome, checkm2_database_root, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_capabilities_for_config, checkm2_predict_command, checkm2_runtime_is_verified, checkm2_runtime_marker, checkm2_testrun_command, parse_checkm2_quality_report, record_checkm2_runtime_verified, resolve_checkm2_db, validate_checkm2_db
 from cleangene.defaults import DEFAULTS
 from cleangene.tools import ToolResolutionError, resolve_checkm2_executable
 from cleangene.cli import make_run
@@ -62,6 +62,12 @@ class CheckM2DatabaseTests(unittest.TestCase):
         self.assertEqual(cached.cleanup_option,"--remove_intermediates")
         self.assertEqual(cached.help_sha256,"cached")
 
+    def test_configured_predict_capabilities_avoid_help_probe(self):
+        with tempfile.TemporaryDirectory() as d:
+            cached=checkm2_predict_capabilities_for_config("/does/not/run", {"CHECKM2_DATABASE_ROOT":str(Path(d)/"checkm2"), "CHECKM2_PREDICT_CLEANUP_OPTION":"--remove_intermediates"})
+            self.assertEqual(cached.cleanup_option,"--remove_intermediates")
+            self.assertEqual(cached.help_sha256,"configured")
+
     def test_existing_shared_db_is_reused_and_recorded(self):
         with tempfile.TemporaryDirectory() as d:
             exe=_write_executable(Path(d)/"bin"/"checkm2")
@@ -111,6 +117,24 @@ class CheckM2DatabaseTests(unittest.TestCase):
             marker=checkm2_runtime_marker(cfg)
             data=load_json(marker); data["schema"]=CHECKM2_COMMAND_SCHEMA_VERSION-1; atomic_json(marker,data)
             self.assertFalse(checkm2_runtime_is_verified(cfg,db,exe,"CheckM2 version 1.1.0"))
+
+    def test_valid_runtime_marker_does_not_reprobe_help(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); exe=_write_executable(root/"bin"/"checkm2")
+            cfg={"CHECKM2_DATABASE_ROOT":str(root/"checkm2"),"CHECKM2_EXECUTABLE":str(exe)}
+            db=checkm2_database_root(cfg)/"CheckM2_database"/EXPECTED_CHECKM2_DB_NAME; _write_db(db)
+            record_checkm2_runtime_verified(cfg,db,exe,"CheckM2 version 1.1.0")
+            with patch("cleangene.checkm2.checkm2_predict_help", side_effect=AssertionError("help probe reran")):
+                self.assertTrue(checkm2_runtime_is_verified(cfg,db,exe,"CheckM2 version 1.1.0"))
+
+    def test_runtime_marker_rejects_changed_configured_cleanup_option(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); exe=_write_executable(root/"bin"/"checkm2")
+            cfg={"CHECKM2_DATABASE_ROOT":str(root/"checkm2"),"CHECKM2_EXECUTABLE":str(exe),"CHECKM2_PREDICT_CLEANUP_OPTION":"--remove_intermediates"}
+            db=checkm2_database_root(cfg)/"CheckM2_database"/EXPECTED_CHECKM2_DB_NAME; _write_db(db)
+            record_checkm2_runtime_verified(cfg,db,exe,"CheckM2 version 1.1.0")
+            changed={**cfg,"CHECKM2_PREDICT_CLEANUP_OPTION":"--remove-intermediates"}
+            self.assertFalse(checkm2_runtime_is_verified(changed,db,exe,"CheckM2 version 1.1.0"))
 
     def test_runtime_smoke_test_failure_stops_before_preprocess(self):
         with tempfile.TemporaryDirectory() as d:

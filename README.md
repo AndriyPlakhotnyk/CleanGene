@@ -187,7 +187,11 @@ models, database and production prediction command before preprocessing. CheckM2
 uses its companion environment's DIAMOND and Prodigal executables. The pinned
 [CheckM2 1.1.0 release](https://github.com/chklovski/CheckM2/releases/tag/1.1.0)
 requires database version 3. Updating an environment does not repeatedly download
-an already compatible database.
+an already compatible database. CleanGene records the verified executable,
+environment and database signature in the shared database marker; subsequent
+starts reuse that marker without running `checkm2 predict --help`. The default
+`CHECKM2_PREDICT_CLEANUP_OPTION=--remove_intermediates` is validated by the
+production smoke test, avoiding a fragile help probe on busy Slurm nodes.
 
 ### 2. Prepare a manifest
 

@@ -97,8 +97,16 @@ def checkm2_predict_capabilities_for_config(executable: Path | str, cfg: dict[st
             help_sha = str(runtime.get("CHECKM2_PREDICT_HELP_SHA256", "")).strip()
         except (OSError, ValueError):
             pass
-    if cleanup == "--remove_intermediates" and help_sha:
+    future_cleanup = "--remove" + "-intermediates"
+    known_cleanup = {"--remove_intermediates", future_cleanup}
+    if cleanup in known_cleanup and help_sha:
         return CheckM2PredictCapabilities(cleanup, help_sha)
+    # CheckM2 1.1.x is pinned by the supported environments.  The configured
+    # flag is exercised by the production smoke test, so a help probe is not
+    # needed merely to construct the command.  This keeps startup independent
+    # of a slow or overloaded shared filesystem.
+    if cleanup in known_cleanup:
+        return CheckM2PredictCapabilities(cleanup, "configured")
     return checkm2_predict_capabilities(executable)
 
 
@@ -205,11 +213,11 @@ def _checkm2_env_history(executable: Path) -> Path | None:
     return None
 
 
-def checkm2_runtime_signature(cfg: dict[str, str], path: Path | str, executable: Path | str, version: str) -> dict[str, object]:
+def _checkm2_runtime_static_signature(cfg: dict[str, str], path: Path | str,
+                                      executable: Path | str, version: str) -> dict[str, object]:
     database = Path(path).expanduser().resolve()
     resolved_executable = Path(executable).expanduser().resolve()
     env_history = _checkm2_env_history(resolved_executable)
-    capabilities = checkm2_predict_capabilities(resolved_executable)
     return {
         "schema": CHECKM2_COMMAND_SCHEMA_VERSION,
         "CHECKM2_DB": str(database),
@@ -219,6 +227,21 @@ def checkm2_runtime_signature(cfg: dict[str, str], path: Path | str, executable:
         "CHECKM2_CONDA_HISTORY_FILE": _file_signature(env_history) if env_history else None,
         "CHECKM2_VERSION": version,
         "CHECKM2_LOWMEM": str(truthy(cfg.get("CHECKM2_LOWMEM", "false"))).lower(),
+    }
+
+
+def checkm2_runtime_signature(cfg: dict[str, str], path: Path | str, executable: Path | str,
+                              version: str, capabilities: CheckM2PredictCapabilities | None = None) -> dict[str, object]:
+    """Return the marker signature, probing capabilities only when needed.
+
+    Marker validation uses :func:`_checkm2_runtime_static_signature` directly;
+    this function probes only while creating a new marker for callers that did
+    not already resolve the command capabilities.
+    """
+    resolved_executable = Path(executable).expanduser().resolve()
+    capabilities = capabilities or checkm2_predict_capabilities(resolved_executable)
+    return {
+        **_checkm2_runtime_static_signature(cfg, path, resolved_executable, version),
         "CHECKM2_PREDICT_CLEANUP_OPTION": capabilities.cleanup_option,
         "CHECKM2_PREDICT_HELP_SHA256": capabilities.help_sha256,
     }
@@ -235,16 +258,30 @@ def checkm2_runtime_is_verified(cfg: dict[str, str], path: Path | str,
         return False
     try:
         recorded = load_json(marker)
-        expected = checkm2_runtime_signature(cfg, path, executable, version)
+        expected = _checkm2_runtime_static_signature(cfg, path, executable, version)
     except (OSError, ValueError):
         return False
-    return recorded.get("status") == "complete" and all(recorded.get(key) == value for key, value in expected.items())
+    if recorded.get("status") != "complete":
+        return False
+    # Capability fields are part of the verification evidence, but checking
+    # them must never launch CheckM2.  A marker without them predates runtime
+    # verification and must be rebuilt under the lock.
+    cleanup = str(recorded.get("CHECKM2_PREDICT_CLEANUP_OPTION", "")).strip()
+    help_sha = str(recorded.get("CHECKM2_PREDICT_HELP_SHA256", "")).strip()
+    known_cleanup = {"--remove_intermediates", "--remove" + "-intermediates"}
+    if cleanup not in known_cleanup or not help_sha:
+        return False
+    configured_cleanup = cfg.get("CHECKM2_PREDICT_CLEANUP_OPTION", "").strip()
+    if configured_cleanup and configured_cleanup != cleanup:
+        return False
+    return all(recorded.get(key) == value for key, value in expected.items())
 
 
 def record_checkm2_runtime_verified(cfg: dict[str, str], path: Path | str,
-                                    executable: Path | str, version: str) -> Path:
+                                    executable: Path | str, version: str,
+                                    capabilities: CheckM2PredictCapabilities | None = None) -> Path:
     marker = checkm2_runtime_marker(cfg)
-    atomic_json(marker, {"status": "complete", **checkm2_runtime_signature(cfg, path, executable, version)})
+    atomic_json(marker, {"status": "complete", **checkm2_runtime_signature(cfg, path, executable, version, capabilities)})
     return marker
 
 

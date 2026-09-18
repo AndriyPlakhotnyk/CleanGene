@@ -89,8 +89,15 @@ passed with those execution restrictions lifted.
 ## CheckM2 array timeout incident — 2026-09-15
 
 An ARC run reached successful shared CheckM2 database and runtime verification,
-then preprocess array elements timed out while probing `checkm2 predict --help`
-individually. The controller correctly stopped on the failed array while other
-elements remained in Slurm. Workers now reuse the cleanup option and help hash
-recorded by the controller, avoiding that repeated probe; older runs without the
-cached fields fall back to the probe once per worker.
+then a later setup attempted `checkm2 predict --help` and timed out. The
+controller correctly stopped before preprocessing, but the marker check itself
+made the one-time verification non-reusable. The current implementation checks
+an existing marker using executable, environment, database and configuration
+signatures only; it never launches CheckM2 during marker validation. The pinned
+`--remove_intermediates` option is configured by default and is exercised by the
+real production smoke test. A new or invalid marker therefore runs one smoke
+test, while a valid shared marker is reused without a help probe. If the real
+smoke test cannot create multiprocessing sockets on a node, setup still fails
+before submitting isolate jobs; use `CHECKM2_MODE=off` only when omitting
+CheckM2 QC is scientifically acceptable, then run the post-hoc CheckM2 utility
+after moving to a working allocation.

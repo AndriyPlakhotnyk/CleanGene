@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from .config import assembler_mode, checkm2_mode, read_env, truthy
-from .checkm2 import CheckM2DbError, CheckM2DbNotReady, bundled_test_genome, checkm2_database_root, checkm2_named_input_link, checkm2_predict_capabilities, checkm2_predict_command, checkm2_testrun_command, parse_checkm2_quality_report, resolve_checkm2_db
+from .checkm2 import CheckM2DbError, CheckM2DbNotReady, bundled_test_genome, checkm2_database_root, checkm2_named_input_link, checkm2_predict_capabilities_for_config, checkm2_predict_command, checkm2_testrun_command, parse_checkm2_quality_report, resolve_checkm2_db
 from .completion import reconcile_preprocess_outputs
 from .defaults import DEFAULTS, SCIENTIFIC_DEFAULTS
 from .manifest import groups, load_manifest, write_resolved
@@ -248,7 +248,7 @@ def doctor(args) -> int:
             version=executable_version(executable,"CheckM2")
             print(f"CheckM2 executable: READY {executable}")
             print(f"CheckM2 version: {version}")
-            capabilities=checkm2_predict_capabilities(executable)
+            capabilities=checkm2_predict_capabilities_for_config(executable,cfg)
             print("CheckM2 predict CLI: READY")
             print(f"CheckM2 cleanup option: {capabilities.cleanup_option}")
         except ToolResolutionError as error:
@@ -274,7 +274,7 @@ def doctor(args) -> int:
                     genome=bundled_test_genome(executable)
                     input_path=checkm2_named_input_link(genome,tmpdir/"input","cleangene_checkm2_smoke")
                     out=tmpdir/"predict"
-                    command=checkm2_predict_command(executable,input_path,out,resolution.path,1,checkm2_predict_capabilities(executable),lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false")))
+                    command=checkm2_predict_command(executable,input_path,out,resolution.path,1,checkm2_predict_capabilities_for_config(executable,cfg),lowmem=truthy(cfg.get("CHECKM2_LOWMEM","false")))
                     predict=subprocess.run(command,cwd=tmpdir,capture_output=True,text=True,env=env)
                     if predict.returncode:
                         raise CheckM2DbError((predict.stderr or predict.stdout or "").strip() or f"predict exited {predict.returncode}")
