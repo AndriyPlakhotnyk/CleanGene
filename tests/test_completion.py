@@ -261,6 +261,23 @@ class CompletionReconciliationTests(unittest.TestCase):
                     scheduler.refresh()
             self.assertIn(str(log),str(raised.exception))
 
+    def test_timeout_array_requeues_only_missing_preprocess_markers(self):
+        with tempfile.TemporaryDirectory() as d:
+            run, _ = self.make_run(Path(d), n=2)
+            atomic_json(run / "state" / "preprocess" / "BI_0000.done.json", {})
+            scheduler = _RollingScheduler(run, {**DEFAULTS, "SLURM_POLL_SECONDS": "0", "SLURM_TIMEOUT_RETRIES": "1"})
+            scheduler.active["48720947"] = _ActiveBatch("48720947", "preprocess", [0, 1], "0-1%400", seen=True, missing_polls=1)
+            with patch("cleangene.workers.user_queue_snapshot", return_value={"total": 0, "jobs": {}, "entries": []}), \
+                 patch("cleangene.workers.assert_jobs_succeeded", side_effect=RuntimeError("SLURM job failure detected: 48720984|TIMEOUT")):
+                scheduler.refresh()
+            self.assertNotIn("48720947", scheduler.active)
+            self.assertEqual(scheduler.done["preprocess"], {0})
+            self.assertEqual(scheduler.timeout_retries[("preprocess", 1)], 1)
+            scheduler.snapshot = {"total": 0, "jobs": {}, "entries": []}
+            with patch("cleangene.workers.submit_with_qos_retry", return_value="48721000"):
+                submitted = scheduler.submit_ready("preprocess", [0, 1], "1", "1G", "24:00:00", "CleanGene preprocess", 400)
+            self.assertEqual(submitted, 1)
+
     def test_cpu_limit_caps_preprocess_submissions_without_affecting_default(self):
         with tempfile.TemporaryDirectory() as d:
             run, rows = self.make_run(Path(d), n=4, cfg={"SLURM_USER_CPU_LIMIT": "16", "SLURM_CPU_HEADROOM": "0"})

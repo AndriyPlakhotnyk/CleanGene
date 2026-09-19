@@ -1631,7 +1631,7 @@ def write_final_developer_report(run_dir: Path) -> Path | None:
 
 class _RollingScheduler:
     def __init__(self,run_dir: Path,cfg: dict[str,str]):
-        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.done: dict[str,set[int]]={}; self.failed: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}; self.reported_stages:set[str]=set(); self.last_controller_report=0.0; self.last_developer_report=0.0
+        self.run_dir=run_dir; self.cfg=cfg; self.active: dict[str,_ActiveBatch]={}; self.jobs=[]; self.submitted: dict[str,set[int]]={}; self.done: dict[str,set[int]]={}; self.failed: dict[str,set[int]]={}; self.snapshot={"total":0,"jobs":{},"entries":[]}; self.reported_stages:set[str]=set(); self.last_controller_report=0.0; self.last_developer_report=0.0; self.timeout_retries: dict[tuple[str,int],int]={}
 
     def seed_done(self,stage: str,indices: list[int]) -> set[int]:
         if stage not in self.done:
@@ -1696,7 +1696,32 @@ class _RollingScheduler:
                 excerpt=_failed_stage_log_excerpt(self.run_dir,batch.stage,jid)
                 message=str(error)
                 if excerpt: message += "\n" + excerpt
-                raise RuntimeError(message) from error
+                # A Slurm wall-time expiry cancels the array parent and leaves
+                # unfinished elements without markers. Those elements are
+                # safe to resubmit because each worker is marker/output aware;
+                # other failure states remain fatal and retain their detail.
+                if "TIMEOUT" not in str(error).upper():
+                    raise RuntimeError(message) from error
+                missing=[i for i in batch.indices if not _index_done(self.run_dir,batch.stage,i)]
+                if missing and batch.stage=="preprocess":
+                    isolate_rows=read_tsv(self.run_dir/"state"/"isolate_tasks.tsv")
+                    reconcile_preprocess_outputs(self.run_dir,self.cfg,isolate_rows,self.snapshot,indices=missing)
+                    missing=[i for i in batch.indices if not _index_done(self.run_dir,batch.stage,i)]
+                if not missing:
+                    self.done.setdefault(batch.stage,set()).update(batch.indices)
+                    del self.active[jid]
+                    _controller_log(f"step=CleanGene {batch.stage} | recovered_timeout_outputs={len(batch.indices)} | job_id={jid}",ok=True)
+                    continue
+                retry_limit=max(0,int(self.cfg.get("SLURM_TIMEOUT_RETRIES","1") or 0))
+                exhausted=[i for i in missing if self.timeout_retries.get((batch.stage,i),0)>=retry_limit]
+                if exhausted:
+                    raise RuntimeError(f"{message}\nTimed-out {batch.stage} indices exceeded SLURM_TIMEOUT_RETRIES={retry_limit}: {','.join(map(str,exhausted[:10]))}") from error
+                for i in missing:
+                    self.timeout_retries[(batch.stage,i)]=self.timeout_retries.get((batch.stage,i),0)+1
+                self.done.setdefault(batch.stage,set()).update(i for i in batch.indices if i not in missing)
+                del self.active[jid]
+                _controller_log(f"step=CleanGene {batch.stage} | recoverable_timeout=true | job_id={jid} | retry={max(self.timeout_retries[(batch.stage,i)] for i in missing)}/{retry_limit} | resubmitting={len(missing)} | task_range={_indices_spec(missing,self.cfg.get('SLURM_MAX_PARALLEL','1'))}",ok=True)
+                continue
             missing=[i for i in batch.indices if not _index_done(self.run_dir,batch.stage,i)]
             if missing and batch.stage=="preprocess":
                 isolate_rows=read_tsv(self.run_dir/"state"/"isolate_tasks.tsv")
@@ -1829,7 +1854,7 @@ def _controller_pipeline(run_dir: Path,include_preprocess: bool) -> None:
         scheduler.submit_ready("reduce",reduce_ready,cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene reduce",_stage_limit(cfg,"reduce"))
         plot_ready=[i for i in all_groups if done("reduce",i)]
         scheduler.submit_ready("plot",plot_ready,cfg["PLOT_CPUS"],cfg["PLOT_MEM"],cfg["PLOT_TIME"],"CleanGene plot",_stage_limit(cfg,"plot"))
-        if include_preprocess: scheduler.submit_ready("preprocess",prep_order,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess",_stage_limit(cfg,"preprocess"))
+        if include_preprocess: scheduler.submit_ready("preprocess",prep_order,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg.get("SLURM_PREPROCESS_TIME",cfg["SLURM_TIME"]),"CleanGene preprocess",_stage_limit(cfg,"preprocess"))
         if hasattr(scheduler,"report_completed_stage"):
             for stage,indices in (("preprocess",all_prep),("panaroo",all_groups),("prepare_validation",all_groups),("validate",all_validate),("arbitrate",all_validate),("reduce",all_groups),("plot",all_groups)):
                 scheduler.report_completed_stage(stage,indices)
@@ -1897,7 +1922,7 @@ def slurm_controller(run_dir: Path, index: int | None = None) -> None:
                 _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
             if unresolved:
                 prep_indices=incomplete_indices(run_dir,"preprocess")
-                if prep_indices: _run_index_stage(run_dir,cfg,"preprocess",prep_indices,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg["SLURM_TIME"],"CleanGene preprocess")
+                if prep_indices: _run_index_stage(run_dir,cfg,"preprocess",prep_indices,cfg["SLURM_CPUS"],cfg["SLURM_MEM"],cfg.get("SLURM_PREPROCESS_TIME",cfg["SLURM_TIME"]),"CleanGene preprocess")
                 if not _done(run_dir/"state"/"resolve_groups.done.json"):
                     _run_single_job(run_dir,cfg,"resolve_groups",cfg["GROUP_ORCHESTRATOR_CPUS"],cfg["GROUP_ORCHESTRATOR_MEM"],cfg["GROUP_ORCHESTRATOR_TIME"],"CleanGene resolve_groups")
                 controller_downstream(run_dir)

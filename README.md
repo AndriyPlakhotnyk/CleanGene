@@ -401,6 +401,11 @@ memory, and time requests are available in the
 [default settings](src/cleangene/defaults.py) list additional controls, including
 QC thresholds and database management.
 
+Preprocessing has its own wall-time setting, `SLURM_PREPROCESS_TIME`. When a
+preprocess array reaches `TIMEOUT`, the controller keeps successful markers,
+reconciles completed outputs, and resubmits only unfinished isolates. The
+bounded retry count is controlled by `SLURM_TIMEOUT_RETRIES`.
+
 ## Outputs
 
 Each run is stored beneath `<analysis-root>/runs/<run-id>/`.
