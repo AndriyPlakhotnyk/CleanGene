@@ -97,8 +97,11 @@ python -m cleangene run \
 Shovill, annotation, Panaroo, read validation, arbitration, QC and figures still
 run. Raw-read depth reduction and CheckM2 setup/prediction are disabled. Read
 trimming retains its normal configuration. QC exclusions still apply. At around
-1,000 isolates, the ARC config selects the medium Panaroo tier (32 CPUs, 512 GB,
-72 hours); adjust resources to your allocation and measured cohort complexity.
+1,000 isolates, the ARC template selects the medium Panaroo tier (32 CPUs,
+160 GB, 72 hours), which fits ordinary ARC CPU nodes with headroom. If
+`arc.hardware` and `sinfo` show that your account can use a big-memory
+partition, you may raise `PANAROO_MEDIUM_MEM` in the local config; otherwise a
+512 GB request is rejected before the array is submitted.
 Resistance detection uses bounded arrays (100 concurrent tasks, 4 CPUs/16 GB
 per task by default) and an 8-CPU/64-GB merge job. Array chunks are bounded by the
 existing scheduler. No claim of a 1,000-isolate runtime benchmark is implied.

@@ -52,6 +52,11 @@ markers. `FAILED`, `CANCELLED`, and out-of-memory states remain fatal. A resume
 is therefore safe after a controller failure once no old CleanGene jobs for
 that run remain active.
 
+The ARC template requests 32 CPUs and 160 GB for the medium Panaroo tier. This
+fits the ordinary CPU-node class with headroom. A 512 GB request requires a
+partition and account that expose a suitable big-memory node; verify that with
+`arc.hardware` and `sinfo` before raising `PANAROO_MEDIUM_MEM`.
+
 ## Latest resistance workflow
 
 `--resistance-operon` is optional and disabled by default. It adds AMRFinderPlus
