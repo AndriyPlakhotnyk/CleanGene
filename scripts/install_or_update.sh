@@ -111,7 +111,7 @@ print(f"CheckM2 bundled test genome: {bundled_test_genome(exe)}")
 
 echo "Verifying primary tools"
 run_primary sh -c '
-    for tool in shovill spades.py prokka panaroo bwa samtools bcftools minimap2 fastp kraken2 prodigal cd-hit-est cd-hit-est-2d mafft; do
+    for tool in shovill spades.py prokka panaroo bwa samtools bcftools minimap2 fastp kraken2 prodigal cd-hit-est cd-hit-est-2d mafft amrfinder; do
         command -v "$tool" >/dev/null || { echo "ERROR: missing primary tool: $tool" >&2; exit 1; }
     done
 '

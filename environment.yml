@@ -19,4 +19,6 @@ dependencies:
   - matplotlib
   - scipy
   - mafft
+  - ncbi-amrfinderplus
+  - edlib
   - pip

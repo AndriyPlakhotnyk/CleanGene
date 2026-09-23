@@ -41,6 +41,7 @@ class LauncherTiming:
 
 def apply_cli_overrides(cfg: dict[str,str], args) -> dict[str,str]:
     cfg=dict(cfg)
+    if getattr(args,"resistance_operon",False): cfg["RESISTANCE_OPERON"]="true"
     if getattr(args,"ignore_checkm2",False):
         cfg["CHECKM2_MODE"]="off"
         cfg["CHECKM2_DISABLED_BY_USER"]="true"
@@ -106,6 +107,7 @@ def refresh_resume_config(run: Path, config: Path | None) -> dict[str,str]:
     if current.get("CHECKM2_DB") and not updated.get("CHECKM2_DB"): updated["CHECKM2_DB"]=current["CHECKM2_DB"]
     if current.get("CHECKM2_EXECUTABLE") and not updated.get("CHECKM2_EXECUTABLE"): updated["CHECKM2_EXECUTABLE"]=current["CHECKM2_EXECUTABLE"]
     if current.get("CHECKM2_VERSION") and not updated.get("CHECKM2_VERSION"): updated["CHECKM2_VERSION"]=current["CHECKM2_VERSION"]
+    if current.get("AMRFINDER_DB") and not updated.get("AMRFINDER_DB"): updated["AMRFINDER_DB"]=current["AMRFINDER_DB"]
     if current.get("QC_PROFILE_FILE"): updated["QC_PROFILE_FILE"]=current["QC_PROFILE_FILE"]
     backup=run/"provenance"/"resolved_config.pre_resume.json"
     if not backup.is_file(): shutil.copy2(run/"provenance"/"resolved_config.json",backup)
@@ -137,6 +139,8 @@ def check(args) -> int:
     mode=checkm2_mode(cfg)
     trim_mode="off" if assembler in {"spades","off"} or truthy(cfg.get("SKIP_TRIM","false")) else cfg.get("READ_TRIMMING_MODE","auto")
     if trim_mode=="always": required.append("fastp")
+    if truthy(cfg.get("RESISTANCE_OPERON","false")):
+        required += ["amrfinder","mafft"]
     missing=[x for x in required if not command_exists(x)]
     if mode=="required":
         try: resolve_checkm2_executable(cfg.get("CHECKM2_EXECUTABLE",""))
@@ -233,7 +237,7 @@ def doctor(args) -> int:
         target=args.config or Path("config/cleangene.arc.local.env")
         print(f"Configuration fix: edit {target}, then run mamba run -n cleangene cleangene doctor --config {target}")
     else: print("Configuration: OK")
-    for tool in ("shovill","spades.py","prokka","panaroo","bwa","samtools","bcftools","minimap2","prodigal","cd-hit-est","cd-hit-est-2d","fastp","kraken2"):
+    for tool in (("amrfinder","mafft") if truthy(cfg.get("RESISTANCE_OPERON","false")) else ()) + ("shovill","spades.py","prokka","panaroo","bwa","samtools","bcftools","minimap2","prodigal","cd-hit-est","cd-hit-est-2d","fastp","kraken2"):
         if command_exists(tool): print(f"Primary tool {tool}: OK")
         else:
             failures+=1; print(f"Primary tool {tool}: ERROR missing. Fix: bash scripts/install_or_update.sh --recreate")
@@ -320,9 +324,9 @@ def local(run: Path) -> None:
         names={"kraken_db_setup":"Kraken2 database setup", "checkm2_db_setup":"CheckM2 database and runtime verification",
                "preprocess":"Preprocessing", "resolve_groups":"Organism grouping", "panaroo":"Panaroo pangenome",
                "prepare_validation":"Prepare gene validation", "validate":"Read mapping and gene validation",
-               "arbitrate":"Gene arbitration", "reduce":"Consolidate validated gene calls", "plot":"Plots", "summary":"Final summaries"}
+               "arbitrate":"Gene arbitration", "reduce":"Consolidate validated gene calls", "plot":"Plots", "resistance_scan":"AMRFinderPlus and resistance locus evidence", "resistance_merge":"Resistance operon alignments and reports", "summary":"Final summaries"}
         subject="Cohort"
-        if stage in {"preprocess","validate","arbitrate"}:
+        if stage in {"preprocess","validate","arbitrate","resistance_scan"}:
             subject=f"Sample {rows[index]['isolate_id']} ({index+1}/{len(rows)})"
         elif index is not None:
             subject=f"Organism {read_tsv(run/'state/group_tasks.tsv')[index]['group_id']}"
@@ -341,6 +345,11 @@ def local(run: Path) -> None:
     for i in range(ni): step("arbitrate",i)
     for i in range(ng): step("reduce",i)
     for i in range(ng): step("plot",i)
+    if truthy(cfg.get("RESISTANCE_OPERON","false")):
+        from .resistance import prepare
+        prepare(run)
+        for i in range(ni): step("resistance_scan",i)
+        step("resistance_merge",None)
     step("summary",None)
 
 def slurm(run: Path, cfg: dict[str,str], dry: bool) -> str:
@@ -388,7 +397,7 @@ def run_command(args) -> int:
     cfg=timing.timed("parse_config",lambda: apply_cli_overrides(read_env(args.config),args)); assert_config_matches_runtime(args.config,cfg); root=args.analysis_root.expanduser().resolve(); root.mkdir(parents=True,exist_ok=True)
     if args.resume:
         run=load_existing(root,args.resume); timing.set_run(run); cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
-        if args.skip_trim or args.skip_shovill or getattr(args,"skip_downsampling",False) or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False) or getattr(args,"ignore_checkm2",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
+        if args.skip_trim or args.skip_shovill or getattr(args,"skip_downsampling",False) or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False) or getattr(args,"ignore_checkm2",False) or getattr(args,"resistance_operon",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
     else:
         run_id=args.run_id or datetime.now().strftime("%y%m%d_%H%M%S_cleangene"); run=root/"runs"/run_id
     print(f"Run directory: {run}")
@@ -428,7 +437,7 @@ def resume_command(args) -> int:
     timing.set_run(run)
     cfg=apply_cli_overrides(refresh_resume_config(run,args.config),args)
     assert_config_matches_runtime(args.config,cfg)
-    if args.skip_trim or args.skip_shovill or getattr(args,"skip_downsampling",False) or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False) or getattr(args,"ignore_checkm2",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
+    if args.skip_trim or args.skip_shovill or getattr(args,"skip_downsampling",False) or getattr(args,"assembler",None) or args.compress_assembly_outputs or args.compress_annotation_outputs or getattr(args,"cleanup_trimmed_fastq",False) or getattr(args,"ignore_checkm2",False) or getattr(args,"resistance_operon",False): atomic_json(run/"provenance"/"resolved_config.json",cfg)
     cfg={**DEFAULTS,**load_json(run/"provenance"/"resolved_config.json")}
     record_runtime_provenance(run,cfg)
     print(f"Run directory: {run}")
@@ -514,6 +523,10 @@ def main(argv=None) -> int:
     x=sub.add_parser("exclude",help="exclude isolates safely before downstream pangenome stages start"); x.add_argument("--run-dir",type=Path,required=True); x.add_argument("--samples",nargs="*"); x.add_argument("--samples-file",type=Path); x.set_defaults(func=exclude_command)
     w=sub.add_parser("_worker"); w.add_argument("--stage",required=True); w.add_argument("--run-dir",type=Path,required=True); w.add_argument("--index",type=int,default=0); w.set_defaults(func=lambda a:(dispatch(a.stage,a.run_dir,a.index),0)[1])
     uw=sub.add_parser("_utils_worker"); uw.add_argument("--request",type=Path,required=True); uw.add_argument("--index",type=int,default=-1); uw.set_defaults(func=lambda a:(__import__("cleangene.downstream",fromlist=["run_request"]).run_request(a.request,a.index),0)[1])
+    for parser in (c,d,r,rs):
+        parser.add_argument("--resistance-operon", "-resistance-operon", "-ressitanec-operon", "--ressitanec-operon",
+                            dest="resistance_operon", action="store_true",
+                            help="run AMRFinderPlus, flanked resistance locus bins, read evidence and variant alignments after main analysis")
     add_utils_parser(sub)
     args=p.parse_args(argv)
     if args.cmd=="run" and not args.resume and not args.manifest: p.error("run requires --manifest unless --resume is used")

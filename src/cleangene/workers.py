@@ -37,6 +37,8 @@ STAGE_DESCRIPTIONS = (
     ("arbitrate", "resolve only discordant read and locus evidence"),
     ("reduce", "apply read evidence and publish the final cleaned pangenome matrix"),
     ("plot", "render each group presence/absence summary"),
+    ("resistance_scan", "optionally detect AMR loci and measure assembly/read support per isolate"),
+    ("resistance_merge", "optionally bin and align resistance loci and plot their prevalence"),
     ("summary", "compile cohort and group QC tables"),
 )
 
@@ -157,6 +159,9 @@ def global_preflight(run_dir: Path) -> dict[str,object]:
         _controller_log("step=preflight | status=started")
         inputs=load_json(run_dir/"provenance"/"inputs.json") if (run_dir/"provenance"/"inputs.json").is_file() else {}
         manifest_base=Path(str(inputs.get("manifest",""))).expanduser().parent if inputs.get("manifest") else None
+        if truthy(cfg.get("RESISTANCE_OPERON","false")):
+            from .resistance import preflight, root_dir
+            _timed(timings,"resistance_preflight",lambda: preflight(cfg,root_dir(run_dir)/"provenance"))
         input_summary=_timed(timings,"input_paths",lambda: validate_preflight_input_paths(rows,cfg,manifest_base))
         group_sizes=Counter(r.get("group_id","") for r in rows)
         panaroo_required=assembler_mode(cfg)!="off" and any(
@@ -1254,7 +1259,7 @@ def orchestrate_downstream(run_dir: Path, index: int | None = None) -> None:
 
 def _stage_log_pattern(run_dir: Path, stage: str) -> Path:
     base=run_dir/"logs"/"slurm"
-    return base/(stage if stage in {"preprocess","validate","arbitrate"} else "")/f"{stage}.%A_%a.log"
+    return base/(stage if stage in {"preprocess","validate","arbitrate","resistance_scan"} else "")/f"{stage}.%A_%a.log"
 
 def _controller_cmd(run_dir: Path, cfg: dict[str,str], stage: str, array: str | None, cpus: str, mem: str, time_limit: str) -> list[str]:
     exe=f"{shlex_quote(sys.executable)} -m cleangene _worker"
@@ -1491,7 +1496,7 @@ def _run_database_setup_stages(run_dir: Path, cfg: dict[str,str], rows: list[dic
     return cfg
 
 def _index_done(run_dir: Path, stage: str, index: int) -> bool:
-    kind="isolate" if stage in {"preprocess","validate","arbitrate"} else "group"
+    kind="isolate" if stage in {"preprocess","validate","arbitrate","resistance_scan"} else "group"
     row=task_row(run_dir,kind,index); name=row["isolate_id"] if kind=="isolate" else row["group_id"]
     marker={"validate":"validate"}.get(stage,stage)
     done_path=run_dir/"state"/marker/f"{safe_name(name)}.done.json"; done=_successful_marker(done_path)
@@ -1500,7 +1505,7 @@ def _index_done(run_dir: Path, stage: str, index: int) -> bool:
     return done
 
 def _index_failed(run_dir: Path, stage: str, index: int) -> bool:
-    kind="isolate" if stage in {"preprocess","validate","arbitrate"} else "group"
+    kind="isolate" if stage in {"preprocess","validate","arbitrate","resistance_scan"} else "group"
     row=task_row(run_dir,kind,index); name=row["isolate_id"] if kind=="isolate" else row["group_id"]
     path=run_dir/"state"/stage/f"{safe_name(name)}.done.json"
     if not path.is_file(): return False
@@ -1805,6 +1810,7 @@ class _RollingScheduler:
 
 def _stage_limit(cfg: dict[str,str],stage: str) -> int:
     if stage=="preprocess": return int(cfg["SLURM_PREPROCESS_MAX_INFLIGHT"])
+    if stage=="resistance_scan": return int(cfg["RESISTANCE_MAX_INFLIGHT"])
     if stage=="validate": return int(cfg["SLURM_VALIDATION_MAX_INFLIGHT"])
     if stage=="arbitrate": return int(cfg["SLURM_ARBITRATION_MAX_INFLIGHT"])
     return int(cfg["SLURM_GROUP_MAX_INFLIGHT"])
@@ -1864,6 +1870,9 @@ def _controller_pipeline(run_dir: Path,include_preprocess: bool) -> None:
         pipeline_done=(not include_preprocess or all(done("preprocess",i) for i in all_prep)) and all(done("plot",i) for i in all_groups)
         if pipeline_done and not scheduler.active: break
         scheduler.wait_tick()
+    if truthy(cfg.get("RESISTANCE_OPERON","false")):
+        from .resistance import controller
+        controller(run_dir,cfg)
     if not _done(run_dir/"state"/"summary.done.json"): _run_single_job(run_dir,cfg,"summary",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene summary")
     touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":len(group_rows),"isolates":len(isolate_rows)})
 
@@ -1881,6 +1890,9 @@ def controller_downstream(run_dir: Path) -> None:
     for stage,cpus,mem,limit in (("reduce",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"]),("plot",cfg["PLOT_CPUS"],cfg["PLOT_MEM"],cfg["PLOT_TIME"])):
         indices=incomplete_indices(run_dir,stage)
         if indices: _run_index_stage(run_dir,cfg,stage,indices,cpus,mem,limit,f"CleanGene {stage}")
+    if truthy(cfg.get("RESISTANCE_OPERON","false")):
+        from .resistance import controller
+        controller(run_dir,cfg)
     if not _done(run_dir/"state"/"summary.done.json"): _run_single_job(run_dir,cfg,"summary",cfg["SUMMARY_CPUS"],cfg["SUMMARY_MEM"],cfg["SUMMARY_TIME"],"CleanGene summary")
     touch_done(run_dir/"state"/"orchestrate_downstream.done.json",{"groups":len(group_rows),"isolates":len(isolate_rows)})
 
@@ -2252,6 +2264,12 @@ def dispatch(stage: str, run_dir: Path, index: int | None) -> None:
         elif stage=="arbitrate": arbitrate(run_dir,int(index))
         elif stage=="reduce": reduce_group(run_dir,int(index))
         elif stage=="plot": plot_group(run_dir,int(index))
+        elif stage=="resistance_scan":
+            from .resistance import isolate_task
+            isolate_task(run_dir,int(index))
+        elif stage=="resistance_merge":
+            from .resistance import merge
+            merge(run_dir)
         elif stage=="summary": summarize(run_dir)
         else: raise SystemExit(f"Unknown worker stage: {stage}")
     except BaseException:

@@ -580,3 +580,31 @@ cleangene run \
 
 Omit the flag for normal Shovill downsampling. To disable it when resuming, add
 `--skip-downsampling` to `cleangene resume`; already completed assemblies are reused.
+
+## Resistance operons after the main pipeline
+
+Add `--resistance-operon` (also accepts `-ressitanec-operon`) to run AMRFinderPlus,
+extract candidate resistance loci with one upstream and downstream gene, group by
+gene content and 95% global nucleotide similarity, and align all exact variants.
+The top 12 variants per resistance type receive SNP/indel and gene-structure
+figures. Results are in `results/resistance_analysis/figures` and
+`results/resistance_analysis/tables` within the run.
+
+For the full ARC pipeline with raw-read downsampling and CheckM2 disabled:
+
+```bash
+conda activate cleangene
+bash scripts/submit_resistance_arc.sh input/efaecium.manifest.tsv \
+  config/cleangene.resistance.arc.local.env --run-id efaecium_resistance
+```
+
+Set your ARC account/partition and versioned `AMRFINDER_DB` in a copy of
+`config/cleangene.arc.env` first. See [resistance analysis instructions](docs/resistance_operons.md)
+for database setup, the full submission command, locus definitions, read evidence,
+resume behavior, tests and output tables. Variants are assembly-derived with
+explicit read-support flags. Chromosome/plasmid origin remains unknown unless
+contig-level evidence is supplied; genomic proximity does not prove an operon.
+
+To clone or fast-forward the checkout and install the latest ARC environment,
+run [scripts/bootstrap_arc_latest.sh](scripts/bootstrap_arc_latest.sh) after
+loading ARC's Git and Miniforge modules.
