@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from cleangene.cli import apply_cli_overrides, local, main
 from cleangene.defaults import DEFAULTS
-from cleangene.resistance import (align_sequences, assign_families, cluster_sequences, controller,
+from cleangene.resistance import (align_sequences, amrfinder_database, assign_families, cluster_sequences, controller,
     definitions, extract_loci, features_from_gff, global_identity, merge, origins, parse_hits,
     pileup_counts, read_support, revcomp, root_dir, validate_config, variant_events)
 from cleangene.util import atomic_json, load_json, read_tsv, write_tsv
@@ -41,6 +41,26 @@ def fixture(isolate="a", strand="+", mutation=False):
 
 
 class ResistanceTests(unittest.TestCase):
+    def test_amrfinder_database_requires_explicit_existing_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "amrfinder"; database.mkdir()
+            self.assertEqual(amrfinder_database({"AMRFINDER_DB": str(database)}), database.resolve())
+            with self.assertRaisesRegex(RuntimeError, "requires AMRFINDER_DB"):
+                amrfinder_database({"AMRFINDER_DB": ""})
+            with self.assertRaisesRegex(RuntimeError, "does not exist"):
+                amrfinder_database({"AMRFINDER_DB": str(database / "missing")})
+
+    def test_amrfinder_preflight_reports_database_stderr(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "amrfinder"; database.mkdir()
+            cfg = {**DEFAULTS, "RESISTANCE_OPERON": "true", "AMRFINDER_DB": str(database)}
+            with patch("cleangene.resistance.shutil.which", return_value="/bin/tool"), \
+                 patch.dict("sys.modules", {"edlib": object(), "matplotlib": object()}), \
+                 patch("cleangene.resistance.subprocess.run", side_effect=subprocess.CalledProcessError(1, ["amrfinder"], stderr="database files missing")):
+                with self.assertRaisesRegex(RuntimeError, "database files missing"):
+                    from cleangene.resistance import preflight
+                    preflight(cfg, Path(temp) / "provenance")
+
     def test_requested_typo_alias_and_canonical_flag(self):
         for flag in ("-ressitanec-operon", "--resistance-operon", "-resistance-operon", "--ressitanec-operon"):
             with patch("cleangene.cli.run_command", return_value=0) as run:

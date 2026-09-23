@@ -71,6 +71,26 @@ def validate_config(cfg: dict) -> None:
         origins(Path(cfg["RESISTANCE_CONTIG_ORIGINS"]))
 
 
+def amrfinder_database(cfg: dict) -> Path:
+    """Return the explicitly configured AMRFinderPlus database directory.
+
+    Resistance results must be reproducible across login and compute nodes. A
+    silently selected AMRFinder default can differ between those environments,
+    so the resistance workflow requires an explicit shared database path.
+    """
+    value = str(cfg.get("AMRFINDER_DB", "")).strip()
+    if not value:
+        raise RuntimeError(
+            "Resistance analysis requires AMRFINDER_DB to point to a versioned "
+            "shared AMRFinderPlus database directory; run amrfinder_update and "
+            "set AMRFINDER_DB in the ARC config before submitting"
+        )
+    path = Path(value).expanduser().resolve()
+    if not path.is_dir():
+        raise RuntimeError(f"AMRFINDER_DB does not exist or is not a directory: {path}")
+    return path
+
+
 def preflight(cfg: dict, out: Path) -> None:
     validate_config(cfg)
     required = ["amrfinder", "mafft"]
@@ -79,13 +99,21 @@ def preflight(cfg: dict, out: Path) -> None:
     missing = [tool for tool in required if not shutil.which(tool)]
     if missing:
         raise RuntimeError("Resistance analysis requires: " + ", ".join(missing) + "; update environment.yml and provision an AMRFinderPlus database")
+    database = amrfinder_database(cfg)
     import edlib  # noqa: F401
     import matplotlib  # noqa: F401
     out.mkdir(parents=True, exist_ok=True)
-    command = ["amrfinder", "--database_version"]
-    if cfg.get("AMRFINDER_DB"):
-        command += ["--database", cfg["AMRFINDER_DB"]]
-    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    command = ["amrfinder", "--database_version", "--database", str(database)]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        detail = "\n".join(part.strip() for part in (error.stdout or "", error.stderr or "") if part.strip())
+        suffix = f"\nAMRFinderPlus output:\n{detail}" if detail else ""
+        raise RuntimeError(
+            f"AMRFinderPlus database verification failed for {database} "
+            f"(exit status {error.returncode}). Check the database version and "
+            f"the cleangene environment.{suffix}"
+        ) from error
     (out / "amrfinder_version.txt").write_text("\n".join(line for line in (result.stdout + result.stderr).splitlines() if not line.startswith("amrfinder took")) + "\n")
     atomic_json(out / "method.json", {"version": VERSION, "definitions": definitions(cfg),
         "settings": {k: v for k, v in cfg.items() if k.startswith(("RESISTANCE_", "AMRFINDER_"))},
@@ -393,8 +421,7 @@ def isolate_task(run_dir: Path, index: int) -> None:
         organism = "Enterococcus_faecium"
     if organism:
         command += ["--organism", organism]
-    if cfg.get("AMRFINDER_DB"):
-        command += ["--database", cfg["AMRFINDER_DB"]]
+    command += ["--database", str(amrfinder_database(cfg))]
     atomic_json(out / "command.json", command)
     run(command, stderr=out / "amrfinder.log")
     amr_assembly.unlink()

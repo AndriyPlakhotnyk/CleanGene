@@ -13,6 +13,12 @@ Activate the updated CleanGene environment. `environment.yml` now includes
 The analysis needs an installed AMRFinderPlus database; it does not let hundreds
 of array tasks race to download or update one.
 
+`AMRFINDER_DB` must be set to an existing, versioned shared database directory.
+CleanGene verifies that exact directory with `amrfinder --database_version
+--database <path>` during preflight, before submitting any analysis arrays. A
+missing or invalid path stops the controller with AMRFinder's diagnostic output;
+it is not silently replaced with a node-local default database.
+
 For a fresh ARC checkout, or to fast-forward an existing clean checkout to the
 latest `main`, use the bootstrap wrapper. It refuses to overwrite local Git
 changes, installs both Conda environments, updates AMRFinderPlus in shared
