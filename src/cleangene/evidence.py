@@ -1,5 +1,5 @@
 from __future__ import annotations
-import subprocess, json
+import os, subprocess, json, tempfile
 from pathlib import Path
 from .fasta import read_fasta, write_fasta
 from .util import read_tsv, run, write_tsv
@@ -131,11 +131,16 @@ def targeted_local_reconstruction(*,bam: Path,region: str,reference_seq: str,out
     if not read_names: return {"status":"no_recruited_reads"}
     read_names=sorted(read_names)
     names.write_text("".join(f"{name}\n" for name in read_names))
-    recruited=outdir/"recruited.bam"; run(["samtools","view","-b","-F","2304","-N",str(names),"-o",str(recruited),str(bam)])
-    collated=outdir/"recruited.collated.bam"
-    run(["samtools","collate","-o",str(collated),str(recruited)])
     r1=outdir/"recruited_R1.fastq"; r2=outdir/"recruited_R2.fastq"; singles=outdir/"recruited_singletons.fastq"; other=outdir/"recruited_other.fastq"
-    run(["samtools","fastq","-n","-1",str(r1),"-2",str(r2),"-0",str(other),"-s",str(singles),str(collated)],stdout=outdir/"samtools_fastq.stdout",stderr=outdir/"samtools_fastq.stderr")
+    recruited=outdir/"recruited.bam"; run(["samtools","view","-b","-F","2304","-N",str(names),"-o",str(recruited),str(bam)])
+    scratch_root=next((Path(value) for key in ("SLURM_TMPDIR","TMPDIR","TEMP","TMP") if (value:=os.environ.get(key)) and Path(value).is_dir()),None)
+    try:
+        with tempfile.TemporaryDirectory(prefix="cleangene-collate-",dir=scratch_root) as temporary:
+            temporary=Path(temporary); collated=temporary/"recruited.collated.bam"
+            run(["samtools","collate","-T",str(temporary/"collate"),"-o",str(collated),str(recruited)])
+            run(["samtools","fastq","-n","-1",str(r1),"-2",str(r2),"-0",str(other),"-s",str(singles),str(collated)],stdout=outdir/"samtools_fastq.stdout",stderr=outdir/"samtools_fastq.stderr")
+    finally:
+        recruited.unlink(missing_ok=True)
     assembly=outdir/"spades"; command=["spades.py","--only-assembler","--careful","-m",str(memory_gb),"-t",str(threads),"-o",str(assembly)]
     has_reads=False
     if r1.stat().st_size and r2.stat().st_size: command += ["-1",str(r1),"-2",str(r2)]; has_reads=True

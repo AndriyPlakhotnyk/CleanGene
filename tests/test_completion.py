@@ -10,10 +10,21 @@ from cleangene.defaults import DEFAULTS
 from cleangene.qc import QC_OUTPUT_FIELDS
 from cleangene.util import atomic_json, read_tsv, write_tsv
 from cleangene.cli import main as cli_main
-from cleangene.workers import _ActiveBatch, _RollingScheduler, slurm_controller
+from cleangene.workers import _ActiveBatch, _RollingScheduler, cleanup_arbitration_bam_intermediates, slurm_controller
 
 
 class CompletionReconciliationTests(unittest.TestCase):
+    def test_cleanup_arbitration_bam_intermediates_preserves_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d); case=run/"results/groups/g/03_read_validation/evidence/i/arbitration/gene"
+            case.mkdir(parents=True)
+            targets=[case/"recruited.bam",case/"recruited.collated.bam",case/"recruited.collated.bam.collate1234.0000.bam"]
+            for target in targets: target.write_bytes(b"1234")
+            (case/"recruited_R1.fastq").write_text("evidence")
+            result=cleanup_arbitration_bam_intermediates(run)
+            self.assertEqual(result,{"files_removed":3,"bytes_reclaimed":12})
+            self.assertTrue((case/"recruited_R1.fastq").is_file())
+
     def make_run(self, root: Path, n: int = 1, cfg: dict[str, str] | None = None) -> tuple[Path, list[dict[str, str]]]:
         run = root / "run"
         (run / "provenance").mkdir(parents=True)

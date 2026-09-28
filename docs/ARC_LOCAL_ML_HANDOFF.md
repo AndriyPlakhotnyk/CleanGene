@@ -46,6 +46,12 @@ the user-wide queue limit. The controller refills arrays as elements finish.
 Array elements share a parent ID in Slurm; CleanGene tracks task IDs and output
 markers separately.
 
+Arbitration sends `samtools collate` scratch files to node-local temporary
+storage and deletes reproducible recruitment/collation BAMs after FASTQ
+extraction. Resume maintenance also removes these intermediates from runs made
+by older workers before it resubmits missing tasks; retained FASTQs,
+reconstructed contigs, metrics, and discovery evidence are not removed.
+
 When a parent reaches `TIMEOUT`, the controller reconciles completed outputs,
 removes the expired parent, and resubmits only indices without successful
 markers. `FAILED`, `CANCELLED`, and out-of-memory states remain fatal. A resume

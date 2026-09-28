@@ -1413,6 +1413,21 @@ def resume_maintenance_signature(cfg: dict[str,str]) -> dict[str,object]:
         "evidence_version":EVIDENCE_VERSION,
     }
 
+def cleanup_arbitration_bam_intermediates(run_dir: Path) -> dict[str,int]:
+    """Remove reproducible recruitment/collation BAMs left by older workers."""
+    removed=bytes_reclaimed=0
+    evidence=run_dir/"results"/"groups"
+    patterns=("*/03_read_validation/evidence/*/arbitration/*/recruited.bam",
+              "*/03_read_validation/evidence/*/arbitration/*/recruited.collated.bam",
+              "*/03_read_validation/evidence/*/arbitration/*/recruited.collated.bam.collate*.bam")
+    for pattern in patterns:
+        for path in evidence.glob(pattern):
+            try:
+                size=path.stat().st_size; path.unlink(); removed+=1; bytes_reclaimed+=size
+            except FileNotFoundError:
+                continue
+    return {"files_removed":removed,"bytes_reclaimed":bytes_reclaimed}
+
 def invalidate_missing_validation_reports(run_dir: Path) -> int:
     """Backfill reporting on old runs without remapping or reassembling reads."""
     invalidated=0; has_matrices=False
@@ -1434,6 +1449,8 @@ def invalidate_missing_validation_reports(run_dir: Path) -> int:
 def run_resume_maintenance(run_dir: Path, cfg: dict[str,str]) -> dict[str,int]:
     invalidate_missing_validation_reports(run_dir)
     if not (run_dir/"results/cohort/alignment_archives.tsv").is_file(): _remove_done(run_dir/"state/summary.done.json")
+    cleanup=cleanup_arbitration_bam_intermediates(run_dir)
+    if cleanup["files_removed"]: _controller_log(f"step=resume_maintenance | removed_arbitration_bam_intermediates={cleanup['files_removed']} | bytes_reclaimed={cleanup['bytes_reclaimed']}",ok=True)
     marker=run_dir/"state"/"resume_maintenance.done.json"; signature=resume_maintenance_signature(cfg)
     if marker.is_file():
         try:
@@ -1906,6 +1923,7 @@ def _controller_lock(run_dir: Path):
 
 def slurm_controller(run_dir: Path, index: int | None = None) -> None:
     with _controller_lock(run_dir):
+        cleanup_arbitration_bam_intermediates(run_dir)
         status_path=run_dir/"state"/"controller_status.json"
         atomic_json(status_path,{"status":"running","job_id":os.environ.get("SLURM_JOB_ID","local"),"started_at":time.time()})
         try:

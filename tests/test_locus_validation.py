@@ -81,8 +81,11 @@ class LocusValidationTests(unittest.TestCase):
             with patch('cleangene.evidence.run',side_effect=run), patch('cleangene.evidence.subprocess.run',side_effect=subprocess_run), patch('cleangene.evidence.subprocess.Popen',return_value=process):
                 result=targeted_local_reconstruction(bam=root/'reads.bam',region='g',reference_seq='ACGT',outdir=root,threads=2)
             self.assertEqual(result['status'],'reconstructed')
+            collate=next(c for c in commands if c[:2]==['samtools','collate'])
             fastq=next(c for c in commands if c[:2]==['samtools','fastq'])
+            self.assertIn('-T',collate)
             self.assertTrue(fastq[-1].endswith('recruited.collated.bam'))
+            self.assertFalse((root/'recruited.bam').exists())
             self.assertEqual((root/'all_singletons.fastq').read_text().count('@r'),2)
 
     def test_own_locus_positive_ignores_competitive_zero(self):
