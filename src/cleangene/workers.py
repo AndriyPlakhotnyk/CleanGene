@@ -1,5 +1,5 @@
 from __future__ import annotations
-import csv, fcntl, gzip, hashlib, os, shutil, subprocess, sys, tempfile, time
+import csv, fcntl, gzip, hashlib, io, os, shutil, subprocess, sys, tarfile, tempfile, time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -709,14 +709,44 @@ def _compress_assembly_outputs(assembly_dir: Path, assembly: Path, cfg: dict[str
     gz_assembly=assembly.with_name(assembly.name + ".gz")
     return gz_assembly if mode=="all" and gz_assembly.is_file() else assembly
 
+def _archive_files(paths: list[Path], archive: Path, *, base: Path) -> int:
+    """Pack files into one gzip tar, then remove originals after the archive is complete."""
+    paths=[path for path in paths if path.is_file() and not path.is_symlink()]
+    if not paths: return 0
+    archive.parent.mkdir(parents=True,exist_ok=True)
+    temporary=archive.with_name(f".{archive.name}.tmp-{os.getpid()}")
+    try:
+        with tarfile.open(temporary,"w:gz",compresslevel=6) as bundle:
+            for path in sorted(paths): bundle.add(path,arcname=str(path.relative_to(base)),recursive=False)
+        os.replace(temporary,archive)
+    finally:
+        if temporary.exists(): temporary.unlink()
+    for path in paths: path.unlink()
+    return len(paths)
+
+def _archive_directory(directory: Path, archive: Path) -> int:
+    if not directory.is_dir(): return 0
+    files=[path for path in directory.rglob("*") if path.is_file() and not path.is_symlink()]
+    count=_archive_files(files,archive,base=directory)
+    for path in sorted(directory.rglob("*"),reverse=True):
+        if path.is_dir():
+            try: path.rmdir()
+            except OSError: pass
+    try: directory.rmdir()
+    except OSError: pass
+    return count
+
 def _compress_annotation_outputs(annotation_dir: Path, gff: Path, cfg: dict[str,str]) -> None:
     mode=cfg.get("COMPRESS_ANNOTATION_OUTPUTS",DEFAULTS["COMPRESS_ANNOTATION_OUTPUTS"]).strip().lower()
     if mode not in {"off","nonessential"}:
         raise SystemExit("COMPRESS_ANNOTATION_OUTPUTS must be off or nonessential")
     if mode=="off" or not annotation_dir.is_dir(): return
-    for path in sorted(annotation_dir.iterdir()):
-        if not path.is_file() or path.suffix==".gz" or path.resolve()==gff.resolve(): continue
-        _gzip_file(path)
+    protein=annotation_dir/(gff.stem+".faa")
+    if protein.is_file(): _gzip_file(protein)
+    proteins={protein.resolve(),protein.with_name(protein.name+".gz").resolve()}
+    auxiliary=[path for path in annotation_dir.iterdir() if path.is_file() and path.resolve()!=gff.resolve()
+               and path.resolve() not in proteins and path.name!="prokka_auxiliary.tar.gz"]
+    _archive_files(auxiliary,annotation_dir/"prokka_auxiliary.tar.gz",base=annotation_dir)
 
 def _artifact_provenance(path_text: str, artifact: str, source: str = "manifest") -> dict[str,object]:
     if not path_text.strip(): return {}
@@ -886,6 +916,9 @@ def preprocess(run_dir: Path, index: int) -> None:
                 relink_reads.append((relative,target))
                 source.unlink()
 
+        # A completed sample needs diagnostics as an archive; failed samples keep
+        # their readable log directory because finish() is never reached.
+        _archive_directory(logs,work_out/"logs.tar.gz")
         if scratch:
             _sync_tree(work_out,out)
 
@@ -1173,15 +1206,56 @@ def compress_completed_outputs(run_dir: Path) -> dict[str,object]:
         annotation_dir=qc.parent/"annotation"
         if annotation_mode=="nonessential" and annotation_dir.is_dir():
             gff=Path(q.get("gff","")).expanduser(); gff=gff.absolute() if gff else gff
-            for path in sorted(annotation_dir.iterdir()):
-                if not path.is_file() or path.is_symlink() or path.suffix==".gz" or path.suffix.lower() in {".gff",".cram",".crai"} or path.name.endswith((".archive.json",".archive.lock")): continue
-                if gff and path.absolute()==gff: continue
-                before=path.stat().st_size; original=str(path); gz=_gzip_file(path); saved=max(0,before-gz.stat().st_size); reclaimed += saved
-                report.append([iso,"annotation",original,str(gz),saved])
+            protein=annotation_dir/(gff.stem+".faa") if gff else Path("/nonexistent")
+            proteins={protein.absolute(),protein.with_name(protein.name+".gz").absolute()}
+            auxiliary=[path for path in annotation_dir.iterdir() if path.is_file() and not path.is_symlink()
+                       and path.resolve()!=gff and path.resolve() not in proteins
+                       and path.name!="prokka_auxiliary.tar.gz"]
+            archive=annotation_dir/"prokka_auxiliary.tar.gz"
+            before=sum(path.stat().st_size for path in auxiliary)
+            count=_archive_files(auxiliary,archive,base=annotation_dir)
+            if count:
+                saved=max(0,before-archive.stat().st_size); reclaimed+=saved
+                report.append([iso,"annotation_bundle",str(annotation_dir),str(archive),saved])
+        logs=qc.parent/"logs"
+        if logs.is_dir():
+            archive=qc.parent/"logs.tar.gz"; before=sum(path.stat().st_size for path in logs.rglob("*") if path.is_file())
+            count=_archive_directory(logs,archive)
+            if count:
+                saved=max(0,before-archive.stat().st_size); reclaimed+=saved
+                report.append([iso,"logs_bundle",str(logs),str(archive),saved])
         if changed: write_tsv(qc,list(q.keys()),[q])
     write_tsv(run_dir/"results"/"cohort"/"storage_cleanup.tsv",["isolate_id","category","original_path","compressed_path","bytes_reclaimed"],report)
     counts={category:sum(1 for item in report if item[1]==category) for category in sorted({item[1] for item in report})}
     return {"files_compressed":len(report),"bytes_reclaimed":reclaimed,"counts":counts}
+
+def bundle_completed_validation_artifacts(run_dir: Path) -> int:
+    """Bundle reproducible per-isolate mapping sidecars after every consumer finishes."""
+    keep={"metrics.tsv","arbitrated_metrics.tsv","arbitration_cases.tsv","discovered_genes.tsv",
+          "discovered_genes.fasta","loci.tsv","evidence_auxiliary.tar.gz"}
+    bundled=0
+    for directory in (run_dir/"results"/"groups").glob("*/03_read_validation/evidence/*"):
+        if not directory.is_dir(): continue
+        auxiliary=[]
+        for path in directory.iterdir():
+            if not path.is_file() or path.is_symlink() or path.name in keep: continue
+            if path.name.startswith(("own_assembly_reads.cram","own_assembly_reads.archive.",
+                                     "own_assembly_reference.fasta","own_assembly_reference.json",
+                                     "pangenome_reads.cram","pangenome_reads.archive.")):
+                continue
+            if path.name in {".archive.lock","pangenome_reads.cram.archive.lock","own_assembly_reads.cram.archive.lock"}:
+                continue
+            auxiliary.append(path)
+        bundled+=_archive_files(auxiliary,directory/"evidence_auxiliary.tar.gz",base=directory)
+    return bundled
+
+def prune_rebuildable_validation_indexes(run_dir: Path) -> int:
+    """Remove completed BWA indexes; validation rebuilds these from retained FASTA."""
+    removed=0
+    for path in (run_dir/"results").glob("**/own_assembly_reference.*"):
+        if path.is_file() and path.suffix in {".amb",".ann",".bwt",".pac",".sa"}:
+            path.unlink(); removed+=1
+    return removed
 
 def group_size_class(n: int, cfg: dict[str,str]) -> str:
     if n <= int(cfg.get("PANAROO_SMALL_MAX_ISOLATES","499")): return "small"
@@ -1640,6 +1714,15 @@ def write_final_developer_report(run_dir: Path) -> Path | None:
         for row in _read_timing_rows(path):
             value=_numeric_timing(row.get("elapsed_seconds")); status=row.get("status","")
             if value is not None and status: process_values.setdefault(("checkm2",status),[]).append(value)
+    for archive in sorted((run_dir/"results").glob("**/logs.tar.gz")):
+        try:
+            with tarfile.open(archive,"r:gz") as bundle:
+                member=bundle.extractfile("checkm2.timing.tsv")
+                rows=list(csv.DictReader(io.TextIOWrapper(member,encoding="utf-8",errors="replace"),delimiter="\t")) if member else []
+        except (OSError,tarfile.TarError,ValueError): rows=[]
+        for row in rows:
+            value=_numeric_timing(row.get("elapsed_seconds")); status=row.get("status","")
+            if value is not None and status: process_values.setdefault(("checkm2",status),[]).append(value)
     process_rows=[]
     for (source,name),values in sorted(process_values.items()):
         process_rows.append([source,name,len(values),f"{sum(values):.3f}",f"{sum(values)/len(values):.3f}",f"{min(values):.3f}",f"{max(values):.3f}"])
@@ -2078,7 +2161,7 @@ def validate(run_dir: Path, index: int) -> None:
         ev.mkdir(parents=True,exist_ok=True); write_tsv(ev/"metrics.tsv",METRIC_FIELDS,[]); write_tsv(ev/"arbitrated_metrics.tsv",METRIC_FIELDS,[]); touch_done(done,{"status":"no_selected_genes"}); touch_done(run_dir/"state"/"arbitrate"/f"{safe_name(iso)}.done.json",{"status":"no_selected_genes"}); return
     initial={r["Gene"]:int(r[iso]) for r in read_tsv(root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv")}
     sample_loci=[r for r in read_tsv(out/"cluster_isolate_loci.tsv") if r["isolate_id"]==iso]; locus_file=ev/"loci.tsv"; write_tsv(locus_file,["Gene","isolate_id","locus_tag","assembly_scaffold","cds_start","cds_end","cds_strand","contig_edge","left_flank_locus","right_flank_locus"],sample_loci)
-    rr=retained[iso]; validate_isolate(ref,key,locus_file,Path(rr["assembly"]),rr["R1"],rr["R2"],ev,int(cfg["VALIDATION_CPUS"]),float(cfg["READ_VALIDATION_MIN_BREADTH"]),float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"]),float(cfg["READ_VALIDATION_MIN_IDENTITY"]),int(cfg["READ_VALIDATION_MIN_MAPQ"]),int(cfg["BASEQUAL"]),initial_calls=initial,truncation_breadth=float(cfg["READ_VALIDATION_TRUNCATION_MIN_BREADTH"]),divergent_breadth=float(cfg["READ_VALIDATION_DIVERGENT_MIN_BREADTH"]),divergent_identity=float(cfg["READ_VALIDATION_DIVERGENT_MIN_IDENTITY"]))
+    rr=retained[iso]; (ev/"evidence_auxiliary.tar.gz").unlink(missing_ok=True); validate_isolate(ref,key,locus_file,Path(rr["assembly"]),rr["R1"],rr["R2"],ev,int(cfg["VALIDATION_CPUS"]),float(cfg["READ_VALIDATION_MIN_BREADTH"]),float(cfg["READ_VALIDATION_MIN_MEAN_DEPTH"]),float(cfg["READ_VALIDATION_MIN_IDENTITY"]),int(cfg["READ_VALIDATION_MIN_MAPQ"]),int(cfg["BASEQUAL"]),initial_calls=initial,truncation_breadth=float(cfg["READ_VALIDATION_TRUNCATION_MIN_BREADTH"]),divergent_breadth=float(cfg["READ_VALIDATION_DIVERGENT_MIN_BREADTH"]),divergent_identity=float(cfg["READ_VALIDATION_DIVERGENT_MIN_IDENTITY"]))
     metric_rows=read_tsv(ev/"metrics.tsv")
     if not any(r.get("arbitration_status")=="pending" for r in metric_rows):
         for name in ("discovered_genes.fasta","discovered_genes.tsv"):
@@ -2288,6 +2371,12 @@ def summarize(run_dir: Path) -> None:
     available_summaries=[path for path in summary_dirs if all((path/name).is_file() for name in SUMMARY_FILES)]
     combine_validation_summaries(available_summaries,cohort)
     if available_summaries: plot_decision_upset(cohort/"decision_reason_upset.tsv",cohort,"Cohort")
+    payload["validation_auxiliary_files_bundled"]=bundle_completed_validation_artifacts(run_dir)
+    if payload["validation_auxiliary_files_bundled"]:
+        cleanup_path=cohort/"storage_cleanup.tsv"; cleanup_rows=read_tsv(cleanup_path) if cleanup_path.is_file() else []
+        cleanup_rows.append({"isolate_id":"cohort","category":"validation_bundle","original_path":"results/groups/*/03_read_validation/evidence/*","compressed_path":"evidence_auxiliary.tar.gz","bytes_reclaimed":""})
+        write_tsv(cleanup_path,["isolate_id","category","original_path","compressed_path","bytes_reclaimed"],cleanup_rows)
+    payload["rebuildable_validation_indexes_removed"]=prune_rebuildable_validation_indexes(run_dir)
     touch_done(run_dir/"state"/"summary.done.json",payload)
 
 def dispatch(stage: str, run_dir: Path, index: int | None) -> None:

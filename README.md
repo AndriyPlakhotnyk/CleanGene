@@ -275,10 +275,15 @@ apply unless overridden by a command-line option.
 | `--cancel-active` | Flag, resume | Cancel active jobs associated with the run before resubmission. |
 
 Assembly intermediates and nonessential annotation outputs are compressed by
-default; the primary assembly and GFF remain available. Explicit `off` settings
-in existing configs still override these defaults. To adopt the new policy in
-an existing local config, set `COMPRESS_ASSEMBLY_OUTPUTS="intermediates"` and
-`COMPRESS_ANNOTATION_OUTPUTS="nonessential"`.
+default; the primary assembly and GFF remain available. Prokka protein `.faa.gz`
+remains available to AMRFinder, while other Prokka outputs are bundled in
+`prokka_auxiliary.tar.gz`. Successful per-sample tool logs are bundled in
+`logs.tar.gz`; failed preprocesses retain readable log folders. At final summary,
+CleanGene also removes rebuildable BWA indexes after analysis. Explicit `off`
+settings in existing configs still override compression defaults. After
+reduction, mapping sidecars are bundled in `evidence_auxiliary.tar.gz`; metrics,
+discoveries, CRAMs, references, and archive metadata stay directly accessible.
+The cleanup inventory is `results/cohort/storage_cleanup.tsv`.
 
 Direct SPAdes mode uses original paired reads with `--only-assembler`. Choose
 Shovill when you want its assembly preparation workflow. `SHOVILL_MEMORY_GB`

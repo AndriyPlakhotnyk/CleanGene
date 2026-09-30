@@ -98,11 +98,12 @@ are covered. A report is written to `results/cohort/storage_cleanup.tsv`.
 Annotation compression is controlled with
 `COMPRESS_ANNOTATION_OUTPUTS=off|nonessential`, or
 `--compress_annotation_outputs nonessential`. CleanGene keeps Prokka `.gff`
-files uncompressed because Panaroo consumes them, preprocess resume checks look
-for them, and variant/diagnostic utilities read neighboring CDS features from
-them. The nonessential mode gzips other Prokka outputs such as `.sqn`, `.gbk`,
-`.err`, `.ffn`, and `.fna`; the final summary sweep also covers annotations
-created before a resumed controller starts.
+files uncompressed because Panaroo consumes them and utilities read neighboring
+CDS features. It keeps the protein `.faa.gz` available to AMRFinder and bundles
+other Prokka outputs into `prokka_auxiliary.tar.gz`. Completed per-sample logs
+are stored in `logs.tar.gz`; failed preprocesses retain readable log folders.
+After reduction, mapping sidecars go into `evidence_auxiliary.tar.gz`, while
+metrics, discoveries, CRAMs, reference files, and archive metadata remain loose.
 
 ## Archived alignments and read-derived MSA
 
