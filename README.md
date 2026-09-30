@@ -119,6 +119,9 @@ zero cases below 34 present genes. Priority is `divergent_variant` (highest iden
 first), `possible_truncation`, `partial_homolog`, then `insufficient_evidence`
 (highest breadth first within each state). Ambiguous family assignments follow
 those categories. Cases beyond the cap retain explicit `deferred_limit` status.
+Per-gene recruited reads, SPAdes graphs, assemblies and match work files are
+temporary. CleanGene removes them when that isolate's arbitration finishes,
+while retaining compact arbitration metrics and supported discovery records.
 
 Discovery requires a complete, target-overlapping Prodigal CDS, an intact start/stop
 ORF, and recruited-read support meeting the depth gate, 95% breadth and 95% identity.

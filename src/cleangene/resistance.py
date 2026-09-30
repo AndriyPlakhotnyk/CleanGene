@@ -20,7 +20,7 @@ from .config import truthy
 from .fasta import read_fasta, write_fasta
 from .util import atomic_json, load_json, read_tsv, run, safe_name, write_tsv
 
-VERSION = "3"
+VERSION = "4"
 DEFAULT_DEFINITIONS = {
     "vanA": ["vanR-A", "vanS-A", "vanH-A", "vanA", "vanX-A", "vanY-A", "vanZ-A"],
     "vanB": ["vanR-B", "vanS-B", "vanY-B", "vanW-B", "vanH-B", "vanB", "vanX-B"],
@@ -167,18 +167,20 @@ def parse_hits(path: Path) -> list[dict]:
         reader = csv.DictReader(handle, delimiter="\t")
         fields = reader.fieldnames or []
         symbol_field = "Element symbol" if "Element symbol" in fields else "Gene symbol"
-        if not {symbol_field, "Contig id", "Start", "Stop", "Strand", "Type", "Method"}.issubset(fields):
+        type_field = "Element type" if "Element type" in fields else "Type"
+        subtype_field = "Element subtype" if "Element subtype" in fields else "Subtype"
+        if not {symbol_field, "Contig id", "Start", "Stop", "Strand", type_field, "Method"}.issubset(fields):
             raise ValueError(f"Unrecognized AMRFinderPlus output header: {fields}")
         hits = []
         for row in reader:
-            if row["Type"] != "AMR":
+            if row[type_field] != "AMR":
                 continue
             if row["Contig id"] in {"NA", "", "."}:
                 raise ValueError("AMRFinderPlus hit has no nucleotide coordinates")
             start, end = sorted((int(row["Start"]), int(row["Stop"])))
             hits.append({"symbol": row[symbol_field], "contig": row["Contig id"], "start": start,
                 "end": end, "strand": row["Strand"], "method": row["Method"],
-                "subtype": row.get("Subtype", ""), "class": row.get("Class", ""),
+                "subtype": row.get(subtype_field, ""), "class": row.get("Class", ""),
                 "protein": row.get("Protein id", ""), "raw": row})
     return hits
 

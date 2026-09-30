@@ -22,8 +22,24 @@ class CompletionReconciliationTests(unittest.TestCase):
             for target in targets: target.write_bytes(b"1234")
             (case/"recruited_R1.fastq").write_text("evidence")
             result=cleanup_arbitration_bam_intermediates(run)
-            self.assertEqual(result,{"files_removed":3,"bytes_reclaimed":12})
+            self.assertEqual(result,{"files_removed":3,"bytes_reclaimed":12,"workspaces_removed":0})
             self.assertTrue((case/"recruited_R1.fastq").is_file())
+
+    def test_cleanup_completed_arbitration_workspace_only(self):
+        from cleangene.util import atomic_json, write_tsv
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d)
+            workspace=run/"results/groups/g/03_read_validation/evidence/i/arbitration/gene/spades/K21/configs"
+            workspace.mkdir(parents=True)
+            (workspace/"config.info").write_text("scratch")
+            ev=workspace.parents[4]
+            (ev/"arbitrated_metrics.tsv").write_text("Gene\n")
+            write_tsv(run/"state/isolate_tasks.tsv",["group_id","isolate_id"],[["g","i"]])
+            atomic_json(run/"state/arbitrate/i.done.json",{"status":"complete"})
+            result=cleanup_arbitration_bam_intermediates(run)
+            self.assertEqual(result["workspaces_removed"],1)
+            self.assertFalse((ev/"arbitration").exists())
+            self.assertTrue((ev/"arbitrated_metrics.tsv").is_file())
 
     def make_run(self, root: Path, n: int = 1, cfg: dict[str, str] | None = None) -> tuple[Path, list[dict[str, str]]]:
         run = root / "run"

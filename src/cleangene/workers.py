@@ -1414,8 +1414,8 @@ def resume_maintenance_signature(cfg: dict[str,str]) -> dict[str,object]:
     }
 
 def cleanup_arbitration_bam_intermediates(run_dir: Path) -> dict[str,int]:
-    """Remove reproducible recruitment/collation BAMs left by older workers."""
-    removed=bytes_reclaimed=0
+    """Remove obsolete BAMs and completed per-gene reconstruction workspaces."""
+    removed=bytes_reclaimed=workspaces_removed=0
     evidence=run_dir/"results"/"groups"
     patterns=("*/03_read_validation/evidence/*/arbitration/*/recruited.bam",
               "*/03_read_validation/evidence/*/arbitration/*/recruited.collated.bam",
@@ -1426,7 +1426,17 @@ def cleanup_arbitration_bam_intermediates(run_dir: Path) -> dict[str,int]:
                 size=path.stat().st_size; path.unlink(); removed+=1; bytes_reclaimed+=size
             except FileNotFoundError:
                 continue
-    return {"files_removed":removed,"bytes_reclaimed":bytes_reclaimed}
+    tasks=run_dir/"state"/"isolate_tasks.tsv"
+    if tasks.is_file():
+        for row in read_tsv(tasks):
+            iso=safe_name(row["isolate_id"])
+            marker=run_dir/"state"/"arbitrate"/f"{iso}.done.json"
+            if not _successful_marker(marker): continue
+            workspace=evidence/safe_name(row["group_id"])/"03_read_validation"/"evidence"/iso/"arbitration"
+            if workspace.is_dir():
+                shutil.rmtree(workspace)
+                workspaces_removed+=1
+    return {"files_removed":removed,"bytes_reclaimed":bytes_reclaimed,"workspaces_removed":workspaces_removed}
 
 def invalidate_missing_validation_reports(run_dir: Path) -> int:
     """Backfill reporting on old runs without remapping or reassembling reads."""
@@ -1450,7 +1460,8 @@ def run_resume_maintenance(run_dir: Path, cfg: dict[str,str]) -> dict[str,int]:
     invalidate_missing_validation_reports(run_dir)
     if not (run_dir/"results/cohort/alignment_archives.tsv").is_file(): _remove_done(run_dir/"state/summary.done.json")
     cleanup=cleanup_arbitration_bam_intermediates(run_dir)
-    if cleanup["files_removed"]: _controller_log(f"step=resume_maintenance | removed_arbitration_bam_intermediates={cleanup['files_removed']} | bytes_reclaimed={cleanup['bytes_reclaimed']}",ok=True)
+    if cleanup["files_removed"] or cleanup["workspaces_removed"]:
+        _controller_log(f"step=resume_maintenance | removed_arbitration_bam_intermediates={cleanup['files_removed']} | removed_completed_workspaces={cleanup['workspaces_removed']} | bytes_reclaimed={cleanup['bytes_reclaimed']}",ok=True)
     marker=run_dir/"state"/"resume_maintenance.done.json"; signature=resume_maintenance_signature(cfg)
     if marker.is_file():
         try:
@@ -1923,7 +1934,9 @@ def _controller_lock(run_dir: Path):
 
 def slurm_controller(run_dir: Path, index: int | None = None) -> None:
     with _controller_lock(run_dir):
-        cleanup_arbitration_bam_intermediates(run_dir)
+        cleanup=cleanup_arbitration_bam_intermediates(run_dir)
+        if cleanup["files_removed"] or cleanup["workspaces_removed"]:
+            _controller_log(f"step=controller_startup_cleanup | removed_arbitration_bam_intermediates={cleanup['files_removed']} | removed_completed_workspaces={cleanup['workspaces_removed']} | bytes_reclaimed={cleanup['bytes_reclaimed']}",ok=True)
         status_path=run_dir/"state"/"controller_status.json"
         atomic_json(status_path,{"status":"running","job_id":os.environ.get("SLURM_JOB_ID","local"),"started_at":time.time()})
         try:
@@ -2093,8 +2106,20 @@ def arbitrate_evidence(row: dict[str,str], *, deletion_spanned: bool=False) -> d
     return result
 
 def arbitrate(run_dir: Path,index: int) -> None:
+    row=task_row(run_dir,"isolate",index)
+    ev=run_dir/"results"/"groups"/safe_name(row["group_id"])/"03_read_validation"/"evidence"/safe_name(row["isolate_id"])
+    try:
+        _arbitrate_impl(run_dir,index)
+    finally:
+        # Per-gene FASTQs, BAMs, SPAdes graphs and logs are reproducible scratch.
+        # Keep the compact metrics/discovery tables above this directory.
+        shutil.rmtree(ev/"arbitration",ignore_errors=True)
+
+def _arbitrate_impl(run_dir: Path,index: int) -> None:
     cfg=load_run_config(run_dir); row=task_row(run_dir,"isolate",index); iso=row["isolate_id"]; root=run_dir/"results"/"groups"/safe_name(row["group_id"]); ev=root/"03_read_validation"/"evidence"/safe_name(iso); done=run_dir/"state"/"arbitrate"/f"{safe_name(iso)}.done.json"
     if done.is_file() and (ev/"arbitrated_metrics.tsv").is_file(): return
+    # A killed older attempt may have left a non-resumable SPAdes output tree.
+    shutil.rmtree(ev/"arbitration",ignore_errors=True)
     metrics=read_tsv(ev/"metrics.tsv") if (ev/"metrics.tsv").is_file() else []
     if not metrics: ev.mkdir(parents=True,exist_ok=True); write_tsv(ev/"arbitration_cases.tsv",METRIC_FIELDS,[]); write_tsv(ev/"arbitrated_metrics.tsv",METRIC_FIELDS,[]); touch_done(done,{"discordant_cases":0}); return
     initial_matrix=read_tsv(root/"02_pangenome"/"initial_calls"/"gene_presence_absence.binary.tsv")

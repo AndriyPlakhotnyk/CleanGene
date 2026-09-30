@@ -252,6 +252,8 @@ class ArbitrationWorkerTests(unittest.TestCase):
             atomic_json(run / 'provenance/resolved_config.json', {})
             write_tsv(group / '02_pangenome/initial_calls/gene_presence_absence.binary.tsv', ['Gene','i'], [[f'g{n}',1] for n in range(100)])
             fields = ['Gene','initial_call','validated_call','evidence_state','arbitration_status','identity','breadth','reference_id']
+            stale=ev/'arbitration/stale/spades/K21/configs/config.info'
+            stale.parent.mkdir(parents=True); stale.write_text('old scratch')
             write_tsv(ev / 'metrics.tsv', fields, [
                 ['low',1,0,'partial_homolog','pending',.99,.5,'low'],
                 ['d_low',1,1,'divergent_variant','pending',.91,.95,'d_low'],
@@ -270,6 +272,7 @@ class ArbitrationWorkerTests(unittest.TestCase):
             self.assertEqual(rows['zero']['validated_call'],'0')
             self.assertEqual(rows['strong']['validated_call'],'1')
             self.assertFalse((ev / 'own_assembly_reads.bam').exists())
+            self.assertFalse((ev / 'arbitration').exists())
             verified_archive(ev)
             with patch('cleangene.workers.task_row',return_value={'group_id':'g','isolate_id':'i'}), patch('cleangene.workers.targeted_local_reconstruction') as reconstruct:
                 arbitrate(run,0)
