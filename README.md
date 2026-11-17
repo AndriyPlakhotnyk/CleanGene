@@ -154,7 +154,8 @@ with `pip` does not install the external bioinformatics tools.
 
 The installer checks Shovill dependencies and CheckM2 bundled test genomes. It
 automatically selects local deployment checks when `sbatch` is unavailable; use
-`--profile slurm` on ARC or `--profile local` on a workstation to select explicitly.
+`--profile slurm` on a Slurm cluster or `--profile local` on a workstation to
+select explicitly.
 For an isolated installation, add `--env-root /path/to/environments`; both Conda
 environments will be placed there. `cleangene doctor` also accepts `--profile local`.
 
@@ -170,12 +171,20 @@ conda activate cleangene
 
 ### 1. Configure the run
 
-The installer creates `config/cleangene.arc.local.env` from the supplied Slurm
-template without overwriting an existing local file. Set `SLURM_ACCOUNT` and
-`SLURM_PARTITION` for your cluster, and adjust resource requests as needed.
+Create a local cluster configuration from the supplied example. These commands
+preserve an existing local file:
 
 ```bash
-cleangene doctor --config config/cleangene.arc.local.env
+if [ ! -e config/cleangene.cluster.local.env ]; then
+  cp config/cleangene.example.env config/cleangene.cluster.local.env
+fi
+```
+
+Add your cluster's `SLURM_ACCOUNT` and `SLURM_PARTITION` values to this file, and
+adjust resource requests as needed. Check the deployment before submitting:
+
+```bash
+cleangene doctor --profile slurm --config config/cleangene.cluster.local.env
 ```
 
 Managed databases are downloaded when needed and reused. Set
@@ -231,7 +240,7 @@ cleangene run \
   --profile slurm \
   --manifest input/cohort.manifest.tsv \
   --analysis-root /data/cleangene-analysis \
-  --config config/cleangene.arc.local.env \
+  --config config/cleangene.cluster.local.env \
   --assembler spades
 ```
 
@@ -261,7 +270,7 @@ apply unless overridden by a command-line option.
 | `--manifest` | TSV path | Sample inputs; required for a new run. |
 | `--analysis-root` | Active CleanGene checkout | Parent directory for `runs/<run-id>/`; standalone installations without a checkout use the current directory. |
 | `--config` | Environment-style file | QC, database, and execution settings. |
-| `--profile` | `local` (default), `slurm` | Execution backend for `run` and `doctor`; ARC submissions must specify `--profile slurm`. |
+| `--profile` | `local` (default), `slurm` | Execution backend for `run` and `doctor`; cluster submissions must specify `--profile slurm`. |
 | `--skip-downsampling` | Flag; off by default | Run Shovill with `--depth 0`: retain KMC genome-size estimation and other processing, without read-depth reduction. |
 | `--assembler` | `shovill` (built-in default), `spades`, `off` | Assembly strategy; `off` skips assembly and annotation. |
 | `--ignore-checkm2` | Flag | Skip CheckM2 assessment during the run. |
@@ -403,11 +412,11 @@ stage cumulative worker time can exceed wall-clock time because tasks overlap.
 
 Use `SLURM_PREPROCESS_MAX_INFLIGHT`, `SLURM_VALIDATION_MAX_INFLIGHT`, and
 `SLURM_ARBITRATION_MAX_INFLIGHT` to control concurrency. Stage-specific CPU,
-memory, and time requests are available in the
-[Slurm configuration template](config/cleangene.arc.env). The
-[example config](config/cleangene.example.env) and
-[default settings](src/cleangene/defaults.py) list additional controls, including
-QC thresholds and database management.
+memory, and time requests are listed in the
+[default settings](src/cleangene/defaults.py). The
+[example config](config/cleangene.example.env) includes additional controls for
+QC thresholds and database management. See the
+[Slurm scheduling guide](docs/SLURM.md) for controller behavior.
 
 Preprocessing has its own wall-time setting, `SLURM_PREPROCESS_TIME`. When a
 preprocess array reaches `TIMEOUT`, the controller keeps successful markers,
@@ -478,7 +487,7 @@ cannot express.
 ```bash
 cleangene resume \
   --run-dir /data/cleangene-analysis/runs/<run-id> \
-  --config config/cleangene.arc.local.env
+  --config config/cleangene.cluster.local.env
 ```
 
 Completed work is reused where its completion checks pass. Resume reconciles
@@ -564,9 +573,9 @@ Shovill/CheckM2 run and verification of completed-run reuse.
 
 See [LICENSE](LICENSE).
 
-### ARC submission without downsampling
+### Slurm cluster submission without downsampling
 
-Keep the account and partition settings in your existing ARC configuration.
+Keep the account and partition settings in your local cluster configuration.
 The installer updates the environment; compression defaults already retain
 assembly intermediates as compressed files and compress nonessential annotation
 outputs. `--skip-downsampling` affects Shovill only and keeps KMC enabled.
@@ -576,12 +585,12 @@ cd /path/to/CleanGene
 git pull --ff-only origin main
 bash scripts/install_or_update.sh --profile slurm
 conda activate cleangene
-cleangene doctor --profile slurm --config config/cleangene.arc.local.env
+cleangene doctor --profile slurm --config config/cleangene.cluster.local.env
 cleangene run \
   --profile slurm \
-  --manifest "$PWD/input/arc_GDS_test.manifest.tsv" \
+  --manifest "$PWD/input/cohort.manifest.tsv" \
   --analysis-root "$PWD" \
-  --config "$PWD/config/cleangene.arc.local.env" \
+  --config "$PWD/config/cleangene.cluster.local.env" \
   --assembler shovill \
   --skip-downsampling
 ```
@@ -598,21 +607,28 @@ The top 12 variants per resistance type receive SNP/indel and gene-structure
 figures. Results are in `results/resistance_analysis/figures` and
 `results/resistance_analysis/tables` within the run.
 
-For the full ARC pipeline with raw-read downsampling and CheckM2 disabled:
+For the full Slurm cluster pipeline with raw-read downsampling and CheckM2 disabled:
 
 ```bash
 conda activate cleangene
-bash scripts/submit_resistance_arc.sh input/efaecium.manifest.tsv \
-  config/cleangene.resistance.arc.local.env --run-id efaecium_resistance
+cleangene run \
+  --profile slurm \
+  --manifest input/efaecium.manifest.tsv \
+  --analysis-root "$PWD" \
+  --config config/cleangene.cluster.local.env \
+  --assembler shovill \
+  --skip-downsampling \
+  --ignore-checkm2 \
+  --resistance-operon \
+  --run-id efaecium_resistance
 ```
 
-Set your ARC account/partition and versioned `AMRFINDER_DB` in a copy of
-`config/cleangene.arc.env` first. See [resistance analysis instructions](docs/resistance_operons.md)
+Set your cluster account/partition and versioned `AMRFINDER_DB` in
+`config/cleangene.cluster.local.env` first. See [resistance analysis instructions](docs/resistance_operons.md)
 for database setup, the full submission command, locus definitions, read evidence,
 resume behavior, tests and output tables. Variants are assembly-derived with
 explicit read-support flags. Chromosome/plasmid origin remains unknown unless
 contig-level evidence is supplied; genomic proximity does not prove an operon.
 
-To clone or fast-forward the checkout and install the latest ARC environment,
-run [scripts/bootstrap_arc_latest.sh](scripts/bootstrap_arc_latest.sh) after
-loading ARC's Git and Miniforge modules.
+On clusters that provide software through environment modules, load your site's
+Git and Miniforge/Mamba modules before following the [installation steps](#installation).
